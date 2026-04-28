@@ -1670,22 +1670,28 @@ static void rcheevos_client_load_game_callback(int result,
       }
       else
       {
-         if (!error_message)
-            error_message = "Unknown error";
-
-         CHEEVOS_LOG(RCHEEVOS_TAG "Game load failed: %s\n", error_message);
-
-         if (result == RC_LOGIN_REQUIRED)
+                 if (result == RC_NO_GAME_LOADED)
          {
-            /* assume error already reported by rcheevos_client_login_callback */
-         }
-         else
-         {
-            _len = snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_CHEEVOS_GAME_LOAD_FAILED), error_message);
+            CHEEVOS_LOG(RCHEEVOS_TAG "Game not recognized, pausing hardcore\n");
+            rcheevos_pause_hardcore();
+
+            if (!settings->bools.cheevos_verbose_enable)
+               return;
+
+            _len = strlcpy(msg, msg_hash_to_str(MSG_CHEEVOS_GAME_NOT_IDENTIFIED), sizeof(msg));
+
             runloop_msg_queue_push(msg, _len, 0, 2 * 60, false, NULL,
-               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
-         }
-      }
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            
+            /* --- ADICIONE ESTE BLOCO AQUI --- */
+            /* Aviso adicional sobre MD5 não suportado */
+            if (rcheevos_locals.client && rc_client_is_logged_in(rcheevos_locals.client))
+            {
+               snprintf(msg, sizeof(msg), 
+                  "Atenção: Esta ROM (MD5) não é suportada pelo RetroAchievements.");
+               runloop_msg_queue_push(msg, 5, 0, false);
+            }
+            /* --- FIM DO BLOCO ADICIONADO --- */
 
       return;
    }
