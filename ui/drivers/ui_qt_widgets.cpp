@@ -32,19 +32,12 @@
 #include "ui_qt_widgets.h"
 #include "ui_qt.h"
 
-#ifndef CXX_BUILD
-extern "C" {
-#endif
-
-#include <math.h>
-
-#include <retro_miscellaneous.h>
-#include <string/stdstring.h>
-#include <streams/file_stream.h>
-#include <file/file_path.h>
-#include <file/archive_file.h>
-#include <lists/string_list.h>
-
+/* RetroArch-internal headers are included here, OUTSIDE the extern "C"
+ * block below.  They self-guard their C declarations with
+ * RETRO_BEGIN_DECLS / RETRO_END_DECLS, and several of them transitively
+ * include libretro-common/include/retro_atomic.h, which in C++ mode
+ * pulls in the C++ <atomic> header.  Templates inside extern "C" are a
+ * hard error, so these must live outside the extern "C" block. */
 #include "../../config.def.h"
 #include "../../command.h"
 #include "../../core_info.h"
@@ -69,6 +62,19 @@ extern "C" {
 #include "../../menu/menu_shader.h"
 #endif
 #endif
+
+#ifndef CXX_BUILD
+extern "C" {
+#endif
+
+#include <math.h>
+
+#include <retro_miscellaneous.h>
+#include <string/stdstring.h>
+#include <streams/file_stream.h>
+#include <file/file_path.h>
+#include <file/archive_file.h>
+#include <lists/string_list.h>
 
 #ifndef CXX_BUILD
 }
@@ -4789,6 +4795,8 @@ typedef struct qt_download_userdata
    bool is_playlist_download;
 } qt_download_userdata_t;
 
+
+#ifdef HAVE_NETWORKING
 static void cb_extract_thumbnail_pack(retro_task_t *task,
       void *task_data, void *user_data, const char *err)
 {
@@ -4969,6 +4977,7 @@ static void cb_http_thumbnail(retro_task_t *task,
 
    free(ud);
 }
+#endif
 
 /* ---- Thumbnail Pack Download ---- */
 
@@ -4984,6 +4993,7 @@ void MainWindow::onThumbnailPackDownloadCanceled()
 
 void MainWindow::downloadAllThumbnails(QString system, QUrl url)
 {
+#ifdef HAVE_NETWORKING
    QString urlString;
    QByteArray urlArray;
    QByteArray fileNameArray;
@@ -5050,6 +5060,11 @@ void MainWindow::downloadAllThumbnails(QString system, QUrl url)
       m_thumbnailPackDownloadProgressDialog->cancel();
       RARCH_ERR("[Qt] Failed to start HTTP task for thumbnail pack.\n");
    }
+#else
+   (void)system;
+   (void)url;
+   RARCH_LOG("[Qt] Thumbnail pack download unavailable: built without networking.\n");
+#endif
 }
 
 void MainWindow::onThumbnailPackExtractFinished(bool success)
@@ -5129,6 +5144,7 @@ void MainWindow::onSingleThumbnailDownloadFinishedInternal(
 
 void MainWindow::downloadThumbnail(QString system, QString title, QUrl url)
 {
+#ifdef HAVE_NETWORKING
    QString urlString;
    QString downloadType;
    QByteArray urlArray;
@@ -5200,6 +5216,13 @@ void MainWindow::downloadThumbnail(QString system, QString title, QUrl url)
       m_thumbnailDownloadProgressDialog->cancel();
       RARCH_ERR("[Qt] Failed to start HTTP task for thumbnail.\n");
    }
+#else
+   (void)system;
+   (void)title;
+   (void)url;
+   m_pendingThumbnailDownloadTypes.clear();
+   RARCH_LOG("[Qt] Thumbnail download unavailable: built without networking.\n");
+#endif
 }
 
 /* ---- Playlist Thumbnail Download ---- */
@@ -5271,6 +5294,7 @@ void MainWindow::onPlaylistThumbnailDownloadFinishedInternal(
 void MainWindow::downloadNextPlaylistThumbnail(
       QString system, QString title, QString type, QUrl url)
 {
+#ifdef HAVE_NETWORKING
    QString urlString;
    QByteArray urlArray;
    QByteArray fileNameArray;
@@ -5351,6 +5375,15 @@ void MainWindow::downloadNextPlaylistThumbnail(
       else
          m_playlistThumbnailDownloadProgressDialog->cancel();
    }
+#else
+   (void)system;
+   (void)title;
+   (void)type;
+   (void)url;
+   m_pendingPlaylistThumbnails.clear();
+   m_playlistThumbnailDownloadProgressDialog->cancel();
+   RARCH_LOG("[Qt] Playlist thumbnail download unavailable: built without networking.\n");
+#endif
 }
 
 void MainWindow::downloadPlaylistThumbnails(QString playlistPath)
@@ -5867,7 +5900,11 @@ QWidget *NetplayPage::widget()
    serverForm->add(menu_setting_find_enum(MENU_ENUM_LABEL_NETPLAY_SPECTATE_PASSWORD));
    serverForm->add(menu_setting_find_enum(MENU_ENUM_LABEL_NETPLAY_NAT_TRAVERSAL));
 
-   serverLayout->addWidget(createMitmServerGroup());
+   {
+      QGroupBox *mitmGroup = createMitmServerGroup();
+      if (mitmGroup)
+         serverLayout->addWidget(mitmGroup);
+   }
    serverLayout->addSpacing(30);
    serverLayout->addLayout(serverForm);
 
@@ -5915,6 +5952,7 @@ QWidget *NetplayPage::widget()
 
 QGroupBox *NetplayPage::createMitmServerGroup()
 {
+#ifdef HAVE_NETWORKING
    size_t i;
    const char *netplay_mitm_server;
    CheckableSettingsGroup *groupBox = new CheckableSettingsGroup(
@@ -5952,10 +5990,14 @@ QGroupBox *NetplayPage::createMitmServerGroup()
 #endif
 
    return groupBox;
+#else
+   return nullptr;
+#endif
 }
 
 void NetplayPage::onRadioButtonClicked(int id)
 {
+#ifdef HAVE_NETWORKING
    rarch_setting_t *setting =
       menu_setting_find_enum(MENU_ENUM_LABEL_NETPLAY_MITM_SERVER);
 
@@ -5964,6 +6006,9 @@ void NetplayPage::onRadioButtonClicked(int id)
 
    strlcpy(setting->value.target.string,
          netplay_mitm_server_list[id].name, setting->size);
+#else
+   (void)id;
+#endif
 }
 
 UpdaterPage::UpdaterPage(QObject *parent) :

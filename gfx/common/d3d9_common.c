@@ -336,13 +336,25 @@ void d3d9_make_d3dpp(d3d9_video_t *d3d,
    if (!windowed_enable)
    {
 #ifdef _XBOX
+      /* Xbox: query the actual display size, publish it to video_st
+       * and track it in d3d->vp.full_width/full_height so subsequent
+       * read sites can pull from the local field instead of locking
+       * video_st. */
       unsigned width  = 0;
       unsigned height = 0;
       d3d9_get_video_size(d3d, &width, &height);
-      video_driver_set_size(width, height);
+      video_driver_set_output_size(width, height);
+      d3d->vp.full_width  = width;
+      d3d->vp.full_height = height;
+      d3dpp->BackBufferWidth  = width;
+      d3dpp->BackBufferHeight = height;
+#else
+      /* Non-Xbox: by the time make_d3dpp runs, d3d9_*_init_internal
+       * has already published the size and written d3d->vp.
+       * full_width/full_height; read from there. */
+      d3dpp->BackBufferWidth  = d3d->vp.full_width;
+      d3dpp->BackBufferHeight = d3d->vp.full_height;
 #endif
-      video_driver_get_size(&d3dpp->BackBufferWidth,
-            &d3dpp->BackBufferHeight);
    }
 
 #ifdef _XBOX

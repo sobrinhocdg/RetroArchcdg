@@ -3589,6 +3589,8 @@ static bool check_menu_driver_compatibility(settings_t *settings)
                 || (memcmp(video_driver, "glcore", 6) == 0 && video_driver[6] == '\0');
          if (video_driver[1] == 'x')
             return (memcmp(video_driver, "gx2",    3) == 0 && video_driver[3] == '\0');
+         if (video_driver[1] == 'd')
+            return (memcmp(video_driver, "gdi",    3) == 0 && video_driver[3] == '\0');
          return false;
       case 'v':
          return (memcmp(video_driver, "vulkan", 6) == 0 && video_driver[6] == '\0')
@@ -3597,6 +3599,15 @@ static bool check_menu_driver_compatibility(settings_t *settings)
          return (memcmp(video_driver, "metal",  5) == 0 && video_driver[5] == '\0');
       case 'r':
          return (memcmp(video_driver, "rsx",    3) == 0 && video_driver[3] == '\0');
+      case 's':
+         /* sdl2 supports the full menu set (XMB/Ozone/MaterialUI/RGUI)
+          * via gfx_display_ctx_sdl2 + sdl2_raster_font, gated on
+          * SDL_RenderGeometry (>= 2.0.18). On older SDL builds the
+          * driver self-disables the gfx_display backend, and only
+          * RGUI's bitmap path is functional - which already returned
+          * true via the rgui early-out above, so allowing sdl2 here
+          * is safe regardless of the runtime SDL version. */
+         return (memcmp(video_driver, "sdl2",   4) == 0 && video_driver[4] == '\0');
       case 'c':
          return (memcmp(video_driver, "ctr",    3) == 0 && video_driver[3] == '\0');
       default:
@@ -5425,7 +5436,7 @@ void input_config_get_prefix(char *s, char len, char user, bool meta)
  */
 static void input_config_save_keybinds_user(config_file_t *conf, unsigned user)
 {
-   size_t i = 0;
+   unsigned i;
    for (i = 0; input_config_bind_map_get_valid(i); i++)
    {
       char key[64];
@@ -5471,7 +5482,7 @@ static void input_config_save_keybinds_user_override(config_file_t *conf,
       unsigned user, unsigned bind_id,
       const struct retro_keybind *override_bind)
 {
-   size_t i = bind_id;
+   unsigned i = bind_id;
 
    if (input_config_bind_map_get_valid(i))
    {
@@ -5522,7 +5533,7 @@ static void input_config_save_keybinds_user_override(config_file_t *conf,
 static void input_config_save_keybinds_user_minimal(config_file_t *conf,
       unsigned user, const retro_keybind_set default_binds)
 {
-   size_t i = 0;
+   unsigned i;
    for (i = 0; input_config_bind_map_get_valid(i); i++)
    {
       char key[64];

@@ -709,23 +709,6 @@ static const float d3d9_hlsl_tex_coords[8] = {
 
 static LPDIRECT3DTEXTURE9 d3d9_hlsl_white_texture = NULL;
 
-static INT32 gfx_display_prim_to_d3d9_hlsl_enum(
-      enum gfx_display_prim_type prim_type)
-{
-   switch (prim_type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         return D3DPT_TRIANGLESTRIP;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   /* TODO/FIXME - hack */
-   return 0;
-}
-
 static void gfx_display_d3d9_hlsl_blend_begin(void *data)
 {
    d3d9_video_t *d3d = (d3d9_video_t*)data;
@@ -777,7 +760,6 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
 {
    unsigned i;
    LPDIRECT3DDEVICE9 dev;
-   D3DPRIMITIVETYPE type;
    bool has_vertex_data;
    unsigned start                = 0;
    unsigned count                = 0;
@@ -1099,13 +1081,20 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
    if (draw && draw->texture)
       gfx_display_d3d9_bind_texture(draw, d3d);
 
-   type  = (D3DPRIMITIVETYPE)gfx_display_prim_to_d3d9_hlsl_enum(draw->prim_type);
    start = d3d->menu_display.offset;
-   count = draw->coords->vertices -
-         ((draw->prim_type == GFX_DISPLAY_PRIM_TRIANGLESTRIP)
-          ? 2 : 0);
 
-   IDirect3DDevice9_DrawPrimitive(dev, type, start, count);
+   /* Menu draws use a triangle-strip layout.  Harden against vertices < 3
+    * (the count formula vertices - 2 would otherwise underflow the
+    * unsigned subtraction and pass a huge primitive count to the GPU --
+    * see d3d8.c for the matching guard). */
+   if (draw->coords->vertices < 3)
+   {
+      d3d->menu_display.offset += draw->coords->vertices;
+      return;
+   }
+   count = draw->coords->vertices - 2;
+
+   IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP, start, count);
 
    d3d->menu_display.offset += draw->coords->vertices;
 }
@@ -1252,7 +1241,6 @@ static void gfx_display_d3d9_hlsl_draw_pipeline(
           * ca->coords.vertices (which ribbon needs at 8064). */
          blank_coords.vertices = 4;
          draw->coords          = &blank_coords;
-         draw->prim_type = GFX_DISPLAY_PRIM_TRIANGLESTRIP;
 
          /* Set blend state for particle effects */
          IDirect3DDevice9_SetRenderState(d3d->dev,
@@ -1606,7 +1594,8 @@ static void d3d9_font_render_msg(
    if (!d3d)
       return;
 
-   video_driver_get_size(&width, &height);
+   width  = d3d->vp.full_width;
+   height = d3d->vp.full_height;
    if (!width || !height)
       return;
 
@@ -6901,7 +6890,10 @@ static void d3d9_hlsl_set_viewport(void *data,
    int y               = 0;
    struct video_viewport vp;
 
-   video_driver_get_size(&width, &height);
+   /* Width/height parameters are intentionally overwritten here:
+    * the caller's values are not used (pre-existing behaviour). */
+   width  = d3d->vp.full_width;
+   height = d3d->vp.full_height;
 
    vp.full_width  = width;
    vp.full_height = height;
@@ -6963,7 +6955,6 @@ static void d3d9_hlsl_set_osd_msg(void *data,
 static bool d3d9_hlsl_initialize(
       d3d9_video_t *d3d, const video_info_t *info)
 {
-   unsigned width, height;
    bool ret             = true;
 
    if (!d3d->d3d9)
@@ -6998,9 +6989,10 @@ static bool d3d9_hlsl_initialize(
       return false;
    }
 
-   video_driver_get_size(&width, &height);
+   /* d3d->vp.full_* was written by the caller (d3d9_hlsl_init_internal
+    * has already called set_size at this point). */
    d3d9_hlsl_set_viewport(d3d,
-      width, height, false, true);
+      d3d->vp.full_width, d3d->vp.full_height, false, true);
 
    font_driver_init_osd(d3d, info,
          false,
@@ -7145,10 +7137,6 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
    MONITORINFOEX current_mon;
    HMONITOR hm_to_use;
 #endif
-#ifdef HAVE_WINDOW
-   unsigned win_width        = 0;
-   unsigned win_height       = 0;
-#endif
    unsigned full_x           = 0;
    unsigned full_y           = 0;
    settings_t    *settings   = config_get_ptr();
@@ -7203,19 +7191,23 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
    {
       unsigned new_width  = info->fullscreen ? full_x : info->width;
       unsigned new_height = info->fullscreen ? full_y : info->height;
-      video_driver_set_size(new_width, new_height);
-   }
+      video_driver_set_output_size(new_width, new_height);
+      d3d->vp.full_width  = new_width;
+      d3d->vp.full_height = new_height;
 
 #ifdef HAVE_WINDOW
-   video_driver_get_size(&win_width, &win_height);
-
-   if (!win32_set_video_mode(d3d, win_width, win_height,
-         info->fullscreen))
-   {
-      RARCH_ERR("[D3D9 HLSL] win32_set_video_mode failed.\n");
-      return false;
-   }
+      /* Use new_width / new_height directly rather than reading
+       * them back via video_driver_get_output_size: nothing in the
+       * codebase writes video_st->width / height between the
+       * set_size above and this call except us. */
+      if (!win32_set_video_mode(d3d, new_width, new_height,
+            info->fullscreen))
+      {
+         RARCH_ERR("[D3D9 HLSL] win32_set_video_mode failed.\n");
+         return false;
+      }
 #endif
+   }
 
    d3d->video_info = *info;
 
@@ -7287,18 +7279,15 @@ error:
 
 static void d3d9_hlsl_viewport_info(void *data, struct video_viewport *vp)
 {
-   unsigned width, height;
    d3d9_video_t *d3d   = (d3d9_video_t*)data;
-
-   video_driver_get_size(&width, &height);
 
    vp->x               = d3d->out_vp.X;
    vp->y               = d3d->out_vp.Y;
    vp->width           = d3d->out_vp.Width;
    vp->height          = d3d->out_vp.Height;
 
-   vp->full_width      = width;
-   vp->full_height     = height;
+   vp->full_width      = d3d->vp.full_width;
+   vp->full_height     = d3d->vp.full_height;
 }
 
 #ifdef HAVE_OVERLAY
@@ -8174,7 +8163,9 @@ static void d3d9_hlsl_set_resize(d3d9_video_t *d3d,
 
    d3d->video_info.width  = new_width;
    d3d->video_info.height = new_height;
-   video_driver_set_size(new_width, new_height);
+   video_driver_set_output_size(new_width, new_height);
+   d3d->vp.full_width     = new_width;
+   d3d->vp.full_height    = new_height;
 }
 
 static bool d3d9_hlsl_alive(void *data)
@@ -8186,8 +8177,11 @@ static bool d3d9_hlsl_alive(void *data)
    bool        resize    = false;
    d3d9_video_t *d3d     = (d3d9_video_t*)data;
 
-   /* Needed because some context drivers don't track their sizes */
-   video_driver_get_size(&temp_width, &temp_height);
+   /* Read from local bookkeeping rather than video_st (which would
+    * acquire context_lock + display_lock).  d3d->vp.full_* is
+    * written at every set_size call site in this driver. */
+   temp_width  = d3d->vp.full_width;
+   temp_height = d3d->vp.full_height;
 
    win32_check_window(NULL, &quit, &resize, &temp_width, &temp_height);
 
@@ -8205,7 +8199,11 @@ static bool d3d9_hlsl_alive(void *data)
 
    if (  temp_width  != 0 &&
          temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
+   {
+      video_driver_set_output_size(temp_width, temp_height);
+      d3d->vp.full_width  = temp_width;
+      d3d->vp.full_height = temp_height;
+   }
 
    return ret;
 }
@@ -8266,15 +8264,14 @@ static INLINE bool d3d9_hlsl_device_get_render_target_data(
 
 static bool d3d9_hlsl_read_viewport(void *data, uint8_t *buffer, bool is_idle)
 {
-   unsigned width, height;
    D3DLOCKED_RECT rect;
    LPDIRECT3DSURFACE9 target = NULL;
    LPDIRECT3DSURFACE9 dest   = NULL;
    bool ret                  = true;
    d3d9_video_t *d3d         = (d3d9_video_t*)data;
    LPDIRECT3DDEVICE9 d3dr    = d3d->dev;
-
-   video_driver_get_size(&width, &height);
+   unsigned width            = d3d->vp.full_width;
+   unsigned height           = d3d->vp.full_height;
 
    if (
             !(d3dr &&

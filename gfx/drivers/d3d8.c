@@ -409,9 +409,8 @@ static void d3d8_set_vertices(
       unsigned pass,
       unsigned vert_width, unsigned vert_height, uint64_t frame_count)
 {
-   unsigned width, height;
-
-   video_driver_get_size(&width, &height);
+   unsigned width  = d3d->vp.full_width;
+   unsigned height = d3d->vp.full_height;
 
    if (chain->last_width != vert_width || chain->last_height != vert_height)
    {
@@ -572,15 +571,14 @@ static bool d3d8_setup_init(void *data,
       bool rgb32
       )
 {
-   unsigned width, height;
    d3d8_video_t *d3d                      = (d3d8_video_t*)data;
    settings_t *settings                   = config_get_ptr();
    LPDIRECT3DDEVICE8 d3dr                 = (LPDIRECT3DDEVICE8)d3d->dev;
    d3d8_renderchain_t *chain              = (d3d8_renderchain_t*)d3d->renderchain_data;
    unsigned fmt                           = (rgb32) ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;
    video_viewport_t *custom_vp            = &settings->video_vp_custom;
-
-   video_driver_get_size(&width, &height);
+   unsigned width                         = d3d->vp.full_width;
+   unsigned height                        = d3d->vp.full_height;
 
    chain->dev                             = dev_data;
    chain->pixel_size                      = (fmt == RETRO_PIXEL_FORMAT_RGB565)
@@ -659,23 +657,6 @@ static void *gfx_display_d3d8_get_default_mvp(void *data)
    return &id;
 }
 
-static INT32 gfx_display_prim_to_d3d8_enum(
-      enum gfx_display_prim_type prim_type)
-{
-   switch (prim_type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         return D3DPT_TRIANGLESTRIP;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   /* TODO/FIXME - hack */
-   return 0;
-}
-
 static void gfx_display_d3d8_blend_begin(void *data)
 {
    d3d8_video_t *d3d             = (d3d8_video_t*)data;
@@ -712,7 +693,6 @@ static void gfx_display_d3d8_draw(gfx_display_ctx_draw_t *draw,
    math_matrix_4x4 mop, m1, m2;
    LPDIRECT3DVERTEXBUFFER8 vbo;
    LPDIRECT3DDEVICE8 dev;
-   D3DPRIMITIVETYPE type;
    unsigned start                = 0;
    unsigned count                = 0;
    d3d8_video_t *d3d             = (d3d8_video_t*)data;
@@ -1007,32 +987,22 @@ static void gfx_display_d3d8_draw(gfx_display_ctx_draw_t *draw,
    IDirect3DDevice8_SetTextureStageState(dev, 0,
          (D3DTEXTURESTAGESTATETYPE)D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
 
-   type  = gfx_display_prim_to_d3d8_enum(draw->prim_type);
    start = d3d->menu_display.offset;
 
-   /* For tristrips, the primitive count is vertices - 2. Guard
-    * against vertices < 3 which would underflow the unsigned
-    * subtraction and pass a huge primitive count to the GPU. */
-   if (draw->prim_type == GFX_DISPLAY_PRIM_TRIANGLESTRIP)
-   {
-      if (draw->coords->vertices < 3)
-      {
-         d3d->menu_display.offset += draw->coords->vertices;
-         return;
-      }
-      count = draw->coords->vertices - 2;
-   }
-   else
-      count = draw->coords->vertices;
-
-   if (count == 0)
+   /* Menu draws issued by gfx_display always pass a triangle-strip layout
+    * (4 vertices = 2 triangles for a quad).  D3D8 expects PrimitiveCount,
+    * not vertex count, hence (vertices - 2).  Guard against vertices < 3
+    * which would underflow the unsigned subtraction and pass a huge
+    * primitive count to the GPU. */
+   if (draw->coords->vertices < 3)
    {
       d3d->menu_display.offset += draw->coords->vertices;
       return;
    }
+   count = draw->coords->vertices - 2;
 
    IDirect3DDevice8_BeginScene(dev);
-   IDirect3DDevice8_DrawPrimitive(dev, type, start, count);
+   IDirect3DDevice8_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP, start, count);
    IDirect3DDevice8_EndScene(dev);
 
    d3d->menu_display.offset += draw->coords->vertices;
@@ -1569,7 +1539,8 @@ static void d3d8_font_render_msg(
    if (!d3d)
       return;
 
-   video_driver_get_size(&width, &height);
+   width  = d3d->vp.full_width;
+   height = d3d->vp.full_height;
    if (!width || !height)
       return;
 
@@ -1781,21 +1752,18 @@ gfx_display_ctx_driver_t gfx_display_ctx_d3d8 = {
 
 static void d3d8_viewport_info(void *data, struct video_viewport *vp)
 {
-   unsigned width, height;
    d3d8_video_t *d3d   = (d3d8_video_t*)data;
 
    if (!d3d || !vp)
       return;
-
-   video_driver_get_size(&width, &height);
 
    vp->x            = d3d->out_vp.X;
    vp->y            = d3d->out_vp.Y;
    vp->width        = d3d->out_vp.Width;
    vp->height       = d3d->out_vp.Height;
 
-   vp->full_width   = width;
-   vp->full_height  = height;
+   vp->full_width   = d3d->vp.full_width;
+   vp->full_height  = d3d->vp.full_height;
 }
 
 static void d3d8_overlay_render(d3d8_video_t *d3d,
@@ -2104,14 +2072,26 @@ static void d3d8_make_d3dpp(void *data,
    if (!windowed_enable)
    {
 #ifdef _XBOX
+      /* Xbox: query the actual display size, publish it to video_st
+       * and track it in d3d->vp.full_width/full_height so subsequent
+       * read sites (font_render_msg, viewport_info, etc.) can pull
+       * from the local field instead of locking video_st. */
       unsigned width              = 0;
       unsigned height             = 0;
 
       d3d8_get_video_size(d3d, &width, &height);
-      video_driver_set_size(width, height);
+      video_driver_set_output_size(width, height);
+      d3d->vp.full_width          = width;
+      d3d->vp.full_height         = height;
+      d3dpp->BackBufferWidth      = width;
+      d3dpp->BackBufferHeight     = height;
+#else
+      /* Non-Xbox: by the time make_d3dpp runs, d3d8_init_internal
+       * has already published the size and written d3d->vp.
+       * full_width/full_height; read from there. */
+      d3dpp->BackBufferWidth      = d3d->vp.full_width;
+      d3dpp->BackBufferHeight     = d3d->vp.full_height;
 #endif
-      video_driver_get_size(&d3dpp->BackBufferWidth,
-            &d3dpp->BackBufferHeight);
    }
 
 #ifdef _XBOX
@@ -2193,7 +2173,8 @@ static void d3d8_calculate_rect(void *data,
    struct video_viewport vp;
    d3d8_video_t *d3d         = (d3d8_video_t*)data;
 
-   video_driver_get_size(width, height);
+   *width  = d3d->vp.full_width;
+   *height = d3d->vp.full_height;
 
    vp.full_width  = *width;
    vp.full_height = *height;
@@ -2258,7 +2239,6 @@ static void d3d8_set_viewport(void *data,
 static bool d3d8_initialize(d3d8_video_t *d3d, const video_info_t *info)
 {
    struct LinkInfo link_info;
-   unsigned width, height;
    unsigned i           = 0;
    bool ret             = true;
    settings_t *settings = config_get_ptr();
@@ -2307,9 +2287,10 @@ static bool d3d8_initialize(d3d8_video_t *d3d, const video_info_t *info)
       )
       return false;
 
-   video_driver_get_size(&width, &height);
+   /* d3d->vp.full_* was written by the caller (d3d8_init_internal
+    * has already called set_size at this point). */
    d3d8_set_viewport(d3d,
-	   width, height, false, true);
+	   d3d->vp.full_width, d3d->vp.full_height, false, true);
 
    font_driver_init_osd(d3d, info,
          false,
@@ -2403,7 +2384,9 @@ static void d3d8_set_resize(d3d8_video_t *d3d,
 
    d3d->video_info.width  = new_width;
    d3d->video_info.height = new_height;
-   video_driver_set_size(new_width, new_height);
+   video_driver_set_output_size(new_width, new_height);
+   d3d->vp.full_width     = new_width;
+   d3d->vp.full_height    = new_height;
 }
 
 static bool d3d8_alive(void *data)
@@ -2415,8 +2398,14 @@ static bool d3d8_alive(void *data)
    bool        quit     = false;
    bool        resize   = false;
 
-   /* Needed because some context drivers don't track their sizes */
-   video_driver_get_size(&temp_width, &temp_height);
+   /* Read from local bookkeeping rather than video_st (which
+    * would acquire context_lock + display_lock).  d3d->vp.full_*
+    * is written at every set_size call site in this driver, so
+    * it stays in sync with video_st->width/height as long as no
+    * other code path writes them.  In practice nothing does --
+    * see video_driver.c audit. */
+   temp_width  = d3d->vp.full_width;
+   temp_height = d3d->vp.full_height;
 
    win32_check_window(NULL, &quit, &resize, &temp_width, &temp_height);
 
@@ -2433,7 +2422,11 @@ static bool d3d8_alive(void *data)
    ret = !quit;
 
    if (temp_width != 0 && temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
+   {
+      video_driver_set_output_size(temp_width, temp_height);
+      d3d->vp.full_width  = temp_width;
+      d3d->vp.full_height = temp_height;
+   }
 
    return ret;
 }
@@ -2481,10 +2474,6 @@ static bool d3d8_init_internal(d3d8_video_t *d3d,
    HMONITOR hm_to_use;
 #endif
    struct video_shader_pass *pass = NULL;
-#ifdef HAVE_WINDOW
-   unsigned win_width        = 0;
-   unsigned win_height       = 0;
-#endif
    unsigned full_x           = 0;
    unsigned full_y           = 0;
    settings_t    *settings   = config_get_ptr();
@@ -2537,19 +2526,23 @@ static bool d3d8_init_internal(d3d8_video_t *d3d,
    {
       unsigned new_width  = info->fullscreen ? full_x : info->width;
       unsigned new_height = info->fullscreen ? full_y : info->height;
-      video_driver_set_size(new_width, new_height);
-   }
+      video_driver_set_output_size(new_width, new_height);
+      d3d->vp.full_width  = new_width;
+      d3d->vp.full_height = new_height;
 
 #ifdef HAVE_WINDOW
-   video_driver_get_size(&win_width, &win_height);
-
-   if (!win32_set_video_mode(d3d, win_width, win_height,
-         info->fullscreen))
-   {
-      RARCH_ERR("[D3D8] win32_set_video_mode failed.\n");
-      return false;
-   }
+      /* Use new_width / new_height directly rather than reading
+       * them back via video_driver_get_output_size: nothing in the
+       * codebase writes video_st->width / height between the
+       * set_size above and this call except us. */
+      if (!win32_set_video_mode(d3d, new_width, new_height,
+            info->fullscreen))
+      {
+         RARCH_ERR("[D3D8] win32_set_video_mode failed.\n");
+         return false;
+      }
 #endif
+   }
 
    memset(&d3d->shader, 0, sizeof(d3d->shader));
    d3d->shader.passes                    = 1;

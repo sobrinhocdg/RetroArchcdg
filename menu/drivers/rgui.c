@@ -1374,48 +1374,68 @@ static uint16_t argb32_to_rgba4444(uint32_t col)
 
 static uint16_t (*argb32_to_pixel_platform_format)(uint32_t col) = argb32_to_rgba4444;
 
+/* Per-driver RGUI pixel-format dispatch.
+ *
+ * Each entry maps a video driver ident to:
+ *   - the conversion function used to produce the platform's
+ *     16bpp menu framebuffer format from the source ARGB32, and
+ *   - whether that platform format carries usable alpha
+ *     (i.e. supports framebuffer transparency in RGUI).
+ *
+ * The list is scanned in order; the first ident match wins.  When
+ * adding a new driver, append a single entry here -- no other
+ * changes in this function are needed.  Any driver not in the table
+ * gets the default fallback specified below the table. */
+typedef struct
+{
+   const char *driver_ident;
+   uint16_t (*conv)(uint32_t);
+   bool transparency_supported;
+} rgui_pixel_format_entry;
+
+static const rgui_pixel_format_entry rgui_pixel_format_map[] =
+{
+   { "ps2",        argb32_to_abgr1555, false }, /* PS2 */
+   { "gx",         argb32_to_rgb5a3,   true  }, /* GEKKO */
+   { "psp1",       argb32_to_abgr4444, true  }, /* PSP */
+   { "rsx",        argb32_to_argb4444, true  }, /* PS3 */
+   { "d3d8",       argb32_to_argb4444, true  }, /* D3D8 (Original Xbox + legacy Windows) */
+   { "d3d9_hlsl",  argb32_to_argb4444, true  }, /* D3D9 PC/Xbox 360 */
+   { "d3d9_cg",    argb32_to_argb4444, true  }, /* D3D9 PC */
+   { "d3d10",      argb32_to_bgra4444, true  }, /* D3D10/11/12 */
+   { "d3d11",      argb32_to_bgra4444, true  },
+   { "d3d12",      argb32_to_bgra4444, true  },
+   { "metal",      argb32_to_bgra4444, true  }, /* Metal */
+   { "sdl_dingux", argb32_to_rgb565,   false }, /* DINGUX SDL */
+   { "sdl_rs90",   argb32_to_rgb565,   false },
+   { "xvideo",     argb32_to_rgb565,   false }
+};
+
 /* Returns true if current pixel format supports
  * framebuffer transparency */
 static bool rgui_set_pixel_format_function(void)
 {
-   const char *driver_ident    = video_driver_get_ident();
+   const char *driver_ident = video_driver_get_ident();
+   size_t i;
 
-   /* Default fallback... */
-   if (!driver_ident || !*driver_ident)
+   if (driver_ident && *driver_ident)
    {
-      argb32_to_pixel_platform_format = argb32_to_rgba4444;
-      return true; /* Transparency supported */
+      for (i = 0; i < ARRAY_SIZE(rgui_pixel_format_map); i++)
+      {
+         if (string_is_equal(driver_ident,
+                  rgui_pixel_format_map[i].driver_ident))
+         {
+            argb32_to_pixel_platform_format =
+                  rgui_pixel_format_map[i].conv;
+            return rgui_pixel_format_map[i].transparency_supported;
+         }
+      }
    }
 
-   if (string_is_equal(driver_ident, "ps2"))                  /* PS2 */
-   {
-      argb32_to_pixel_platform_format = argb32_to_abgr1555;
-      return false; /* Transparency not supported */
-   }
-   else if (string_is_equal(driver_ident, "gx"))              /* GEKKO */
-      argb32_to_pixel_platform_format = argb32_to_rgb5a3;
-   else if (string_is_equal(driver_ident, "psp1"))            /* PSP */
-      argb32_to_pixel_platform_format = argb32_to_abgr4444;
-   else if (   string_is_equal(driver_ident, "rsx")            /* PS3 */
-            || string_is_equal(driver_ident, "d3d8")           /* D3D8 (Original Xbox + legacy Windows) */
-            || string_is_equal(driver_ident, "d3d9_hlsl")      /* D3D9 (PC + Xbox 360) */
-            || string_is_equal(driver_ident, "d3d9_cg"))
-      argb32_to_pixel_platform_format = argb32_to_argb4444;
-   else if (   string_is_equal(driver_ident, "d3d10")         /* D3D10/11/12 */
-            || string_is_equal(driver_ident, "d3d11")
-            || string_is_equal(driver_ident, "d3d12")
-            || string_is_equal(driver_ident, "metal"))        /* Metal */
-      argb32_to_pixel_platform_format = argb32_to_bgra4444;
-   else if (   string_is_equal(driver_ident, "sdl_dingux")    /* DINGUX SDL */
-            || string_is_equal(driver_ident, "sdl_rs90")
-            || string_is_equal(driver_ident, "xvideo"))
-   {
-      argb32_to_pixel_platform_format = argb32_to_rgb565;
-      return false; /* Transparency not supported */
-   }
-   else
-      argb32_to_pixel_platform_format = argb32_to_rgba4444;
-   return true; /* Transparency supported */
+   /* Default fallback for unknown / empty driver ident:
+    * RGBA4444 with transparency support. */
+   argb32_to_pixel_platform_format = argb32_to_rgba4444;
+   return true;
 }
 
 /* ==============================
@@ -2952,7 +2972,7 @@ static void rgui_render_mini_thumbnail(
       else
          fb_y_offset = (rgui->term_layout.start_y + term_height) - thumbnail->max_height;
 
-      text_x         = (thumbnail->max_width  / 2) + fb_x_offset - (strlen(msg) * (rgui->font_width_stride / 2));
+      text_x         = (thumbnail->max_width  / 2) + fb_x_offset - ((int)strlen(msg) * (rgui->font_width_stride / 2));
       text_y         = (thumbnail->max_height / 2) + fb_y_offset - (rgui->font_height_stride / 3);
 
       /* Draw background */
@@ -5312,7 +5332,6 @@ static void rgui_render(void *data, unsigned width, unsigned height,
       char thumbnail_title_buf[NAME_MAX_LENGTH];
       unsigned title_x, title_width;
       const char *thumbnail_title = NULL;
-      struct menu_state *menu_st  = menu_state_get_ptr();
       bool is_state_slot          = *rgui->savestate_thumbnail_file_path;
       thumbnail_title_buf[0]      = '\0';
 
@@ -5524,9 +5543,9 @@ static void rgui_render(void *data, unsigned width, unsigned height,
 
          rgui_blit_line(rgui,
                fb_width,
-               term_end_x
+               (int)(term_end_x
                      - (powerstate_len * rgui->font_width_stride)
-                     - (timedate_len * rgui->font_width_stride),
+                     - (timedate_len * rgui->font_width_stride)),
                title_y,
                timedate,
                rgui->colors.hover_color,
@@ -7444,6 +7463,7 @@ static void rgui_populate_entries(
 {
    rgui_t *rgui                  = (rgui_t*)data;
    settings_t *settings          = config_get_ptr();
+   struct menu_state *menu_st    = menu_state_get_ptr();
 #if defined(DINGUX)
    unsigned aspect_ratio_lock    = RGUI_ASPECT_RATIO_LOCK_NONE;
 #else
@@ -7551,19 +7571,19 @@ static void rgui_populate_entries(
    {
       if (     remember_selection == MENU_REMEMBER_SELECTION_ALWAYS
             || remember_selection == MENU_REMEMBER_SELECTION_PLAYLISTS)
-         menu_state_get_ptr()->selection_ptr = rgui->playlist_selection[rgui->playlist_selection_ptr];
+         menu_st->selection_ptr = rgui->playlist_selection[rgui->playlist_selection_ptr];
    }
    else if (rgui->flags & RGUI_FLAG_IS_PLAYLISTS_TAB)
    {
       if (     remember_selection == MENU_REMEMBER_SELECTION_ALWAYS
             || remember_selection == MENU_REMEMBER_SELECTION_PLAYLISTS)
-         menu_state_get_ptr()->selection_ptr = rgui->playlist_selection_ptr;
+         menu_st->selection_ptr = rgui->playlist_selection_ptr;
    }
    else if (string_is_equal(label, MENU_ENUM_LABEL_SETTINGS_STR))
    {
       if (     remember_selection == MENU_REMEMBER_SELECTION_ALWAYS
             || remember_selection == MENU_REMEMBER_SELECTION_MAIN)
-         menu_state_get_ptr()->selection_ptr = rgui->settings_selection_ptr;
+         menu_st->selection_ptr = rgui->settings_selection_ptr;
    }
 
    rgui_navigation_set(data, true);
@@ -7694,8 +7714,6 @@ static int rgui_pointer_up(
                   return rgui_menu_entry_action(rgui, entry, selection, MENU_ACTION_CANCEL);
                else if (ptr <= (end - 1))
                {
-                  struct menu_state *menu_st = menu_state_get_ptr();
-
                   /* Perform 'select' on the pointed item */
                   menu_st->selection_ptr = ptr;
                   rgui_navigation_set(rgui, false);

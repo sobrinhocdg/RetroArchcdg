@@ -641,7 +641,6 @@ static void gfx_display_gl3_draw_pipeline(
                   + 3 * sizeof(float), &yflip, sizeof(yflip));
             draw->coords          = &blank_coords;
             blank_coords.vertices = 4;
-            draw->prim_type       = GFX_DISPLAY_PRIM_TRIANGLESTRIP;
             break;
       }
    }
@@ -649,23 +648,6 @@ static void gfx_display_gl3_draw_pipeline(
 
    t += 0.01;
 #endif
-}
-
-static GLenum gfx_display_prim_to_gl3_enum(
-      enum gfx_display_prim_type type)
-{
-   switch (type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         return GL_TRIANGLE_STRIP;
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-         return GL_TRIANGLES;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   return 0;
 }
 
 static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
@@ -695,8 +677,8 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
             draw->matrix_data ? (math_matrix_4x4*)draw->matrix_data
          : (math_matrix_4x4*)&gl->mvp_no_rot);
 
-      glDrawArrays(gfx_display_prim_to_gl3_enum(
-               draw->prim_type), 0, draw->coords->vertices);
+      /* Menu draws use a triangle-strip layout. */
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
    }
 #ifdef HAVE_SLANG
    else
@@ -797,18 +779,9 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
       glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE,
             4 * sizeof(float), (void *)(uintptr_t)0);
 
-      switch (draw->prim_type)
-      {
-         case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
-            break;
-         case GFX_DISPLAY_PRIM_TRIANGLES:
-            glDrawArrays(GL_TRIANGLES, 0, draw->coords->vertices);
-            break;
-         case GFX_DISPLAY_PRIM_NONE:
-         default:
-            break;
-      }
+      /* See the matching comment in the chain.active branch above:
+       * every caller passes TRIANGLESTRIP. */
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
 
       glDisableVertexAttribArray(0);
       glDisableVertexAttribArray(1);
@@ -3024,8 +2997,9 @@ static void *gl3_init(const video_info_t *video,
    /* Get real known video size, which might have been altered by context. */
 
    if (temp_width != 0 && temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
-   video_driver_get_size(&temp_width, &temp_height);
+      video_driver_set_output_size(temp_width, temp_height);
+   else
+      video_driver_get_output_size(&temp_width, &temp_height);
    gl->video_width  = temp_width;
    gl->video_height = temp_height;
 
@@ -3326,7 +3300,7 @@ static bool gl3_alive(void *data)
 
    if (temp_width != 0 && temp_height != 0)
    {
-      video_driver_set_size(temp_width, temp_height);
+      video_driver_set_output_size(temp_width, temp_height);
       gl->video_width  = temp_width;
       gl->video_height = temp_height;
    }

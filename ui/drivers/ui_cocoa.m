@@ -46,7 +46,7 @@
 #include <IOKit/hidsystem/IOLLEvent.h>
 
 #if defined(HAVE_COCOA_METAL)
-#include "../../gfx/common/metal_common.h"
+#include "../../gfx/common/metal_view.h"
 #endif
 
 #include "../ui_companion_driver.h"

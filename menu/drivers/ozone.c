@@ -3089,7 +3089,6 @@ static void ozone_draw_icon(
    draw.coords          = &coords;
    draw.matrix_data     = mymat;
    draw.texture         = texture;
-   draw.prim_type       = GFX_DISPLAY_PRIM_TRIANGLESTRIP;
    draw.pipeline_id     = 0;
 
    if (draw.height > 0 && draw.width > 0)
@@ -3643,6 +3642,24 @@ static void ozone_draw_sidebar(
          enum msg_hash_enums value_idx  = ozone_system_tabs_value[ozone->tabs[i]];
          const char *title              = msg_hash_to_str(value_idx);
          uint32_t text_color            = 0;
+         /* Available pixel width for the ticker.  scale_factor
+          * promotes the right operand to float, and entry_width
+          * may legitimately be small or zero (sidebar collapsed
+          * or animating in -- dimensions_sidebar_width is a float
+          * tween initialised to 0.0f), so the float sum can land
+          * below zero.  Implicit float-to-unsigned conversion of
+          * a negative is UB (C11 6.3.1.4 p1) -- UBSan flagged
+          * the previous integer-typed expression here as e.g.
+          * '-20.4167 outside the range of unsigned int'.  Compute
+          * in signed int (no float intruders) and clamp at zero;
+          * a non-positive width means there's no room to draw
+          * anything, which the ticker treats as 'skip' rather
+          * than scribbling at the wrap-around offset. */
+         int avail_width                = entry_width
+               - ozone->dimensions.sidebar_entry_icon_size
+               - (int)(40.0f * scale_factor);
+         unsigned ticker_field_width    = avail_width > 0
+               ? (unsigned)avail_width : 0;
          if (ozone->theme)
             text_color                  = selected
                ? COLOR_TEXT_ALPHA(ozone->theme->text_selected_rgba, text_alpha)
@@ -3651,13 +3668,7 @@ static void ozone_draw_sidebar(
          if (use_smooth_ticker)
          {
             ticker_smooth.selected    = selected;
-            /* TODO/FIXME - undefined behavior reported by ASAN -
-             *-12.549 is outside the range of representable values
-             of type 'unsigned int'
-             * */
-            ticker_smooth.field_width = (entry_width
-                  - ozone->dimensions.sidebar_entry_icon_size
-                  - 40 * scale_factor);
+            ticker_smooth.field_width = ticker_field_width;
             ticker_smooth.src_str     = title;
             ticker_smooth.dst_str     = console_title;
             ticker_smooth.dst_str_len = sizeof(console_title);
@@ -3666,10 +3677,9 @@ static void ozone_draw_sidebar(
          }
          else
          {
-            ticker.len      = (entry_width
-                  - ozone->dimensions.sidebar_entry_icon_size
-                  - 40 * scale_factor)
-                  / ozone->fonts.sidebar.glyph_width;
+            ticker.len      = ozone->fonts.sidebar.glyph_width
+                  ? ticker_field_width / ozone->fonts.sidebar.glyph_width
+                  : 0;
             ticker.s        = console_title;
             ticker.selected = selected;
             ticker.str      = title;
@@ -3796,33 +3806,40 @@ static void ozone_draw_sidebar(
          if (ozone->sidebar_collapsed)
             goto console_iterate;
 
-         if (use_smooth_ticker)
+         /* See matching computation earlier in this function for
+          * the rationale; entry_width can be small or zero
+          * (sidebar_width is a float tween, init 0.0f) and the
+          * float `40 * scale_factor` term promotes the sum to
+          * float, so the result can land below zero and the
+          * implicit conversion to unsigned/size_t is UB. */
          {
-            ticker_smooth.selected    = selected;
-            /* TODO/FIXME - undefined behavior reported by ASAN -
-             *-12.549 is outside the range of representable values
-             of type 'unsigned int'
-             * */
-            ticker_smooth.field_width = (entry_width
+            int avail_width                = entry_width
                   - ozone->dimensions.sidebar_entry_icon_size
-                  - 40 * scale_factor);
-            ticker_smooth.src_str     = node->console_name;
-            ticker_smooth.dst_str     = console_title;
-            ticker_smooth.dst_str_len = sizeof(console_title);
+                  - (int)(40.0f * scale_factor);
+            unsigned ticker_field_width    = avail_width > 0
+                  ? (unsigned)avail_width : 0;
 
-            gfx_animation_ticker_smooth(&ticker_smooth);
-         }
-         else
-         {
-            ticker.len      = (entry_width
-                  - ozone->dimensions.sidebar_entry_icon_size
-                  - 40 * scale_factor)
-                  / ozone->fonts.sidebar.glyph_width;
-            ticker.s        = console_title;
-            ticker.selected = selected;
-            ticker.str      = node->console_name;
+            if (use_smooth_ticker)
+            {
+               ticker_smooth.selected    = selected;
+               ticker_smooth.field_width = ticker_field_width;
+               ticker_smooth.src_str     = node->console_name;
+               ticker_smooth.dst_str     = console_title;
+               ticker_smooth.dst_str_len = sizeof(console_title);
 
-            gfx_animation_ticker(&ticker);
+               gfx_animation_ticker_smooth(&ticker_smooth);
+            }
+            else
+            {
+               ticker.len      = ozone->fonts.sidebar.glyph_width
+                     ? ticker_field_width / ozone->fonts.sidebar.glyph_width
+                     : 0;
+               ticker.s        = console_title;
+               ticker.selected = selected;
+               ticker.str      = node->console_name;
+
+               gfx_animation_ticker(&ticker);
+            }
          }
 
          gfx_display_draw_text(
@@ -4733,7 +4750,7 @@ static void ozone_list_cache(void *data,
       ozone->flags           &= ~OZONE_FLAG_IS_PLAYLIST_OLD;
 
    /* Deep copy visible elements */
-   video_driver_get_size(NULL, &video_info_height);
+   video_info_height          = ozone->last_height;
    y                          = ozone->dimensions.header_height + ozone->dimensions.entry_padding_vertical;
    entries_end                = MENU_LIST_GET_SELECTION(menu_list, 0)->size;
    selection_buf              = MENU_LIST_GET_SELECTION(menu_list, 0);
@@ -4842,13 +4859,11 @@ static void ozone_sidebar_goto(ozone_handle_t *ozone, size_t new_selection)
 #endif
    };
 
-   unsigned video_info_height;
+   unsigned video_info_height = ozone->last_height;
    struct gfx_animation_ctx_entry entry;
    uintptr_t tag = (uintptr_t)ozone;
    struct menu_state *menu_st = menu_state_get_ptr();
    menu_input_t *menu_input   = &menu_st->input_state;
-
-   video_driver_get_size(NULL, &video_info_height);
 
    if (ozone->categories_selection_ptr != new_selection)
    {
@@ -5587,7 +5602,7 @@ static void ozone_content_metadata_line(
 static void ozone_update_scroll(ozone_handle_t *ozone,
       bool allow_animation, ozone_node_t *node)
 {
-   unsigned video_info_height;
+   unsigned video_info_height = ozone->last_height;
    gfx_animation_ctx_entry_t entry;
    float new_scroll = 0, entries_middle;
    float bottom_boundary, current_selection_middle_onscreen;
@@ -5596,8 +5611,6 @@ static void ozone_update_scroll(ozone_handle_t *ozone,
    menu_list_t *menu_list     = menu_st->entries.list;
    file_list_t *selection_buf = MENU_LIST_GET_SELECTION(menu_list, 0);
    uintptr_t tag              = (uintptr_t)selection_buf;
-
-   video_driver_get_size(NULL, &video_info_height);
 
    if (!node)
       return;
@@ -5684,8 +5697,7 @@ static void ozone_compute_entries_position(ozone_handle_t *ozone,
 {
    size_t i;
    /* Compute entries height and adjust scrolling if needed */
-   unsigned video_info_height;
-   unsigned video_info_width;
+   unsigned video_info_width     = ozone->last_width;
    struct menu_state *menu_st    = menu_state_get_ptr();
    menu_list_t *menu_list        = menu_st->entries.list;
    file_list_t *selection_buf    = NULL;
@@ -5710,8 +5722,6 @@ static void ozone_compute_entries_position(ozone_handle_t *ozone,
 
    if (!selection_buf->size)
       return;
-
-   video_driver_get_size(&video_info_width, &video_info_height);
 
    if (menu_show_sublabels)
       sublabel_max_width         = ozone_get_sublabel_max_width(ozone, video_info_width, entry_padding);
@@ -5824,7 +5834,8 @@ static void ozone_draw_entries(
    size_t i;
    uint32_t alpha_uint32;
    float bottom_boundary;
-   unsigned video_info_height, video_info_width;
+   unsigned video_info_height        = ozone->last_height;
+   unsigned video_info_width         = ozone->last_width;
    float last_border_alpha           = -1.0f;
    bool menu_show_sublabels          = settings->bools.menu_show_sublabels;
    bool use_smooth_ticker            = settings->bools.menu_ticker_smooth;
@@ -5855,8 +5866,6 @@ static void ozone_draw_entries(
    unsigned button_height            = ozone->dimensions.entry_height; /* height of the button (entry minus sublabel) */
    float invert                      = (ozone->flags & OZONE_FLAG_FADE_DIRECTION) ? -1 : 1;
    float alpha_anim                  = old_list ? alpha : 1.0f - alpha;
-
-   video_driver_get_size(&video_info_width, &video_info_height);
 
    bottom_boundary                   = video_info_height
          - ozone->dimensions.header_height
@@ -6398,10 +6407,28 @@ border_iterate:
                   + x_offset
                   + entry_width
                   - ozone->dimensions.entry_icon_padding,
-            y
-                  + ozone->dimensions.entry_height / 2
+            /* The y arg is unsigned but the sum below evaluates to
+             * a float because of scroll_y, which is clamped to <= 0
+             * (see lines 10435-10436).  When the row's vertical
+             * centre lands above the visible top -- reachable
+             * during pointer/wheel scrolling whenever the topmost
+             * partially-visible row's value text would draw above
+             * the header -- the float value can be slightly
+             * negative (UBSan reported -10.0781).  Implicit
+             * float-to-unsigned conversion of a negative is UB
+             * (C11 6.3.1.4 p1); silently wraps to ~UINT_MAX in
+             * practice, which the renderer then implicit-converts
+             * back to float as a huge off-screen coordinate, so
+             * the text just fails to draw rather than corrupting
+             * anything.  Cast through int -- well-defined for the
+             * range these screen coords occupy -- so the negative
+             * case wraps in a defined manner instead.  Matches the
+             * (int)((float)y + scroll_y) idiom used at lines 5970,
+             * 5985, 3581, 3595. */
+            (int)((float)y
+                  + ozone->dimensions.entry_height / 2.0f
                   + ozone->fonts.entries_label.line_centre_offset
-                  + scroll_y,
+                  + scroll_y),
             alpha_uint32,
             &entry,
             mymat);
@@ -7431,7 +7458,7 @@ static void ozone_draw_messagebox(
       unsigned slice_new_w  = longest_width + (slice_margin * 2);
       unsigned slice_new_h  = line_height * (line_count + 2) + (slice_margin / 2);
       unsigned slice_w      = 256;
-      int slice_x           = x - (longest_width / 2) - slice_margin;
+      int slice_x           = (int)(x - (longest_width / 2) - slice_margin);
       int slice_y           = y - line_height - (slice_margin / 4)
             + ((slice_new_h >= slice_w)
                   ? (16.0f * scale_factor)
@@ -8581,7 +8608,6 @@ static enum menu_action ozone_parse_menu_entry_action(
          }
          else if (ozone->flags2 & OZONE_FLAG2_IS_PLAYLISTS_TAB)
          {
-            struct menu_state *menu_st = menu_state_get_ptr();
             size_t selection_total     = menu_st->entries.list ? MENU_LIST_GET_SELECTION(menu_st->entries.list, 0)->size : 0;
             size_t selection           = menu_st->selection_ptr;
             size_t new_selection       = random_range(0, (unsigned)(selection_total - 1));
@@ -9277,7 +9303,7 @@ static void *ozone_init(void **userdata, bool video_is_threaded)
    for (i = 0; i < 15; i++)
       ozone->pure_white[i]                      = 1.00f;
 
-   video_driver_get_size(&width, &height);
+   video_driver_get_output_size(&width, &height);
 
    /* Also used as a tag for cursor animation */
    ozone->default_theme                         = &ozone_theme_dark; 
@@ -12312,7 +12338,6 @@ static void ozone_frame(void *data, video_frame_info_t *video_info)
 
       if (draw_osk)
       {
-         struct menu_state *menu_st  = menu_state_get_ptr();
          const char *label           = menu_st->input_dialog_kb_label;
          const char *str             = menu_input_dialog_get_buffer();
 
@@ -13268,8 +13293,9 @@ static int ozone_pointer_up(void *userdata,
       menu_entry_t *entry,
       unsigned action)
 {
-   unsigned int width, height;
    ozone_handle_t *ozone             = (ozone_handle_t*)userdata;
+   unsigned int width                = ozone->last_width;
+   unsigned int height               = ozone->last_height;
    struct menu_state *menu_st        = menu_state_get_ptr();
    menu_input_t *menu_input          = &menu_st->input_state;
    menu_list_t *menu_list            = menu_st->entries.list;
@@ -13298,8 +13324,6 @@ static int ozone_pointer_up(void *userdata,
       ozone->flags2 &= ~OZONE_FLAG2_WANT_FULLSCREEN_THUMBNAILS;
       return 0;
    }
-
-   video_driver_get_size(&width, &height);
 
    switch (gesture)
    {

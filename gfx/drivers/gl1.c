@@ -140,15 +140,15 @@ typedef struct gl1
 
    int version_major;
    int version_minor;
-   unsigned video_width;
-   unsigned video_height;
-   unsigned video_pitch;
+   unsigned frame_width;
+   unsigned frame_height;
+   unsigned frame_pitch;
    unsigned screen_width;
    unsigned screen_height;
    unsigned menu_width;
    unsigned menu_height;
    unsigned menu_pitch;
-   unsigned video_bits;
+   unsigned frame_bits;
    unsigned menu_bits;
    unsigned out_vp_width;
    unsigned out_vp_height;
@@ -273,23 +273,6 @@ static void *gfx_display_gl1_get_default_mvp(void *data)
    return &gl1->mvp_no_rot;
 }
 
-static GLenum gfx_display_prim_to_gl1_enum(
-      enum gfx_display_prim_type type)
-{
-   switch (type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         return GL_TRIANGLE_STRIP;
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-         return GL_TRIANGLES;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   return 0;
-}
-
 static void gfx_display_gl1_blend_begin(void *data)
 {
    glEnable(GL_BLEND);
@@ -366,8 +349,8 @@ static void gfx_display_gl1_draw(gfx_display_ctx_draw_t *draw,
    glColorPointer(4, GL_FLOAT, 0, draw->coords->color);
    glTexCoordPointer(2, GL_FLOAT, 0, draw->coords->tex_coord);
 
-   glDrawArrays(gfx_display_prim_to_gl1_enum(
-            draw->prim_type), 0, draw->coords->vertices);
+   /* Menu draws use a triangle-strip layout. */
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
 
    glDisableClientState(GL_COLOR_ARRAY);
    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -864,16 +847,14 @@ static void gl1_raster_font_render_msg(
       font->block->fullscreen = full_screen;
 
    {
-      /* gl->video_width/height holds the core's emulated frame size
-       * (e.g. 256x224), not the window size — gl1 reuses that field
-       * for texture upload bookkeeping. The font viewport must cover
-       * the full window, so use screen_width/height instead. Fall
-       * back to video_width/height if the context driver did not
-       * report a screen size yet. */
+      /* The font viewport must cover the full window, so prefer
+       * screen_width/height (set by the context driver). Fall back
+       * to frame_width/height if the context driver hasn't reported
+       * a screen size yet. */
       unsigned width          = gl->screen_width
-         ? gl->screen_width  : gl->video_width;
+         ? gl->screen_width  : gl->frame_width;
       unsigned height         = gl->screen_height
-         ? gl->screen_height : gl->video_height;
+         ? gl->screen_height : gl->frame_height;
       float inv_tex_size_x    = 1.0f / font->tex_width;
       float inv_tex_size_y    = 1.0f / font->tex_height;
       float inv_win_width;
@@ -1004,12 +985,10 @@ static void gl1_render_overlay(gl1_t *gl,
 {
    int i;
 
-   /* gl1 reuses video_width/height for the emulated core frame size
-    * (e.g. 256x224 for SNES, 320x240 default for the menu surface),
-    * not the window size. Fullscreen overlays must be drawn into the
-    * actual window viewport, so use screen_width/height instead.
-    * Fall back to the passed-in width/height if the context driver
-    * has not reported a screen size yet. */
+   /* Fullscreen overlays must be drawn into the actual window
+    * viewport, so prefer screen_width/height (set by the context
+    * driver). Fall back to the passed-in width/height if the
+    * context driver hasn't reported a screen size yet. */
    if (gl->screen_width)
       width  = gl->screen_width;
    if (gl->screen_height)
@@ -1177,19 +1156,19 @@ static void *gl1_init(const video_info_t *video,
    *input                               = NULL;
    *input_data                          = NULL;
 
-   gl1->video_width                     = video->width;
-   gl1->video_height                    = video->height;
+   gl1->frame_width                     = video->width;
+   gl1->frame_height                    = video->height;
 
    if (video->rgb32)
    {
-      gl1->video_bits                   = 32;
-      gl1->video_pitch                  = video->width * 4;
+      gl1->frame_bits                   = 32;
+      gl1->frame_pitch                  = video->width * 4;
       gl1->flags                       |= GL1_FLAG_RGB32;
    }
    else
    {
-      gl1->video_bits                   = 16;
-      gl1->video_pitch                  = video->width * 2;
+      gl1->frame_bits                   = 16;
+      gl1->frame_pitch                  = video->width * 2;
    }
 
    ctx_driver = video_context_driver_init_first(gl1,
@@ -1284,9 +1263,11 @@ static void *gl1_init(const video_info_t *video,
    /* Get real known video size, which might have been altered by context. */
 
    if (temp_width != 0 && temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
-
-   video_driver_get_size(&temp_width, &temp_height);
+      video_driver_set_output_size(temp_width, temp_height);
+   else
+      video_driver_get_output_size(&temp_width, &temp_height);
+   gl1->vp.full_width  = temp_width;
+   gl1->vp.full_height = temp_height;
 
    RARCH_LOG("[GL1] Using resolution %ux%u.\n", temp_width, temp_height);
 
@@ -1638,7 +1619,7 @@ static bool gl1_frame(void *data, const void *frame,
    bool draw                        = true;
    bool do_swap                     = false;
    gl1_t *gl1                       = (gl1_t*)data;
-   unsigned bits                    = gl1->video_bits;
+   unsigned bits                    = gl1->frame_bits;
    unsigned pot_width               = 0;
    unsigned pot_height              = 0;
    unsigned video_width             = video_info->width;
@@ -1656,8 +1637,9 @@ static bool gl1_frame(void *data, const void *frame,
       &video_info->osd_stat_params;
    bool overlay_behind_menu         = video_info->overlay_behind_menu;
 
-   /* FIXME: Force these settings off as they interfere with the rendering */
-   video_info->xmb_shadows_enable   = false;
+   /* gl1 fixed-function has no programmable pipeline, so the
+    * animated XMB backgrounds (Ribbon / Snow / Bokeh / etc.) can't
+    * run -- force that off so XMB falls back to the static gradient. */
    video_info->menu_shader_pipeline = 0;
 
    if (gl1->flags & GL1_FLAG_SHOULD_RESIZE)
@@ -1688,15 +1670,15 @@ static bool gl1_frame(void *data, const void *frame,
 
    do_swap = frame || draw;
 
-   if (     (gl1->video_width  != frame_width)
-         || (gl1->video_height != frame_height)
-         || (gl1->video_pitch  != pitch))
+   if (     (gl1->frame_width  != frame_width)
+         || (gl1->frame_height != frame_height)
+         || (gl1->frame_pitch  != pitch))
    {
       if (frame_width > 4 && frame_height > 4)
       {
-         gl1->video_width  = frame_width;
-         gl1->video_height = frame_height;
-         gl1->video_pitch  = pitch;
+         gl1->frame_width  = frame_width;
+         gl1->frame_height = frame_height;
+         gl1->frame_pitch  = pitch;
 
          pot_width         = GET_POT(frame_width);
          pot_height        = GET_POT(frame_height);
@@ -1711,9 +1693,9 @@ static bool gl1_frame(void *data, const void *frame,
       }
    }
 
-   width         = gl1->video_width;
-   height        = gl1->video_height;
-   pitch         = gl1->video_pitch;
+   width         = gl1->frame_width;
+   height        = gl1->frame_height;
+   pitch         = gl1->frame_pitch;
 
    pot_width     = GET_POT(width);
    pot_height    = GET_POT(height);
@@ -1735,10 +1717,10 @@ static bool gl1_frame(void *data, const void *frame,
       frame_to_copy = gl1->video_buf;
    }
 
-   if (gl1->video_width != width || gl1->video_height != height)
+   if (gl1->frame_width != width || gl1->frame_height != height)
    {
-      gl1->video_width  = width;
-      gl1->video_height = height;
+      gl1->frame_width  = width;
+      gl1->frame_height = height;
    }
 
    if (gl1->ctx_driver->get_video_size)
@@ -2008,8 +1990,11 @@ static bool gl1_alive(void *data)
    bool ret             = false;
    gl1_t *gl1           = (gl1_t*)data;
 
-   /* Needed because some context drivers don't track their sizes */
-   video_driver_get_size(&temp_width, &temp_height);
+   /* Read from local bookkeeping rather than video_st (which would
+    * acquire context_lock + display_lock).  gl1->vp.full_* is
+    * written at every set_size call site in this driver. */
+   temp_width  = gl1->vp.full_width;
+   temp_height = gl1->vp.full_height;
 
    gl1->ctx_driver->check_window(gl1->ctx_data,
             &quit, &resize, &temp_width, &temp_height);
@@ -2020,7 +2005,11 @@ static bool gl1_alive(void *data)
    ret = !quit;
 
    if (temp_width != 0 && temp_height != 0)
-      video_driver_set_size(temp_width, temp_height);
+   {
+      video_driver_set_output_size(temp_width, temp_height);
+      gl1->vp.full_width  = temp_width;
+      gl1->vp.full_height = temp_height;
+   }
 
    return ret;
 }
@@ -2098,19 +2087,17 @@ static void gl1_set_rotation(void *data,
 
 static void gl1_viewport_info(void *data, struct video_viewport *vp)
 {
-   unsigned width, height;
    unsigned top_y, top_dist;
    gl1_t *gl1      = (gl1_t*)data;
 
-   video_driver_get_size(&width, &height);
-
+   /* gl1->vp carries full_width/full_height (written at every
+    * set_size call site), so the struct copy populates them
+    * directly without a video_driver_get_output_size round-trip. */
    *vp             = gl1->vp;
-   vp->full_width  = width;
-   vp->full_height = height;
 
    /* Adjust as GL viewport is bottom-up. */
    top_y           = vp->y + vp->height;
-   top_dist        = height - top_y;
+   top_dist        = vp->full_height - top_y;
    vp->y           = top_dist;
 }
 
@@ -2135,16 +2122,13 @@ static bool gl1_read_viewport(void *data, uint8_t *buffer, bool is_idle)
       /* Clamp to the region glReadPixels actually wrote.
        * gl1_readback() clamps its read to
        * min(vp.{w,h}, video_{width,height}), where video_{width,height}
-       * come from video_info and ultimately video_driver_get_size().
+       * come from the surface size kept in gl1->vp.full_*.
        * gl1->video_{width,height} holds the core's frame size, not the
-       * window size, so we re-query here to match. Not a hot path. */
-      unsigned vd_w = 0;
-      unsigned vd_h = 0;
-      unsigned rb_w = 0;
-      unsigned rb_h = 0;
-      video_driver_get_size(&vd_w, &vd_h);
-      rb_w = (gl1->vp.width  > vd_w) ? vd_w : gl1->vp.width;
-      rb_h = (gl1->vp.height > vd_h) ? vd_h : gl1->vp.height;
+       * window size, so we read the surface size from gl1->vp.full_*. */
+      unsigned vd_w = gl1->vp.full_width;
+      unsigned vd_h = gl1->vp.full_height;
+      unsigned rb_w = (gl1->vp.width  > vd_w) ? vd_w : gl1->vp.width;
+      unsigned rb_h = (gl1->vp.height > vd_h) ? vd_h : gl1->vp.height;
       video_frame_convert_rgba_to_bgr(
             (const void*)gl1->readback_buffer_screenshot,
             buffer,
