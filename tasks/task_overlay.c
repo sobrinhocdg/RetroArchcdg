@@ -41,6 +41,12 @@ typedef struct overlay_loader overlay_loader_t;
 struct overlay_loader
 {
    config_file_t *conf;
+   /* Set when the config came out of an archive: the io that serves
+    * the config's '#include' chain from the same archive, and the
+    * archive path it reads (also the io's ud).  Both must outlive
+    * conf, so they live here and are released after it. */
+   config_file_io_t conf_io;
+   char *conf_archive;
    char *overlay_path;
    struct overlay *overlays;
    struct overlay *active;
@@ -49,7 +55,6 @@ struct overlay_loader
    size_t resolve_pos;
    unsigned size;
    unsigned pos;
-   unsigned pos_increment;
 
    enum overlay_status state;
    enum overlay_image_transfer_status loading_status;
@@ -58,6 +63,88 @@ struct overlay_loader
 
    uint8_t flags;
 };
+
+/* Normalize an archive member name in place: collapse repeated
+ * separators and resolve '.' and '..' segments lexically.
+ *
+ * Paths handed to the file system are normalized for us - the disk
+ * path in overlay_resolve_path() below ends in path_resolve_realpath(),
+ * and open() would collapse the separators anyway.  An archive member
+ * is matched as a literal name, so "dir/../img/a.png" and "img//a.png"
+ * are simply not members even when the file they mean is, and the
+ * reference is dropped without an error.  Real overlay packs contain
+ * both forms.
+ *
+ * Only the member portion may be touched, never the archive path
+ * before the '#', so the caller passes the offset past the delimiter -
+ * a host separator there is part of a real file name and must survive.
+ *
+ * Either host separator is accepted and '/' is always written, because
+ * a member name uses '/' whatever the host does: on Windows a config
+ * may spell its image paths with '\\' and the member it means still
+ * has '/'.  PATH_CHAR_IS_SLASH reduces to '/' alone elsewhere, so a
+ * member legitimately containing a backslash stays intact there.
+ * A '..' with nothing left to pop is kept verbatim: it cannot be
+ * resolved inside an archive, and preserving it keeps the lookup
+ * failing as it did rather than silently aliasing some other member.
+ */
+static void overlay_normalize_member(char *s)
+{
+   char       *w = s;
+   const char *r = s;
+   /* Poppable segments written so far.  A '..' that had nothing to pop
+    * is kept but never counted, so a later '..' cannot consume it. */
+   size_t depth  = 0;
+
+   while (*r)
+   {
+      const char *seg;
+      size_t seg_len;
+
+      while (PATH_CHAR_IS_SLASH(*r))
+         r++;
+      if (!*r)
+         break;
+      seg = r;
+      while (*r && !PATH_CHAR_IS_SLASH(*r))
+         r++;
+      seg_len = (size_t)(r - seg);
+
+      if (seg_len == 1 && seg[0] == '.')
+         continue;
+
+      if (     seg_len == 2
+            && seg[0] == '.'
+            && seg[1] == '.'
+            && depth > 0)
+      {
+         /* Pop the separator and the segment before it.  Every '..'
+          * kept verbatim precedes all poppable segments, so while
+          * depth is nonzero the last segment written is poppable. */
+         while (w > s && w[-1] != '/')
+            w--;
+         if (w > s)
+            w--;
+         depth--;
+         continue;
+      }
+
+      /* The separator goes before the segment, never after: writing a
+       * trailing one would land on the terminator's byte whenever
+       * nothing has been dropped yet, taking the write - and then the
+       * read cursor chasing it - past the end of the buffer. */
+      if (w > s)
+         *w++ = '/';
+      memmove(w, seg, seg_len);
+      w     += seg_len;
+      /* A '..' kept for want of anything to pop stays uncounted, so a
+       * later '..' cannot consume it and escape the archive root. */
+      if (!(seg_len == 2 && seg[0] == '.' && seg[1] == '.'))
+         depth++;
+   }
+
+   *w = '\0';
+}
 
 /* Resolve a relative image path against the overlay config path.
  * When the config is inside an archive (e.g. overlays.zip#dir/cfg),
@@ -72,7 +159,7 @@ static void overlay_resolve_path(char *s,
    {
       size_t archive_len = (size_t)(delim + 1 - overlay_path);
       const char *inner  = delim + 1;
-      const char *slash  = strrchr(inner, '/');
+      const char *slash  = find_last_slash(inner);
 
       /* Copy archive path including '#' */
       strlcpy(s, overlay_path, len);
@@ -90,6 +177,7 @@ static void overlay_resolve_path(char *s,
             }
          }
          strlcpy(s + _len, rel_path, len - _len);
+         overlay_normalize_member(s + archive_len);
       }
       return;
    }
@@ -97,12 +185,116 @@ static void overlay_resolve_path(char *s,
    fill_pathname_resolve_relative(s, overlay_path, rel_path, len);
 }
 
+#ifdef HAVE_COMPRESSION
+/* config_file io serving an archived overlay config's '#include'
+ * chain from the archive itself; ud is the path of the archive.
+ *
+ * The parser resolves an include against its parent config's path, so
+ * for a member with an inner directory ("pack.zip#dir/root.cfg") the
+ * request arrives with the delim intact ("pack.zip#dir/inc.cfg"),
+ * while for a member at the archive root the '#' falls to the basedir
+ * cut and the request lands beside the archive on disk
+ * ("<dir of pack.zip>/inc.cfg") - that form is remapped onto the
+ * archive here.  A name that is not a member is then tried on the
+ * file system, so an include that genuinely lives beside the archive
+ * as a file keeps resolving the way it always has. */
+static char *task_overlay_conf_read_file(const char *path,
+      int64_t *len, void *ud)
+{
+   char member_path[PATH_MAX_LENGTH];
+   const char *archive_path = (const char*)ud;
+   const char *try_path     = NULL;
+   void   *buf              = NULL;
+   int64_t buf_len          = 0;
+
+   if (path_get_archive_delim(path))
+   {
+      strlcpy(member_path, path, sizeof(member_path));
+      overlay_normalize_member(member_path
+            + (path_get_archive_delim(member_path) + 1 - member_path));
+      try_path = member_path;
+   }
+   else
+   {
+      char basedir[PATH_MAX_LENGTH];
+      size_t dir_len = fill_pathname_basedir(basedir, archive_path,
+            sizeof(basedir));
+      if (dir_len && !strncmp(path, basedir, dir_len))
+      {
+         size_t a_len = strlcpy(member_path, archive_path,
+               sizeof(member_path));
+         if (a_len + 1 < sizeof(member_path))
+         {
+            member_path[a_len] = '#';
+            strlcpy(member_path + a_len + 1, path + dir_len,
+                  sizeof(member_path) - a_len - 1);
+            overlay_normalize_member(member_path + a_len + 1);
+            try_path           = member_path;
+         }
+      }
+   }
+
+   if (try_path)
+   {
+      if (file_archive_compressed_read(try_path, &buf, NULL,
+               &buf_len) == 1)
+      {
+         /* NUL-terminate past *len - the parser's buffer contract. */
+         char *str = (char*)realloc(buf, (size_t)(buf_len + 1));
+         if (!str)
+         {
+            free(buf);
+            return NULL;
+         }
+         str[buf_len] = '\0';
+         if (len)
+            *len      = buf_len;
+         return str;
+      }
+      if (buf)
+         free(buf);
+      buf = NULL;
+   }
+
+   /* Not a member (or not mappable onto the archive): a delim path
+    * cannot be a plain file, anything else may be. */
+   if (path_get_archive_delim(path))
+      return NULL;
+   if (!filestream_read_file(path, &buf, &buf_len))
+      return NULL;
+   if (len)
+      *len = buf_len;
+   return (char*)buf;
+}
+
+static void task_overlay_conf_free_file(char *buf, void *ud)
+{
+   free(buf);
+}
+#endif
+
+/* Per-frame I/O window, consulted between work items.
+ *
+ * The loader used to chunk by a fixed count derived from the
+ * workload itself - half the descriptors, a quarter of the overlays
+ * - which is not pacing at all: a bigger overlay simply means a
+ * bigger chunk, so the work always landed in the same two or four
+ * handler invocations no matter how long each one took.  With
+ * Threaded Tasks off those invocations run on the thread driving
+ * the frame loop, and every item in them is a PNG decode off disk.
+ *
+ * Consulting the shared window instead is what the budgeted
+ * directory walks, playlist parse and scanner do: small overlays
+ * still finish in one invocation, large ones spread over as many as
+ * they need, and neither case is decided by the size of the job. */
+static bool task_overlay_within_budget(void *ud)
+{
+   return task_nbio_slice_within_budget(ud, 0, 0);
+}
+
 static void task_overlay_image_done(struct overlay *overlay)
 {
    overlay->pos           = 0;
-   /* Divide iteration steps by half of total descs if size is even,
-    * otherwise default to 8 (arbitrary value for now to speed things up). */
-   overlay->pos_increment = (overlay->size / 2) ? ((unsigned)(overlay->size / 2)) : 8;
 }
 
 static bool task_overlay_load_image_texture(
@@ -676,7 +868,7 @@ static void task_overlay_resolve_iterate(retro_task_t *task)
    loader->resolve_pos += 1;
 }
 
-static void task_overlay_deferred_loading(retro_task_t *task)
+static void task_overlay_deferred_loading(retro_task_t *task, void *budget)
 {
    size_t i                  = 0;
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
@@ -701,25 +893,27 @@ static void task_overlay_deferred_loading(retro_task_t *task)
          loader->overlays[loader->pos].pos = 0;
          break;
       case OVERLAY_IMAGE_TRANSFER_DESC_IMAGE_ITERATE:
-         for (i = 0; i < overlay->pos_increment; i++)
+         for (;;)
          {
-            if (overlay->pos < overlay->size)
+            if (overlay->pos >= overlay->size)
             {
-               task_overlay_load_desc_image(loader,
-                     &overlay->descs[overlay->pos], overlay,
-                     loader->pos, (unsigned)overlay->pos);
-            }
-            else
-            {
-               overlay->pos       = 0;
+               overlay->pos           = 0;
                loader->loading_status = OVERLAY_IMAGE_TRANSFER_DESC_ITERATE;
                break;
             }
 
+            task_overlay_load_desc_image(loader,
+                  &overlay->descs[overlay->pos], overlay,
+                  loader->pos, (unsigned)overlay->pos);
+
+            /* One item is always made, so the loader cannot stall on
+             * a window that is already exhausted. */
+            if (!task_overlay_within_budget(budget))
+               break;
          }
          break;
       case OVERLAY_IMAGE_TRANSFER_DESC_ITERATE:
-         for (i = 0; i < overlay->pos_increment; i++)
+         for (;;)
          {
             if (overlay->pos < overlay->size)
             {
@@ -743,6 +937,11 @@ static void task_overlay_deferred_loading(retro_task_t *task)
                loader->loading_status = OVERLAY_IMAGE_TRANSFER_DESC_DONE;
                break;
             }
+
+            /* One item is always made, so the loader cannot stall on
+             * a window that is already exhausted. */
+            if (!task_overlay_within_budget(budget))
+               break;
          }
          break;
       case OVERLAY_IMAGE_TRANSFER_DESC_DONE:
@@ -759,13 +958,12 @@ static void task_overlay_deferred_loading(retro_task_t *task)
    }
 }
 
-static void task_overlay_deferred_load(retro_task_t *task)
+static void task_overlay_deferred_load(retro_task_t *task, void *budget)
 {
-   unsigned i;
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
    config_file_t       *conf = loader->conf;
 
-   for (i = 0; i < loader->pos_increment; i++, loader->pos++)
+   for (;; loader->pos++)
    {
       size_t _len;
       char conf_key[32];
@@ -965,7 +1163,7 @@ static void task_overlay_deferred_load(retro_task_t *task)
 
       /* Parse viewport override (optional) */
       strlcpy(conf_key + _len, "_viewport", sizeof(conf_key) - _len);
-      RARCH_DBG("[Overlay] Checking for viewport key: %s\n", conf_key);
+
       if (config_get_array(conf, conf_key, tmp_str, sizeof(tmp_str)))
       {
          char cfg_vp_buf[256];
@@ -1051,6 +1249,14 @@ static void task_overlay_deferred_load(retro_task_t *task)
          overlay->flags |=  OVERLAY_AUTO_Y_SEPARATION;
       else
          overlay->flags &= ~OVERLAY_AUTO_Y_SEPARATION;
+
+      /* One overlay is always parsed, so the loader cannot stall on
+       * a window that is already exhausted. */
+      if (!task_overlay_within_budget(budget))
+      {
+         loader->pos++;
+         return;
+      }
    }
 
    return;
@@ -1066,41 +1272,66 @@ static void task_overlay_free(retro_task_t *task)
 {
    unsigned i;
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
-   uint8_t flg               = task_get_flags(task);
 
-   if ((flg & RETRO_TASK_FLG_CANCELLED) > 0)
+   /* Release what the loader still owns.
+    *
+    * A successful load hands the overlays, the path and the image
+    * list to the consumer and clears them (see the hand-off at the
+    * end of task_overlay_handler), so a pointer that is still set
+    * here is one nobody else took - because the load was cancelled,
+    * or because it finished but the hand-off never happened.
+    *
+    * Keying this on the pointers rather than on
+    * RETRO_TASK_FLG_CANCELLED is what keeps it from releasing what
+    * the consumer already released, and it also covers the case the
+    * flag missed: a load that completes but cannot allocate its
+    * payload used to leak the lot. */
+   if (loader->image_list)
    {
-      if (loader->overlay_path)
-         free(loader->overlay_path);
-
+      /* The list is a dedup index - its elements point at
+       * texture_images owned by the overlays, and string_list_free()
+       * does not follow .attr.p, so the textures go first. */
       for (i = 0; i < loader->image_list->size; i++)
          image_texture_free((struct texture_image*)loader->image_list->elems[i].attr.p);
-      string_list_free(loader->image_list);
 
+      string_list_free(loader->image_list);
+   }
+
+   if (loader->overlays)
+   {
       for (i = 0; i < loader->size; i++)
          input_overlay_free_overlay(&loader->overlays[i]);
 
       free(loader->overlays);
    }
 
+   free(loader->overlay_path);
+
    if (loader->conf)
       config_file_free(loader->conf);
 
+   /* After the conf: its io reads through this. */
+   free(loader->conf_archive);
    free(loader);
 }
 
 static void task_overlay_handler(retro_task_t *task)
 {
    uint8_t flg;
+   nbio_budget_t budget;
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
+
+   /* Claim this invocation's share of the shared per-frame I/O
+    * window; the loading phases consult it between items. */
+   task_nbio_slice_open(&budget);
 
    switch (loader->state)
    {
       case OVERLAY_STATUS_DEFERRED_LOADING:
-         task_overlay_deferred_loading(task);
+         task_overlay_deferred_loading(task, &budget);
          break;
       case OVERLAY_STATUS_DEFERRED_LOAD:
-         task_overlay_deferred_load(task);
+         task_overlay_deferred_load(task, &budget);
          break;
       case OVERLAY_STATUS_DEFERRED_LOADING_RESOLVE:
          task_overlay_resolve_iterate(task);
@@ -1114,6 +1345,8 @@ static void task_overlay_handler(retro_task_t *task)
          task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
          break;
    }
+
+   task_nbio_slice_close(&budget);
 
    flg = task_get_flags(task);
 
@@ -1140,6 +1373,20 @@ static void task_overlay_handler(retro_task_t *task)
       data->overlay_types               = loader->overlay_types;
       data->overlay_path                = loader->overlay_path;
       data->image_list                  = loader->image_list;
+
+      /* Ownership moves with the pointers, so drop the loader's
+       * references to them.  task_overlay_free() below releases
+       * whatever the loader still holds, and the task queue retires
+       * a task by running its callback and then its cleanup - so by
+       * the time the cleanup looks, the consumer
+       * (input_overlay_loaded in input/input_driver.c) has already
+       * taken the overlays and the path and released the image
+       * list.  Leaving the references set is a second release of
+       * each of them. */
+      loader->overlays                  = NULL;
+      loader->active                    = NULL;
+      loader->overlay_path              = NULL;
+      loader->image_list                = NULL;
 
       task_set_data(task, data);
    }
@@ -1208,7 +1455,7 @@ bool task_push_overlay_load_default(
       {
          RARCH_ERR("[Overlay] Failed to read config from archive.\n");
          free(loader);
-         free(image_list);
+         string_list_free(image_list);
          return false;
       }
       RARCH_DBG("[Overlay] Read %lld bytes from archive.\n",
@@ -1219,12 +1466,34 @@ bool task_push_overlay_load_default(
          {
             free(buf);
             free(loader);
-            free(image_list);
+            string_list_free(image_list);
             return false;
          }
          str[buf_len] = '\0';
-         conf = config_file_new_from_string(str, overlay_path);
-         free(str);
+         {
+            /* Serve the config's '#include' chain from the archive
+             * too; without this the includes resolve to paths the
+             * file system cannot satisfy and are silently dropped. */
+            const char *delim    = path_get_archive_delim(overlay_path);
+            size_t archive_len   = (size_t)(delim - overlay_path);
+            loader->conf_archive = (char*)malloc(archive_len + 1);
+            if (!loader->conf_archive)
+            {
+               free(str);
+               free(loader);
+               string_list_free(image_list);
+               return false;
+            }
+            memcpy(loader->conf_archive, overlay_path, archive_len);
+            loader->conf_archive[archive_len] = '\0';
+            loader->conf_io.read_file = task_overlay_conf_read_file;
+            loader->conf_io.free_file = task_overlay_conf_free_file;
+            loader->conf_io.ud        = loader->conf_archive;
+         }
+         /* Hand the buffer over: the conf adopts it and entries
+          * borrow from it - no per-entry copies. */
+         conf = config_file_new_take_string_with_io(str, (size_t)buf_len,
+               overlay_path, &loader->conf_io);
       }
       if (conf)
          RARCH_DBG("[Overlay] Config parsed successfully from archive.\n");
@@ -1237,8 +1506,9 @@ bool task_push_overlay_load_default(
 
    if (!conf)
    {
+      free(loader->conf_archive);
       free(loader);
-      free(image_list);
+      string_list_free(image_list);
       return false;
    }
 
@@ -1246,8 +1516,9 @@ bool task_push_overlay_load_default(
    {
       /* Error - overlays variable not defined in config. */
       config_file_free(conf);
+      free(loader->conf_archive);
       free(loader);
-      free(image_list);
+      string_list_free(image_list);
       return false;
    }
 
@@ -1257,15 +1528,15 @@ bool task_push_overlay_load_default(
    if (!loader->overlays)
    {
       config_file_free(conf);
+      free(loader->conf_archive);
       free(loader);
-      free(image_list);
+      string_list_free(image_list);
       return false;
    }
 
    loader->conf             = conf;
    loader->image_list       = image_list;
    loader->state            = OVERLAY_STATUS_DEFERRED_LOAD;
-   loader->pos_increment    = (loader->size / 4) ? (loader->size / 4) : 4;
 
    if (is_osk)
       loader->flags        |= OVERLAY_LOADER_IS_OSK;
@@ -1280,8 +1551,9 @@ bool task_push_overlay_load_default(
    {
       config_file_free(conf);
       free(loader->overlays);
+      free(loader->conf_archive);
       free(loader);
-      free(image_list);
+      string_list_free(image_list);
       return false;
    }
 

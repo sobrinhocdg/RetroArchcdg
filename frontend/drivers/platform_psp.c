@@ -69,7 +69,7 @@
 #endif
 
 #if defined(HAVE_VITAGLES)
-#include "../../deps/Pigs-In-A-Blanket/include/pib.h"
+#include "../../gfx/drivers_context/vita_pib/include/pib.h"
 #endif
 
 #ifndef VITA
@@ -142,7 +142,18 @@ static void frontend_psp_get_env_settings(int *argc, char *argv[],
    strlcpy(eboot_path, argv[0], sizeof(eboot_path));
    /* for PSP, use uppercase directories, and no trailing slashes
       otherwise mkdir fails */
-   strlcpy(user_path, "ms0:/PSP/RETROARCH", sizeof(user_path));
+   /* Derive the user data root from the storage device RetroArch was
+      launched from (such as "ms0:/" or "ef0:/" on PSP Go). That way user 
+      data follows the binary instead of being hardcoded to ms0: */
+   if (strlen(eboot_path) >= 5 && eboot_path[4] == '/')
+   {
+      strlcpy(user_path, eboot_path, sizeof(user_path));
+      user_path[5] = '\0';
+   }
+   else
+      strlcpy(user_path, "ms0:/", sizeof(user_path));
+   strlcat(user_path, "PSP/RETROARCH", sizeof(user_path));
+   RARCH_LOG("[PSP]: Using %s for user data.\n", user_path);
 
    fill_pathname_basedir(g_defaults.dirs[DEFAULT_DIR_PORT], argv[0],
       sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
@@ -570,15 +581,6 @@ enum retro_language frontend_psp_get_user_language(void)
    return psp_get_retro_lang_from_langid(langid);
 }
 
-static uint64_t frontend_psp_get_total_mem(void)
-{
-   return _newlib_heap_end - _newlib_heap_base;
-}
-
-static uint64_t frontend_psp_get_free_mem(void)
-{
-   return _newlib_heap_end - _newlib_heap_cur;
-}
 #endif
 
 frontend_ctx_driver_t frontend_ctx_psp = {
@@ -600,13 +602,6 @@ frontend_ctx_driver_t frontend_ctx_psp = {
    frontend_psp_get_arch,        /* get_architecture */
    frontend_psp_get_powerstate,
    frontend_psp_parse_drive_list,
-#ifdef VITA
-   frontend_psp_get_total_mem,
-   frontend_psp_get_free_mem,
-#else
-   NULL,                         /* get_total_mem    */
-   NULL,                         /* get_free_mem     */
-#endif
    NULL,                         /* install_signal_handler */
    NULL,                         /* get_sighandler_state */
    NULL,                         /* set_sighandler_state */

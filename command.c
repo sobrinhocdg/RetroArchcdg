@@ -88,9 +88,9 @@ static void command_post_state_loaded(void)
    {
      video_driver_state_t *video_st                 =
        video_state_get_ptr();
-     bool frame_time_counter_reset_after_load_state =
-       config_get_ptr()->bools.frame_time_counter_reset_after_load_state;
-     if (frame_time_counter_reset_after_load_state)
+     bool frame_time_counter_auto_reset             =
+       config_get_ptr()->bools.frame_time_counter_auto_reset;
+     if (frame_time_counter_auto_reset)
         video_st->frame_time_count = 0;
    }
 #if defined(HAVE_GFX_WIDGETS) && defined(HAVE_SCREENSHOTS)
@@ -160,7 +160,16 @@ static void command_parse_sub_msg(command_t *handle, const char *tok)
             RARCH_ERR("[Command] Command \"%s\" failed.\n", arg);
       }
       else
-         handle->state[map[index].id] = true;
+      {
+         /* For MENU_TOGGLE, bypass the press-and-release mechanism
+          * by directly invoking the command event.  This avoids
+          * timing issues with runahead (single-instance) where the
+          * 1-frame pulse from network commands can be lost. */
+         if (map[index].id == RARCH_MENU_TOGGLE)
+            command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+         else
+            handle->state[map[index].id] = true;
+      }
    }
    else
       RARCH_WARN(msg_hash_to_str(MSG_UNRECOGNIZED_COMMAND), tok);
@@ -331,6 +340,11 @@ static void command_stdin_poll(command_t *handle)
    {
       char *last_newline = NULL;
       stdincmd->stdin_buf_ptr                      += ret;
+      
+      /* Ensure we don't write past buffer bounds */
+      if (stdincmd->stdin_buf_ptr >= CMD_BUF_SIZE)
+         stdincmd->stdin_buf_ptr = CMD_BUF_SIZE - 1;
+         
       stdincmd->stdin_buf[stdincmd->stdin_buf_ptr]  = '\0';
 
       last_newline = strrchr(stdincmd->stdin_buf, '\n');
@@ -365,7 +379,7 @@ command_t* command_stdin_new(void)
    command_t *cmd;
    command_stdin_t *stdincmd;
 
-#if !(defined(_WIN32) || defined(EMSCRIPTEN))
+#if !(defined(_WIN32) || defined(__EMSCRIPTEN__))
 #ifdef HAVE_NETWORKING
    if (!socket_nonblock(STDIN_FILENO))
       return NULL;
@@ -395,7 +409,7 @@ command_t* command_stdin_new(void)
 }
 #endif
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #include "frontend/drivers/platform_emscripten.h"
 typedef struct
 {
@@ -503,6 +517,25 @@ bool command_get_config_param(command_t *cmd, const char* arg)
          strlcpy(value_dynamic, "0 0 0", sizeof(value_dynamic));
    }
    #endif
+#ifdef HAVE_MENU
+   else if (memcmp(arg, "menu_active", sizeof("menu_active")) == 0)
+   {
+      struct menu_state* menu_st = menu_state_get_ptr();
+      if (menu_st && (menu_st->flags & MENU_ST_FLAG_ALIVE))
+         value = "true";
+      else
+         value = "false";
+   }
+#endif
+#ifdef HAVE_CHEEVOS
+   else if (memcmp(arg, "cheevos_enable", sizeof("cheevos_enable")) == 0)
+   {
+      if (settings->bools.cheevos_enable)
+         value = "true";
+      else
+         value = "false";
+   }
+#endif
    /* TODO: query any string */
    _len  = strlcpy(reply, "GET_CONFIG_PARAM ", sizeof(reply));
    _len += strlcpy(reply + _len, arg, sizeof(reply)  - _len);
@@ -798,6 +831,36 @@ bool command_load_state_slot(command_t *cmd, const char *arg)
    bool ret                     = false;
    _len  = strlcpy(reply, "LOAD_STATE_SLOT ", sizeof(reply));
    _len += snprintf(reply + _len, sizeof(reply) - _len, "%d", slot);
+   runloop_get_savestate_path(state_path, sizeof(state_path), slot);
+   /* For LOADING, an existing state file outranks metadata and
+    * save-capability probes: core_serialize_size() measures whether the
+    * core can SAVE right now (0 at e.g. a game's own main menu), which
+    * says nothing about whether it can restore. Let the load task and
+    * retro_unserialize() arbitrate. */
+   if (!savestates_enabled)
+      savestates_enabled = path_is_valid(state_path);
+   if (savestates_enabled)
+   {
+      if ((ret = content_load_state(state_path, false, false)))
+         command_post_state_loaded();
+   }
+   else
+      ret = false;
+
+   cmd->replier(cmd, reply, _len);
+   return ret;
+}
+
+bool command_save_state_slot(command_t* cmd, const char* arg)
+{
+   char state_path[PATH_MAX_LENGTH] = "";
+   size_t _len                  = 0;
+   char reply[128]              = "";
+   unsigned int slot            = (unsigned int)strtoul(arg, NULL, 10);
+   bool savestates_enabled      = core_info_current_supports_savestate();
+   bool ret = false;
+   _len = strlcpy(reply, "SAVE_STATE_SLOT ", sizeof(reply));
+   _len += snprintf(reply + _len, sizeof(reply) - _len, "%d", slot);
    if (savestates_enabled)
    {
       size_t info_size;
@@ -807,10 +870,7 @@ bool command_load_state_slot(command_t *cmd, const char *arg)
       savestates_enabled = (info_size > 0);
    }
    if (savestates_enabled)
-   {
-      if ((ret = content_load_state(state_path, false, false)))
-         command_post_state_loaded();
-   }
+      ret = content_save_state(state_path, true);
    else
       ret = false;
 
@@ -841,7 +901,12 @@ bool command_play_replay_slot(command_t *cmd, const char *arg)
       if (ret)
       {
          input_driver_state_t *input_st = input_state_get_ptr();
-         task_queue_wait(NULL, NULL);
+         /* The reply carries the replay handle, which the movie
+          * task's callback installs, so this still waits - but only
+          * for that task.  A NULL condition means "until the queue
+          * is empty", which made a network command block on every
+          * unrelated scan or download in flight. */
+         task_queue_wait(movie_playback_start_in_progress, NULL);
          if (input_st->bsv_movie_state_next_handle)
             snprintf(reply, sizeof(reply) - 1, "PLAY_REPLAY_SLOT %lld", (long long)(input_st->bsv_movie_state_next_handle->identifier));
          else
@@ -944,6 +1009,13 @@ bool command_read_ram(command_t *cmd, const char *arg)
       /* We allocate more than needed, saving 20 bytes is not really relevant */
       unsigned int alloc_size = 40 + nbytes * 3;
       char *reply             = (char*)malloc(alloc_size);
+      
+      if (!reply)
+      {
+         cmd->replier(cmd, "READ_CORE_RAM ERROR: OUT OF MEMORY\n", 34);
+         return true;
+      }
+      
       reply[0]                = '\0';
       reply_at                = reply + snprintf(
             reply, alloc_size - 1, "READ_CORE_RAM" " %x", addr);
@@ -1000,11 +1072,175 @@ bool command_version(command_t *cmd, const char* arg)
    return true;
 }
 
+/* LOAD_CORE <core path>
+ *
+ * Mirrors selecting a core in the menu's core list / file browser,
+ * action_ok_load_core() -> generic_action_ok()'s ACTION_OK_LOAD_CORE
+ * branch.  Same task_push_load_new_core() call with the same arguments;
+ * the result is propagated rather than discarded so a bad core path is
+ * reported as a failed command instead of a silent no-op. */
 bool command_load_core(command_t *cmd, const char* arg)
 {
    content_ctx_info_t content_info = {0};
-   task_push_load_new_core(arg, NULL,
+
+   if (!arg || !*arg)
+      return false;
+
+#ifdef IOS
+   {
+      char exp[PATH_MAX_LENGTH];
+      fill_pathname_expand_special(exp, arg, sizeof(exp));
+      return task_push_load_new_core(exp, NULL,
+            &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   }
+#else
+   return task_push_load_new_core(arg, NULL,
          &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+#endif
+}
+
+/* START_CORE
+ *
+ * Mirrors the Main Menu "Start Core" entry, action_ok_start_core():
+ * clears the content path and starts the currently loaded core without
+ * content.  The list_cache() call that entry makes first is menu
+ * animation bookkeeping and has no equivalent here. */
+bool command_start_core(command_t *cmd, const char* arg)
+{
+   content_ctx_info_t content_info = {0};
+
+   path_clear(RARCH_PATH_BASENAME);
+
+   return task_push_start_current_core(&content_info);
+}
+
+/* LOAD_CONTENT <core path>|<content path>
+ *
+ * The separator is '|' rather than a space because both operands are
+ * filesystem paths and may legitimately contain spaces.  Routed through
+ * the companion UI entry point so that the command interface takes the
+ * same content load path as any other frontend-external requester,
+ * rather than duplicating the menu-only variant. */
+bool command_load_content(command_t *cmd, const char* arg)
+{
+   char core_path[PATH_MAX_LENGTH];
+   content_ctx_info_t content_info = {0};
+   const char *sep                 = NULL;
+   size_t _len                     = 0;
+
+   if (!arg || !*arg)
+      return false;
+   if (!(sep = strchr(arg, '|')))
+      return false;
+
+   _len = (size_t)(sep - arg);
+   if (_len == 0 || _len >= sizeof(core_path))
+      return false;
+   if (!*(sep + 1))
+      return false;
+
+   memcpy(core_path, arg, _len);
+   core_path[_len] = '\0';
+
+#ifdef IOS
+   {
+      char exp[PATH_MAX_LENGTH];
+      fill_pathname_expand_special(exp, sep + 1, sizeof(exp));
+      return task_push_load_content_with_new_core_from_companion_ui(
+            core_path, exp, NULL, NULL, NULL, &content_info, NULL, NULL);
+   }
+#else
+   return task_push_load_content_with_new_core_from_companion_ui(
+         core_path, sep + 1, NULL, NULL, NULL, &content_info, NULL, NULL);
+#endif
+}
+
+/* CLOSE_CONTENT
+ *
+ * On HAVE_MENU builds this is CMD_EVENT_CLOSE_CONTENT, the same event the
+ * Quick Menu "Close Content" entry issues.
+ *
+ * On builds without a menu, CMD_EVENT_CLOSE_CONTENT is defined as
+ * CMD_EVENT_QUIT -- reasonable for a hotkey on a frontend that has
+ * nowhere to return to, but wrong here: a command interface consumer
+ * asking to close content is not asking to terminate the process, and
+ * has no way to discover that the two are the same on this build.  Use
+ * CMD_EVENT_UNLOAD_CORE instead, which unloads the core and starts the
+ * dummy core.  That is as close to "content closed" as a menuless build
+ * gets, and it leaves the process alive to accept further commands.
+ *
+ * This was previously a map[] entry driving RARCH_CLOSE_CONTENT_KEY,
+ * which is not what the menu entry does either: the hotkey path in
+ * runloop_iterate() also applies the 'confirm_close' double press timer,
+ * and nothing external can produce the second press inside the window,
+ * so with that setting enabled the command was silently swallowed.  The
+ * menu entry's confirmation is a dialog rather than a timer and is
+ * equally unreachable over the command interface, so neither form of
+ * confirmation applies on this path. */
+bool command_close_content(command_t *cmd, const char* arg)
+{
+#ifdef HAVE_MENU
+   return command_event(CMD_EVENT_CLOSE_CONTENT, NULL);
+#else
+   return command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+#endif
+}
+
+/* UNLOAD_CORE
+ *
+ * CMD_EVENT_UNLOAD_CORE releases the core and starts the dummy core, and
+ * is not menu dependent.  The Main Menu "Unload Core" entry issues the
+ * same event and then clears the last core path; that clear is a
+ * frontend path operation rather than a menu one, so it belongs here
+ * too.  Only the entry refresh afterwards is menu state. */
+bool command_unload_core(command_t *cmd, const char* arg)
+{
+   if (!command_event(CMD_EVENT_UNLOAD_CORE, NULL))
+      return false;
+
+   path_clear(RARCH_PATH_CORE_LAST);
+
+#ifdef HAVE_MENU
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      if (menu_st)
+         menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                         |  MENU_ST_FLAG_PREVENT_POPULATE;
+   }
+#endif
+
+   return true;
+}
+
+/* VIDEO_REINIT / AUDIO_REINIT / DRIVERS_REINIT
+ *
+ * Driver reinit, split by scope.  None has a menu equivalent; they exist
+ * so that a driver teardown and rebuild can be triggered on its own,
+ * rather than only as a side effect of loading content.
+ *
+ * CMD_EVENT_REINIT takes an optional driver mask through its data
+ * pointer and falls back to DRIVERS_CMD_ALL when passed NULL, so
+ * VIDEO_REINIT passes DRIVER_VIDEO_MASK explicitly rather than relying on
+ * the default -- otherwise it would tear down audio, input, MIDI and the
+ * rest as well, and would not be a video reinit at all.  A video-only
+ * mask through video_driver_reinit() is what the CRT switch path already
+ * does.  DRIVERS_REINIT keeps the all-drivers behaviour under a name that
+ * says so. */
+bool command_video_reinit(command_t *cmd, const char* arg)
+{
+   int flags = DRIVER_VIDEO_MASK;
+   command_event(CMD_EVENT_REINIT, &flags);
+   return true;
+}
+
+bool command_audio_reinit(command_t *cmd, const char* arg)
+{
+   return command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+}
+
+bool command_drivers_reinit(command_t *cmd, const char* arg)
+{
+   command_event(CMD_EVENT_REINIT, NULL);
    return true;
 }
 
@@ -1148,8 +1384,7 @@ bool command_get_status(command_t *cmd, const char* arg)
       else
          strlcpy_append(reply, sizeof(reply), &_len, "UNKNOWN");
 
-      _len += snprintf(reply + _len, sizeof(reply) - _len,
-            ",crc32=%lx\n", (unsigned long)content_get_crc());
+      strlcpy_append(reply, sizeof(reply), &_len, "\n");
    }
    else
       _len = strlcpy(reply, "GET_STATUS CONTENTLESS", sizeof(reply));
@@ -1185,6 +1420,13 @@ bool command_read_memory(command_t *cmd, const char *arg)
    /* Ensure large enough to return all requested bytes or an error message */
    alloc_size = 64 + nbytes * 3;
    reply      = (char*)malloc(alloc_size);
+   
+   if (!reply)
+   {
+      cmd->replier(cmd, "READ_CORE_MEMORY ERROR: OUT OF MEMORY\n", 37);
+      return true;
+   }
+   
    reply_at   = reply + snprintf(reply, alloc_size - 1, "READ_CORE_MEMORY %x", address);
 
    if ((data = command_memory_get_pointer(
@@ -1527,8 +1769,8 @@ bool command_event_load_entry_state(settings_t *settings)
    runloop_state_t *runloop_st     = runloop_state_get_ptr();
    bool ret                        = false;
 
-   if (!core_info_current_supports_savestate())
-      return false;
+   /* No early save-capability gate here: content_load_state() decides,
+    * and an existing entry-state file outranks stale metadata. */
 
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
@@ -1576,8 +1818,8 @@ bool command_event_load_auto_state(void)
    const char *name_savestate      = runloop_st->name.savestate;
    bool ret                        = false;
 
-   if (!core_info_current_supports_savestate())
-      return false;
+   /* No early save-capability gate here: content_load_state() decides,
+    * and an existing .auto state file outranks stale metadata. */
 
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
@@ -1841,14 +2083,18 @@ void command_event_set_savestate_auto_index(settings_t *settings)
    bool savestate_auto_index = settings->bools.savestate_auto_index;
    if (savestate_auto_index)
    {
+      int prev_slot          = settings->ints.state_slot;
       command_scan_states(
             settings->bools.show_hidden_files,
             settings->uints.savestate_max_keep,
             settings->ints.state_slot, &max_idx, NULL);
       configuration_set_int(settings, settings->ints.state_slot, max_idx);
-      RARCH_LOG("[State] %s: #%d.\n",
+      RARCH_LOG("[State] %s: #%d (slot reset %d -> %u from on-disk scan, "
+            "max_keep %u). If the previous slot was higher, earlier saves "
+            "may be missing on disk.\n",
             msg_hash_to_str(MSG_FOUND_LAST_STATE_SLOT),
-            max_idx);
+            max_idx, prev_slot, max_idx,
+            settings->uints.savestate_max_keep);
    }
    else
       /* Reset savestate index to 0 when loading content. */
@@ -2348,11 +2594,22 @@ bool command_event_main_state(unsigned cmd)
                      settings->bools.savestate_auto_index;
                unsigned savestate_max_keep                    =
                      settings->uints.savestate_max_keep;
-               bool frame_time_counter_reset_after_save_state =
-                     settings->bools.frame_time_counter_reset_after_save_state;
+               bool frame_time_counter_auto_reset             =
+                     settings->bools.frame_time_counter_auto_reset;
 
                if (cmd == CMD_EVENT_SAVE_STATE)
-                  content_save_state(state_path, true);
+               {
+                  bool queued = content_save_state(state_path, true);
+                  RARCH_LOG("[State] save dispatch for slot %d, path "
+                        "\"%s\": content_save_state queued=%s "
+                        "(auto_index=%s, max_keep=%u). NOTE: actual disk "
+                        "write is asynchronous; success is only known when "
+                        "the save task completes.\n",
+                        settings->ints.state_slot, state_path,
+                        queued ? "yes" : "NO",
+                        savestate_auto_index ? "on" : "off",
+                        savestate_max_keep);
+               }
                else
                   content_save_state_to_ram();
 
@@ -2360,7 +2617,7 @@ bool command_event_main_state(unsigned cmd)
                if (savestate_auto_index && (savestate_max_keep > 0))
                   command_event_set_savestate_garbage_collect(settings);
 
-               if (frame_time_counter_reset_after_save_state)
+               if (frame_time_counter_auto_reset)
                   video_st->frame_time_count = 0;
 
                ret      = true;
@@ -2445,6 +2702,50 @@ bool command_event_disk_control_append_image(
    return true;
 }
 
+/* Read-side callback for the snapshot phase of command_event_reinit.
+ * Receives the cached frame's pixels (or NULL if HW-render / no
+ * cached frame), copies into the static reuse buffer, and reports
+ * dims back to the caller via userdata.  Skips the work entirely
+ * if data is NULL -- caller checks the reported size to know
+ * whether a snapshot was actually taken. */
+struct command_reinit_snapshot_ctx
+{
+   void   **buf_p;       /* static cached_snapshot in the caller */
+   size_t  *cap_p;       /* static cached_snapshot_cap in the caller */
+   unsigned w, h;
+   size_t   p, size;
+};
+
+static void command_reinit_snapshot_cb(void *userdata,
+      const void *data,
+      unsigned width, unsigned height, size_t pitch)
+{
+   struct command_reinit_snapshot_ctx *ctx
+      = (struct command_reinit_snapshot_ctx*)userdata;
+   size_t want;
+
+   if (!ctx || !data || !width || !height || !pitch)
+      return;
+
+   want = pitch * height;
+   if (want > *ctx->cap_p)
+   {
+      void *tmp = realloc(*ctx->buf_p, want);
+      if (!tmp)
+         return;
+      *ctx->buf_p = tmp;
+      *ctx->cap_p = want;
+   }
+   if (!*ctx->buf_p)
+      return;
+
+   memcpy(*ctx->buf_p, data, want);
+   ctx->w    = width;
+   ctx->h    = height;
+   ctx->p    = pitch;
+   ctx->size = want;
+}
+
 void command_event_reinit(const int flags)
 {
    settings_t *settings           = config_get_ptr();
@@ -2469,66 +2770,68 @@ void command_event_reinit(const int flags)
       *sec_joypad                 = NULL;
 #endif
    /* Snapshot the last cached core frame before tearing the video
-    * driver down.  video_driver_free() nulls frame_cache_data as part
-    * of the reinit cycle (the pointer was borrowed from the core's
-    * own framebuffer and isn't guaranteed to stay live across the
-    * driver swap), so without a snapshot the new driver would come
-    * up with no core image to replay.  Restored + replayed below so
-    * the paused-core background remains visible when reinit is
-    * triggered from inside the menu (e.g. HDR mode toggle).
+    * driver down.  video_driver_free() invalidates the cache as
+    * part of the reinit cycle (the pointer was borrowed from the
+    * core's own framebuffer and isn't guaranteed to stay live
+    * across the driver swap), so without a snapshot the new
+    * driver would come up with no core image to replay.  Restored
+    * + replayed below so the paused-core background remains
+    * visible when reinit is triggered from inside the menu (e.g.
+    * HDR mode toggle).
     *
     * The snapshot buffer is static and reused across reinits — we
-    * need it to outlive command_event_reinit because we hand the
-    * pointer to video_st->frame_cache_data for the new driver to
-    * read via video_driver_cached_frame(), and the core's next real
-    * frame will replace the pointer at its leisure.  Resizing in
-    * place on each call keeps it bounded at one buffer's worth. */
+    * need it to outlive command_event_reinit because we publish
+    * the pointer back through video_driver_cached_frame_publish
+    * for the new driver to read via video_driver_cached_frame(),
+    * and the core's next real frame will replace the pointer at
+    * its leisure.  Resizing in place on each call keeps it
+    * bounded at one buffer's worth.
+    *
+    * The actual copy happens inside the cached_frame_read
+    * callback (which is what this function was hand-rolling
+    * before the unified read API existed -- exactly the same
+    * pattern, lifted into one place).  HW-render frames are
+    * skipped: the callback receives data == NULL for those, so
+    * we don't even allocate. */
    static void  *cached_snapshot      = NULL;
    static size_t cached_snapshot_cap  = 0;
-   size_t        want_size            = 0;
    unsigned      cached_snapshot_w    = 0;
    unsigned      cached_snapshot_h    = 0;
    size_t        cached_snapshot_p    = 0;
+   size_t        cached_snapshot_size = 0;
 
-   if (     video_st
-         && video_st->frame_cache_data
-         && video_st->frame_cache_data != RETRO_HW_FRAME_BUFFER_VALID
-         && video_st->frame_cache_height
-         && video_st->frame_cache_pitch)
-      want_size = video_st->frame_cache_pitch
-                * video_st->frame_cache_height;
-   if (want_size > cached_snapshot_cap)
    {
-      void *tmp = realloc(cached_snapshot, want_size);
-      if (tmp)
-      {
-         cached_snapshot     = tmp;
-         cached_snapshot_cap = want_size;
-      }
-      else
-         want_size           = 0;
+      struct command_reinit_snapshot_ctx ctx;
+      ctx.buf_p = &cached_snapshot;
+      ctx.cap_p = &cached_snapshot_cap;
+      ctx.w     = 0;
+      ctx.h     = 0;
+      ctx.p     = 0;
+      ctx.size  = 0;
+      video_driver_cached_frame_read(&ctx, command_reinit_snapshot_cb);
+      cached_snapshot_w    = ctx.w;
+      cached_snapshot_h    = ctx.h;
+      cached_snapshot_p    = ctx.p;
+      cached_snapshot_size = ctx.size;
    }
-   if (want_size && cached_snapshot)
-   {
-      memcpy(cached_snapshot, video_st->frame_cache_data, want_size);
-      cached_snapshot_w = video_st->frame_cache_width;
-      cached_snapshot_h = video_st->frame_cache_height;
-      cached_snapshot_p = video_st->frame_cache_pitch;
-   }
+   (void)cached_snapshot_size;
 
    video_driver_reinit(flags);
 
    /* Restore the snapshot and ask the new driver to replay it so the
     * paused-core background appears in the first post-reinit frame.
     * The buffer stays live across subsequent frame_cb calls from the
-    * core (which overwrite the pointer) and is either reused on the
-    * next reinit or freed at shutdown. */
+    * core (which overwrite the pointer) and is reused on the next
+    * reinit.  The static cached_snapshot itself is not freed at
+    * shutdown - it's a one-shot leak bounded at one framebuffer's
+    * worth of memory, reclaimed by the OS on process exit.  Adding
+    * a teardown hook would mean wiring command_event_reinit's
+    * statics into retroarch_deinit_drivers; the size cap makes the
+    * leak benign in practice, so we leave it. */
    if (cached_snapshot_p && cached_snapshot_h)
    {
-      video_st->frame_cache_data   = cached_snapshot;
-      video_st->frame_cache_width  = cached_snapshot_w;
-      video_st->frame_cache_height = cached_snapshot_h;
-      video_st->frame_cache_pitch  = cached_snapshot_p;
+      video_driver_cached_frame_publish(cached_snapshot,
+            cached_snapshot_w, cached_snapshot_h, cached_snapshot_p);
 
 #ifdef HAVE_MENU
       /* If the menu is alive across the reinit, the runloop's

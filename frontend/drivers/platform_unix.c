@@ -30,7 +30,7 @@
 #ifdef __linux__
 #include <linux/version.h>
 #if __STDC_VERSION__ >= 199901L && !defined(ANDROID)
-#include "feralgamemode/gamemode_client.h"
+#include "../../deps/feralgamemode/gamemode_client.h"
 #define FERAL_GAMEMODE
 #endif
 /* inotify API was added in 2.6.13 */
@@ -49,7 +49,7 @@
 #endif
 
 #include <signal.h>
-#include <pthread.h>
+#include <rthreads/rthreads.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -68,6 +68,7 @@
 #endif
 
 #include <boolean.h>
+#include <libretro.h>
 #include <retro_dirent.h>
 #include <retro_inline.h>
 #include <compat/strl.h>
@@ -122,11 +123,17 @@ enum platform_android_flags
    PLAT_ANDROID_FLAG_XPERIA_PLAY_DEVICE  = (1 << 2)
 };
 
-static pthread_key_t thread_key;
+static sthread_tls_t thread_key;
+static bool thread_key_inited            = false;
 static char app_dir[DIR_MAX_LENGTH];
 unsigned storage_permissions             = 0;
 struct android_app *g_android            = NULL;
 static uint8_t g_platform_android_flags  = 0;
+
+#ifdef HAVE_SAF
+static struct retro_vfs_authorized_location *android_vfs_authorized_locations = NULL;
+static size_t android_vfs_authorized_locations_count = 0;
+#endif
 #else
 #define PROC_APM_PATH                    "/proc/apm"
 #define PROC_ACPI_BATTERY_PATH           "/proc/acpi/battery"
@@ -136,14 +143,6 @@ static uint8_t g_platform_android_flags  = 0;
 static char unix_cpu_model_name[64]      = {0};
 #endif
 
-/* /proc/meminfo parameters */
-#define PROC_MEMINFO_PATH                "/proc/meminfo"
-#define PROC_MEMINFO_MEM_TOTAL_TAG       "MemTotal:"
-#define PROC_MEMINFO_MEM_AVAILABLE_TAG   "MemAvailable:"
-#define PROC_MEMINFO_MEM_FREE_TAG        "MemFree:"
-#define PROC_MEMINFO_BUFFERS_TAG         "Buffers:"
-#define PROC_MEMINFO_CACHED_TAG          "Cached:"
-#define PROC_MEMINFO_SHMEM_TAG           "Shmem:"
 
 #if (defined(__linux__) || defined(__HAIKU__) || defined(__unix__)) && !defined(ANDROID)
 static int speak_pid                     = 0;
@@ -167,7 +166,7 @@ typedef struct inotify_data
 #endif
 
 int system_property_get(const char *command,
-      const char *args, char *value)
+      const char *args, char *value, size_t value_size)
 {
    FILE *pipe;
    char buffer[BUFSIZ];
@@ -175,6 +174,9 @@ int system_property_get(const char *command,
    char *pos                  = NULL;
    size_t __len               = 0;
    size_t _len                = strlcpy(cmd, command, sizeof(cmd));
+
+   if (value_size == 0)
+      return 0;
 
    cmd[  _len]                = ' ';
    cmd[++_len]                = '\0';
@@ -194,6 +196,20 @@ int system_property_get(const char *command,
       if (fgets(buffer, sizeof(buffer), pipe))
       {
          size_t _len = strlen(buffer);
+         
+         /* Prevent buffer overflow by checking available space */
+         if (__len + _len >= value_size - 1)
+         {
+            /* Copy only what fits, leaving space for null terminator */
+            size_t remaining = value_size - __len - 1;
+            if (remaining > 0)
+            {
+               memcpy(pos, buffer, remaining);
+               pos += remaining;
+               __len += remaining;
+            }
+            break;
+         }
 
          memcpy(pos, buffer, _len);
 
@@ -205,6 +221,20 @@ int system_property_get(const char *command,
    *pos = '\0';
    pclose(pipe);
    return __len;
+}
+
+bool test_permissions(const char *path)
+{
+   char buf[PATH_MAX_LENGTH];
+   bool ret                  = false;
+
+   fill_pathname_join_special(buf, path, ".retroarch", sizeof(buf));
+   ret = path_mkdir(buf);
+
+   if (ret)
+      rmdir(buf);
+
+   return ret;
 }
 
 #ifdef ANDROID
@@ -267,13 +297,51 @@ static void android_app_set_activity_state(
    slock_unlock(android_app->mutex);
 }
 
+/* Upper bound on how long onDestroy() will block waiting for the app
+ * thread to unwind. ActivityManager gives a destroying activity on the
+ * order of ten seconds before it stops waiting, so stay well inside
+ * that: overrunning it buys nothing and turns a slow exit into an ANR. */
+#define ANDROID_DESTROY_TIMEOUT_US (5 * 1000 * 1000)
+
 static void android_app_free(struct android_app* android_app)
 {
+   bool acked;
+
+   /* Nothing ever wrote APP_CMD_DESTROY, so destroyRequested was dead
+    * and the app thread was never told to stop - while this function
+    * joined it holding the very mutex the thread needs to finish. If
+    * onDestroy() arrived with the thread still running, the Java UI
+    * thread blocked here until ActivityManager gave up.
+    *
+    * Ask the thread to shut down, then wait on the condvar (which
+    * releases the mutex, so the thread can take it in
+    * android_app_destroy). */
    slock_lock(android_app->mutex);
 
-   sthread_join(android_app->thread);
+   android_app->destroy_from_framework = 1;
+   android_app_write_cmd(android_app, APP_CMD_DESTROY);
+
+   acked = true;
+   while (!android_app->destroyed && acked)
+      acked = scond_wait_timeout(android_app->cond, android_app->mutex,
+            ANDROID_DESTROY_TIMEOUT_US);
+   acked = (android_app->destroyed != 0);
 
    slock_unlock(android_app->mutex);
+
+   /* If the thread did not acknowledge it may still be running and still
+    * holding references into this struct. Returning without joining lets
+    * the framework proceed instead of blocking the UI thread forever;
+    * leaking the allocation is the right trade against freeing memory a
+    * live thread is using, and the process is being torn down anyway. */
+   if (!acked)
+   {
+      RARCH_ERR("[Android] App thread did not acknowledge destroy; "
+            "skipping teardown.\n");
+      return;
+   }
+
+   sthread_join(android_app->thread);
 
    close(android_app->msgread);
    close(android_app->msgwrite);
@@ -304,29 +372,23 @@ static void onResume(ANativeActivity* activity)
 static void* onSaveInstanceState(
       ANativeActivity* activity, size_t* outLen)
 {
-   void* savedState = NULL;
-   struct android_app* android_app = (struct android_app*)
-      activity->instance;
-
-   slock_lock(android_app->mutex);
-
-   android_app->stateSaved = 0;
-   android_app_write_cmd(android_app, APP_CMD_SAVE_STATE);
-
-   while (!android_app->stateSaved)
-      scond_wait(android_app->cond, android_app->mutex);
-
-   if (android_app->savedState)
-   {
-      savedState                  = android_app->savedState;
-      *outLen                     = android_app->savedStateSize;
-      android_app->savedState     = NULL;
-      android_app->savedStateSize = 0;
-   }
-
-   slock_unlock(android_app->mutex);
-
-   return savedState;
+   /* RetroArch does not use the Android saved-instance-state blob.
+    * android_app->savedState is only ever populated from the blob handed
+    * to ANativeActivity_onCreate; nothing produces a new one, and the
+    * APP_CMD_SAVE_STATE handler on the app thread did nothing but set
+    * the acknowledgement flag.
+    *
+    * The upstream glue rendezvous here - write the command, wake the app
+    * thread, block the UI thread on the condvar until it acknowledges -
+    * therefore synchronised a field with no producer, once per
+    * backgrounding and once per configuration change (so on every screen
+    * rotation). Returning nothing skips the round trip entirely.
+    *
+    * Handing back the create-time blob, as the previous code did on the
+    * first call, would only have re-saved state that was already
+    * restored and is never consulted. */
+   *outLen = 0;
+   return NULL;
 }
 
 static void onPause(ANativeActivity* activity)
@@ -386,18 +448,41 @@ static void onContentRectChanged(ANativeActivity *activity,
       const ARect *rect)
 {
    struct android_app *instance = (struct android_app*)activity->instance;
-   unsigned width = rect->right - rect->left;
-   unsigned height = rect->bottom - rect->top;
-   instance->content_rect.changed = true;
-   instance->content_rect.width   = width;
-   instance->content_rect.height  = height;
+   int width                    = rect->right  - rect->left;
+   int height                   = rect->bottom - rect->top;
+
+   /* Store the dimensions before publishing the flag, so a reader that
+    * observes @changed cannot still see the previous size and build a
+    * swapchain at the wrong resolution. The old code set @changed first
+    * and used plain stores, leaving both the ordering and the visibility
+    * to chance. */
+   retro_atomic_store_release_int(&instance->content_rect.width,  width);
+   retro_atomic_store_release_int(&instance->content_rect.height, height);
+   retro_atomic_store_release_int(&instance->content_rect.changed, 1);
 }
 
 JNIEnv *jni_thread_getenv(void)
 {
    JNIEnv *env;
-   struct android_app* android_app = (struct android_app*)g_android;
-   int status = (*android_app->activity->vm)->
+   struct android_app* android_app;
+   int status;
+
+   /* Fast path. A JNIEnv is valid for the entire lifetime of the thread
+    * it was handed to, and this is called on only two threads (the app
+    * thread and, via the activity callbacks, the Java UI thread), so the
+    * cached pointer answers virtually every call.
+    *
+    * AttachCurrentThread on an already-attached thread is not free: it
+    * still crosses into the VM to look the thread up. The TLS slot was
+    * already being written below but never read back, so every one of
+    * the ~25 call sites - including the per-keystroke KeyCharacterMap
+    * lookup - paid for an attach it did not need. */
+   if (thread_key_inited)
+      if ((env = (JNIEnv*)sthread_tls_get(&thread_key)))
+         return env;
+
+   android_app = (struct android_app*)g_android;
+   status      = (*android_app->activity->vm)->
       AttachCurrentThread(android_app->activity->vm, &env, 0);
 
    if (status < 0)
@@ -405,7 +490,12 @@ JNIEnv *jni_thread_getenv(void)
       RARCH_ERR("jni_thread_getenv: Failed to attach current thread.\n");
       return NULL;
    }
-   pthread_setspecific(thread_key, (void*)env);
+
+   /* Without a key there is nowhere to cache, and jni_thread_destruct
+    * will never run to detach - but the env is still usable, so return
+    * it rather than failing the call. */
+   if (thread_key_inited)
+      sthread_tls_set(&thread_key, (void*)env);
 
    return env;
 }
@@ -421,7 +511,7 @@ static void jni_thread_destruct(void *value)
    if (android_app)
       (*android_app->activity->vm)->
          DetachCurrentThread(android_app->activity->vm);
-   pthread_setspecific(thread_key, NULL);
+   sthread_tls_set(&thread_key, NULL);
 }
 
 static void android_app_entry(void *data)
@@ -553,23 +643,42 @@ void ANativeActivity_onCreate(ANativeActivity* activity,
    ANativeActivity_setWindowFlags(activity, AWINDOW_FLAG_KEEP_SCREEN_ON
          | AWINDOW_FLAG_FULLSCREEN, 0);
 
-   if (pthread_key_create(&thread_key, jni_thread_destruct))
-      RARCH_ERR("Error initializing pthread_key.\n");
+   if (sthread_tls_create_with_dtor(&thread_key, jni_thread_destruct))
+      thread_key_inited = true;
+   else
+      RARCH_ERR("Error initializing thread-local storage key.\n");
 
    activity->instance = android_app_create(activity,
          savedState, savedStateSize);
 }
 
-static void frontend_android_get_name(char *s, size_t len)
+void frontend_android_get_manufacturer_model(char *s, size_t len)
 {
-   system_property_get("getprop", "ro.product.model", s);
+   char manufacturer[PROP_VALUE_MAX] = {0};
+   char model[PROP_VALUE_MAX]        = {0};
+
+   if (!s || len == 0)
+      return;
+
+   __system_property_get("ro.product.manufacturer", manufacturer);
+   __system_property_get("ro.product.model", model);
+
+   if (manufacturer[0])
+      manufacturer[0] = (char)toupper((unsigned char)manufacturer[0]);
+
+   snprintf(s, len, "%s %s", manufacturer, model);
 }
 
-static void frontend_android_get_version(int32_t *major,
+void frontend_android_get_name(char *s, size_t len)
+{
+   system_property_get("getprop", "ro.product.model", s, len);
+}
+
+void frontend_android_get_version(int32_t *major,
       int32_t *minor, int32_t *rel)
 {
    char os_version_str[PROP_VALUE_MAX] = {0};
-   system_property_get("getprop", "ro.build.version.release",
+   __system_property_get("ro.build.version.release",
          os_version_str);
    *major  = 0;
    *minor  = 0;
@@ -595,10 +704,10 @@ static void frontend_android_get_version(int32_t *major,
    }
 }
 
-static void frontend_android_get_version_sdk(int32_t *sdk)
+void frontend_android_get_version_sdk(int32_t *sdk)
 {
    char os_version_str[PROP_VALUE_MAX] = {0};
-   system_property_get("getprop", "ro.build.version.sdk", os_version_str);
+   system_property_get("getprop", "ro.build.version.sdk", os_version_str, sizeof(os_version_str));
    *sdk = 0;
    if (os_version_str[0])
       *sdk = (int32_t)strtol(os_version_str, NULL, 10);
@@ -638,7 +747,7 @@ static bool device_is_game_console(const char *name)
    return false;
 }
 
-bool test_permissions(const char *path)
+bool test_permissions_android(const char *path)
 {
    char buf[PATH_MAX_LENGTH];
    bool ret                  = false;
@@ -667,6 +776,160 @@ static void frontend_android_shutdown(bool unused)
 }
 
 #ifdef HAVE_SAF
+static void android_vfs_authorized_locations_free(void)
+{
+   size_t i;
+
+   if (!android_vfs_authorized_locations)
+      return;
+
+   for (i = 0; i < android_vfs_authorized_locations_count; i++)
+   {
+      free((void*)android_vfs_authorized_locations[i].path);
+      free((void*)android_vfs_authorized_locations[i].label);
+   }
+
+   free(android_vfs_authorized_locations);
+   android_vfs_authorized_locations       = NULL;
+   android_vfs_authorized_locations_count = 0;
+}
+
+static bool android_vfs_authorized_locations_refresh(void)
+{
+   JNIEnv *env;
+   jarray trees;
+   jsize trees_length;
+   jsize i;
+
+   android_vfs_authorized_locations_free();
+
+   if (!g_android || !g_android->have_saf)
+      return false;
+
+   env = jni_thread_getenv();
+   if (!env)
+      return false;
+
+   trees = (*env)->CallObjectMethod(
+         env,
+         g_android->activity->clazz,
+         g_android->getPersistedSafTrees);
+
+   if ((*env)->ExceptionOccurred(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      return false;
+   }
+
+   if (!trees)
+      return false;
+
+   trees_length = (*env)->GetArrayLength(env, trees);
+   if ((*env)->ExceptionOccurred(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      (*env)->DeleteLocalRef(env, trees);
+      return false;
+   }
+
+   if (trees_length <= 0)
+   {
+      (*env)->DeleteLocalRef(env, trees);
+      return true;
+   }
+
+   android_vfs_authorized_locations =
+      (struct retro_vfs_authorized_location*)calloc(
+            (size_t)trees_length,
+            sizeof(*android_vfs_authorized_locations));
+
+   if (!android_vfs_authorized_locations)
+   {
+      (*env)->DeleteLocalRef(env, trees);
+      return false;
+   }
+
+   for (i = 0; i < trees_length; ++i)
+   {
+      jstring tree;
+      const char *tree_chars;
+      char *serialized_path;
+
+      tree = (jstring)(*env)->GetObjectArrayElement(env, trees, i);
+      if ((*env)->ExceptionOccurred(env))
+      {
+         (*env)->ExceptionDescribe(env);
+         (*env)->ExceptionClear(env);
+         continue;
+      }
+
+      tree_chars = (*env)->GetStringUTFChars(env, tree, NULL);
+      if ((*env)->ExceptionOccurred(env))
+      {
+         (*env)->ExceptionDescribe(env);
+         (*env)->ExceptionClear(env);
+         (*env)->DeleteLocalRef(env, tree);
+         continue;
+      }
+
+      serialized_path = retro_vfs_path_join_saf(tree_chars, "");
+
+      if (serialized_path)
+      {
+         const char *label = msg_hash_to_str(MSG_REMOVABLE_STORAGE);
+
+         android_vfs_authorized_locations[android_vfs_authorized_locations_count].path  = serialized_path;
+         android_vfs_authorized_locations[android_vfs_authorized_locations_count].label = strdup(label ? label : "Storage");
+         android_vfs_authorized_locations[android_vfs_authorized_locations_count].flags = 0;
+
+         android_vfs_authorized_locations_count++;
+      }
+
+      (*env)->ReleaseStringUTFChars(env, tree, tree_chars);
+      if ((*env)->ExceptionOccurred(env))
+      {
+         (*env)->ExceptionDescribe(env);
+         (*env)->ExceptionClear(env);
+      }
+
+      (*env)->DeleteLocalRef(env, tree);
+      if ((*env)->ExceptionOccurred(env))
+      {
+         (*env)->ExceptionDescribe(env);
+         (*env)->ExceptionClear(env);
+      }
+   }
+
+   (*env)->DeleteLocalRef(env, trees);
+   if ((*env)->ExceptionOccurred(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+   }
+
+   return true;
+}
+
+bool android_get_vfs_authorized_locations(
+      struct retro_vfs_authorized_locations *locations)
+{
+   if (!g_android || !g_android->have_saf)
+      return false;
+
+   if (!android_vfs_authorized_locations && !android_vfs_authorized_locations_refresh())
+      return false;
+
+   if (!locations)
+      return true;
+
+   locations->locations = android_vfs_authorized_locations;
+   locations->count     = android_vfs_authorized_locations_count;
+
+   return true;
+}
+
 void android_show_saf_tree_picker(void)
 {
    JNIEnv *env;
@@ -721,6 +984,8 @@ JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_RetroActivityCom
       (*env)->ExceptionDescribe(env);
       (*env)->ExceptionClear(env);
    }
+
+   android_vfs_authorized_locations_refresh();
 #endif
 }
 
@@ -762,8 +1027,6 @@ static bool make_proc_acpi_key_val(char **_ptr, char **_key, char **_val)
     *_ptr = ptr;  /* store for next time. */
     return true;
 }
-
-#define ACPI_VAL_CHARGING_DISCHARGING  0xf268327aU
 
 static void check_proc_acpi_battery(const char * node, bool * have_battery,
       bool * charging, int *seconds, int *percent)
@@ -1746,18 +2009,22 @@ static void frontend_unix_get_env(int *argc,
       /* set paths depending on the ability to write
        * to internal_storage_path */
 
-      if (*internal_storage_path)
+      if (*internal_storage_path &&
+         test_permissions_android(internal_storage_path))
       {
-         if (test_permissions(internal_storage_path))
-            storage_permissions = INTERNAL_STORAGE_WRITABLE;
+         storage_permissions = INTERNAL_STORAGE_WRITABLE;
       }
-      else if (*internal_storage_app_path)
+      else if (*internal_storage_app_path &&
+               test_permissions_android(internal_storage_app_path))
       {
-         if (test_permissions(internal_storage_app_path))
-            storage_permissions = INTERNAL_STORAGE_APPDIR_WRITABLE;
+         storage_permissions = INTERNAL_STORAGE_APPDIR_WRITABLE;
       }
       else
+      {
+         // fallback to private data storage
+         // e.g. /data/user/0/com.retroarch.aarch64 then saves/ etc.
          storage_permissions = INTERNAL_STORAGE_NOT_WRITABLE;
+      }
 
       /* code to populate default paths*/
       if (*app_dir)
@@ -1883,7 +2150,7 @@ static void frontend_unix_get_env(int *argc,
       }
    }
 
-   system_property_get("getprop", "ro.product.model", device_model);
+   system_property_get("getprop", "ro.product.model", device_model, sizeof(device_model));
 
    /* Set automatic default values per device */
    if (g_platform_android_flags & PLAT_ANDROID_FLAG_XPERIA_PLAY_DEVICE)
@@ -2126,6 +2393,17 @@ static void frontend_unix_get_env(int *argc,
    else
        fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_SYSTEM], base_path,
              "system", sizeof(g_defaults.dirs[DEFAULT_DIR_SYSTEM]));
+
+   if (test_permissions("/tmp") && path_mkdir("/tmp/retroarch-tmp"))
+   {
+      fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CACHE], "/tmp",
+         "retroarch-tmp", sizeof(g_defaults.dirs[DEFAULT_DIR_CACHE]));
+   }
+   else
+   {
+      fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CACHE], base_path,
+         "temp", sizeof(g_defaults.dirs[DEFAULT_DIR_CACHE]));
+   }
 #endif
 
 #ifndef IS_SALAMANDER
@@ -2163,11 +2441,18 @@ static void android_app_destroy(struct android_app *android_app)
 
    env = jni_thread_getenv();
 
-   if (env && android_app->onRetroArchExit)
+   /* onRetroArchExit() calls finish() on the activity. When the destroy
+    * originated from the framework we are already inside onDestroy(),
+    * so asking it to finish again is at best redundant. */
+   if (     env
+         && android_app->onRetroArchExit
+         && !android_app->destroy_from_framework)
       CALL_VOID_METHOD(env, android_app->activity->clazz,
             android_app->onRetroArchExit);
 
 #ifdef HAVE_SAF
+   android_vfs_authorized_locations_free();
+
    if (android_app->have_saf)
       retro_vfs_deinit_saf();
 #endif
@@ -2186,8 +2471,20 @@ static void android_app_destroy(struct android_app *android_app)
 static bool frontend_unix_set_gamemode(bool on)
 {
 #ifdef FERAL_GAMEMODE
-   int gamemode_status  = gamemode_query_status();
-   bool gamemode_active = (gamemode_status == 2);
+   /* Once gamemode_query_status() reports failure (typically because
+    * libgamemode.so is not installed), there is no point repeatedly
+    * re-probing on every config load or menu toggle - the result will
+    * not change for the lifetime of the process, and each probe emits
+    * a warning. Latch the unavailable state and short-circuit. */
+   static bool gamemode_unavailable = false;
+   int gamemode_status;
+   bool gamemode_active;
+
+   if (gamemode_unavailable)
+      return false;
+
+   gamemode_status  = gamemode_query_status();
+   gamemode_active  = (gamemode_status == 2);
 
    if (gamemode_status < 0)
    {
@@ -2196,6 +2493,7 @@ static bool frontend_unix_set_gamemode(bool on)
                "https://github.com/FeralInteractive/gamemode needs to be installed.\n",
                gamemode_error_string());
 
+      gamemode_unavailable = true;
       return false;
    }
 
@@ -2297,6 +2595,14 @@ static void frontend_unix_init(void *data)
          "onRetroArchExit", "()V");
    GET_METHOD_ID(env, android_app->isAndroidTV, class,
          "isAndroidTV", "()Z");
+   GET_METHOD_ID(env, android_app->getRefreshRate, class,
+         "getRefreshRate", "()F");
+   GET_METHOD_ID(env, android_app->getDisplayModes, class,
+         "getDisplayModes", "()[I");
+   GET_METHOD_ID(env, android_app->getCurrentDisplayModeId, class,
+         "getCurrentDisplayModeId", "()I");
+   GET_METHOD_ID(env, android_app->setDisplayModeId, class,
+         "setDisplayModeId", "(I)Z");
    GET_METHOD_ID(env, android_app->getPowerstate, class,
          "getPowerstate", "()I");
    GET_METHOD_ID(env, android_app->getBatteryLevel, class,
@@ -2337,8 +2643,13 @@ static void frontend_unix_init(void *data)
          "isScreenReaderEnabled", "()Z");
    GET_METHOD_ID(env, android_app->accessibilitySpeak, class,
          "accessibilitySpeak", "(Ljava/lang/String;)V");
+   GET_METHOD_ID(env, android_app->showKeyboard, class,
+         "showKeyboard", "(Ljava/lang/String;Ljava/lang/String;)V");
+   GET_METHOD_ID(env, android_app->hideKeyboard, class,
+         "hideKeyboard", "()V");
 
-   CALL_BOOLEAN_METHOD(env, android_app->is_play_store_build, android_app->activity->clazz, android_app->isPlayStoreBuild)
+   CALL_BOOLEAN_METHOD(env, android_app->is_play_store_build,
+         android_app->activity->clazz, android_app->isPlayStoreBuild);
 
 #ifdef HAVE_SAF
    GET_METHOD_ID(env, android_app->requestOpenDocumentTree, class,
@@ -2348,6 +2659,9 @@ static void frontend_unix_init(void *data)
          "getPersistedSafTrees", "()[Ljava/lang/String;");
 
    android_app->have_saf = retro_vfs_init_saf(jni_thread_getenv, android_app->activity->clazz);
+
+   if (android_app->have_saf)
+      android_vfs_authorized_locations_refresh();
 #endif
 
    GET_OBJECT_CLASS(env, class, obj);
@@ -2364,7 +2678,7 @@ static void frontend_unix_init(void *data)
          g_platform_android_flags |= PLAT_ANDROID_FLAG_ANDROID_TV_DEVICE;
    }
 
-   system_property_get("getprop", "ro.product.model", device_model);
+   system_property_get("getprop", "ro.product.model", device_model, sizeof(device_model));
 
    /* Check if we are a game console device */
    if (device_is_game_console(device_model))
@@ -2388,16 +2702,12 @@ static int frontend_unix_parse_drive_list(void *data, bool load_content)
 
    JNIEnv *env = jni_thread_getenv();
    jint output           = 0;
-   jobject obj           = NULL;
    jstring jstr          = NULL;
 
    int volume_count = 0;
 
    if (!env || !g_android)
       return 0;
-
-   CALL_OBJ_METHOD(env, obj, g_android->activity->clazz,
-         g_android->getIntent);
 
    if (!g_android->is_play_store_build && g_android->getVolumeCount)
    {
@@ -2771,125 +3081,6 @@ static void frontend_unix_exitspawn(char *s, size_t len, char *args)
    frontend_unix_exec(s, should_load_content);
 }
 #endif
-
-static uint64_t frontend_unix_get_total_mem(void)
-{
-#if defined(DINGUX)
-   char line[256];
-   unsigned long mem_total = 0;
-   FILE* meminfo_file      = NULL;
-
-   line[0] = '\0';
-
-   /* Open /proc/meminfo */
-   if (!(meminfo_file = fopen(PROC_MEMINFO_PATH, "r")))
-      return 0;
-
-   /* Parse lines
-    * (Note: virtual filesystem, so don't have to
-    *  worry about buffering file reads) */
-   while (fgets(line, sizeof(line), meminfo_file))
-   {
-      if (string_starts_with_size(line, PROC_MEMINFO_MEM_TOTAL_TAG,
-            STRLEN_CONST(PROC_MEMINFO_MEM_TOTAL_TAG)))
-      {
-         sscanf(line, PROC_MEMINFO_MEM_TOTAL_TAG " %lu kB", &mem_total);
-         break;
-      }
-   }
-
-   /* Close /proc/meminfo */
-   fclose(meminfo_file);
-   meminfo_file = NULL;
-
-   return (uint64_t)mem_total * 1024;
-#else
-   uint64_t pages            = sysconf(_SC_PHYS_PAGES);
-   uint64_t page_size        = sysconf(_SC_PAGE_SIZE);
-   return pages * page_size;
-#endif
-}
-
-static uint64_t frontend_unix_get_free_mem(void)
-{
-   char line[256];
-   unsigned long mem_available = 0;
-   unsigned long mem_free      = 0;
-   unsigned long buffers       = 0;
-   unsigned long cached        = 0;
-   unsigned long shmem         = 0;
-   bool mem_available_found    = false;
-   bool mem_free_found         = false;
-   bool buffers_found          = false;
-   bool cached_found           = false;
-   bool shmem_found            = false;
-   FILE* meminfo_file          = NULL;
-
-   line[0] = '\0';
-
-   /* Open /proc/meminfo */
-   if (!(meminfo_file = fopen(PROC_MEMINFO_PATH, "r")))
-      return 0;
-
-   /* Parse lines
-    * (Note: virtual filesystem, so don't have to
-    *  worry about buffering file reads) */
-   while (fgets(line, sizeof(line), meminfo_file))
-   {
-      /* If 'MemAvailable' is found, we can return immediately */
-      if (!mem_available_found)
-         if (string_starts_with_size(line, PROC_MEMINFO_MEM_AVAILABLE_TAG,
-               STRLEN_CONST(PROC_MEMINFO_MEM_AVAILABLE_TAG)))
-         {
-            mem_available_found = true;
-            sscanf(line, PROC_MEMINFO_MEM_AVAILABLE_TAG " %lu kB", &mem_available);
-            break;
-         }
-
-      if (!mem_free_found)
-         if (string_starts_with_size(line, PROC_MEMINFO_MEM_FREE_TAG,
-               STRLEN_CONST(PROC_MEMINFO_MEM_FREE_TAG)))
-         {
-            mem_free_found = true;
-            sscanf(line, PROC_MEMINFO_MEM_FREE_TAG " %lu kB", &mem_free);
-         }
-
-      if (!buffers_found)
-         if (string_starts_with_size(line, PROC_MEMINFO_BUFFERS_TAG,
-               STRLEN_CONST(PROC_MEMINFO_BUFFERS_TAG)))
-         {
-            buffers_found = true;
-            sscanf(line, PROC_MEMINFO_BUFFERS_TAG " %lu kB", &buffers);
-         }
-
-      if (!cached_found)
-         if (string_starts_with_size(line, PROC_MEMINFO_CACHED_TAG,
-               STRLEN_CONST(PROC_MEMINFO_CACHED_TAG)))
-         {
-            cached_found = true;
-            sscanf(line, PROC_MEMINFO_CACHED_TAG " %lu kB", &cached);
-         }
-
-      if (!shmem_found)
-         if (string_starts_with_size(line, PROC_MEMINFO_SHMEM_TAG,
-               STRLEN_CONST(PROC_MEMINFO_SHMEM_TAG)))
-         {
-            shmem_found = true;
-            sscanf(line, PROC_MEMINFO_SHMEM_TAG " %lu kB", &shmem);
-         }
-   }
-
-   /* Close /proc/meminfo */
-   fclose(meminfo_file);
-   meminfo_file = NULL;
-
-   /* Use 'accurate' free memory value, if available */
-   if (mem_available_found)
-      return (uint64_t)mem_available * 1024;
-
-   /* ...Otherwise, use estimate */
-   return (uint64_t)((mem_free + buffers + cached) - shmem) * 1024;
-}
 
 /*#include <valgrind/valgrind.h>*/
 static void frontend_unix_sighandler(int sig)
@@ -3313,10 +3504,17 @@ static bool accessibility_speak_unix(int speed,
       const char* speak_text, int priority)
 {
    int pid;
+   settings_t *settings   = config_get_ptr();
+   unsigned engine        = settings
+      ? settings->uints.accessibility_narrator_engine
+      : (unsigned)ACCESSIBILITY_NARRATOR_ENGINE_ESPEAK;
    const char* language   = accessibility_unix_language_code(get_user_language_iso639_1(true));
    char* voice_out        = (char*)malloc(3 + strlen(language));
    char* speed_out        = (char*)malloc(3 + 3);
    const char* speeds[10] = {"80", "100", "125", "150", "170", "210", "260", "310", "380", "450"};
+   /* speech-dispatcher (spd-say) takes a rate in the range -100..100,
+    * mapped here from RetroArch's 1..10 speed ladder. */
+   const char* spd_rates[10] = {"-90", "-70", "-50", "-30", "-10", "10", "30", "50", "70", "90"};
 
    /* NULL-check both mallocs: voice_out[0]='-' and speed_out[0]='-'
     * below NULL-deref on OOM.  The 'end:' label does NULL-tolerant
@@ -3352,7 +3550,7 @@ static bool accessibility_speak_unix(int speed,
 
    if (speak_pid > 0)
    {
-      /* Kill the running espeak */
+      /* Kill the running narrator */
       kill(speak_pid, SIGTERM);
       speak_pid = 0;
    }
@@ -3361,6 +3559,30 @@ static bool accessibility_speak_unix(int speed,
    switch (pid)
    {
       case 0:
+         if (engine == ACCESSIBILITY_NARRATOR_ENGINE_SPEECH_DISPATCHER)
+         {
+            /* child process: speech-dispatcher via spd-say.
+             *   -l <lang>   language
+             *   -r <rate>   rate (-100..100)
+             *   -w          wait until finished, so this child stays
+             *               alive for is_narrator_running_unix()/SIGTERM
+             *               to track and interrupt, matching the espeak
+             *               long-lived-child behaviour. */
+            char* cmd[] = { (char*) "spd-say",
+               (char*) "-l", NULL,
+               (char*) "-r", NULL,
+               (char*) "-w",
+               NULL, NULL };
+            cmd[2] = (char*)language;
+            cmd[4] = (char*)spd_rates[speed-1];
+            cmd[6] = (char*)speak_text;
+            execvp("spd-say", cmd);
+
+            RARCH_WARN("Could not execute spd-say.\n");
+            /* Prevent interfere with the parent process */
+            _exit(EXIT_FAILURE);
+         }
+         else
          {
             /* child process: replace process with the espeak command */
             char* cmd[] = { (char*) "espeak", NULL, NULL, NULL, NULL };
@@ -3374,7 +3596,7 @@ static bool accessibility_speak_unix(int speed,
             _exit(EXIT_FAILURE);
          }
       case -1:
-         RARCH_ERR("Could not fork for espeak.\n");
+         RARCH_ERR("Could not fork for narrator.\n");
       default:
          {
             /* parent process */
@@ -3473,8 +3695,6 @@ frontend_ctx_driver_t frontend_ctx_unix = {
    frontend_unix_get_arch,             /* get_architecture */
    frontend_unix_get_powerstate,
    frontend_unix_parse_drive_list,
-   frontend_unix_get_total_mem,
-   frontend_unix_get_free_mem,
    frontend_unix_install_signal_handlers,
    frontend_unix_get_signal_handler_state,
    frontend_unix_set_signal_handler_state,

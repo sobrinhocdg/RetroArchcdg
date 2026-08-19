@@ -410,6 +410,30 @@ static bool gl_glsl_compile_shader(glsl_shader_data_t *glsl,
    else if (glsl_core)
    {
       unsigned version_no = 0;
+#ifdef HAVE_OPENGLES
+      /* glsl_core (the glcore/gl3 driver) uses modern in/out stock
+       * shaders.  On GLES a desktop "#version 130" is rejected outright
+       * ("GLSL 1.30 is not supported"), which broke every GLSL shader on
+       * the glcore driver; emit an "... es" version instead, mirroring
+       * the user-shader mapping above. */
+      if (gl_check_capability(GL_CAPS_GLES3_SUPPORTED))
+      {
+         unsigned gl_ver = glsl_major * 100 + glsl_minor * 10;
+         if      (gl_ver >= 320)
+            version_no = 320;
+         else if (gl_ver >= 310)
+            version_no = 310;
+         else
+            version_no = 300;
+         snprintf(version, sizeof(version), "#version %u es\n", version_no);
+         RARCH_LOG("[GLSL] Using GLSL version %u es.\n", version_no);
+      }
+      else
+      {
+         snprintf(version, sizeof(version), "#version 100\n");
+         RARCH_LOG("[GLSL] Using GLSL version 100.\n");
+      }
+#else
       unsigned gl_ver     = glsl_major * 100 + glsl_minor * 10;
 
       if (gl_ver >= 300)
@@ -421,6 +445,7 @@ static bool gl_glsl_compile_shader(glsl_shader_data_t *glsl,
 
       snprintf(version, sizeof(version), "#version %u\n", version_no);
       RARCH_LOG("[GLSL] Using GLSL version %u.\n", version_no);
+#endif
    }
 
    source[0] = version;
@@ -1146,19 +1171,30 @@ static void *gl_glsl_init(void *data, const char *path)
 #endif
 
    /* Find all aliases we use in our GLSLP and add #defines for them so
-    * that a shader can choose a fallback if we are not using a preset. */
-   *glsl->alias_define = '\0';
-   for (i = 0; i < glsl->shader->passes; i++)
+    * that a shader can choose a fallback if we are not using a preset.
+    *
+    * Track a running offset into alias_define and let snprintf write
+    * directly at that offset; the prior strlcat-in-loop form scanned
+    * the buffer from the start on every iteration to find its end,
+    * giving O(passes^2) total cost. */
    {
-      if (*glsl->shader->pass[i].alias)
+      size_t alias_len   = 0;
+      size_t alias_avail = sizeof(glsl->alias_define);
+      glsl->alias_define[0] = '\0';
+      for (i = 0; i < glsl->shader->passes; i++)
       {
-         char define[128];
-
-         define[0] = '\0';
-
-         snprintf(define, sizeof(define), "#define %s_ALIAS\n",
+         int n;
+         if (!*glsl->shader->pass[i].alias)
+            continue;
+         if (alias_len + 1 >= alias_avail)
+            break;
+         n = snprintf(glsl->alias_define + alias_len,
+               alias_avail - alias_len,
+               "#define %s_ALIAS\n",
                glsl->shader->pass[i].alias);
-         strlcat(glsl->alias_define, define, sizeof(glsl->alias_define));
+         if (n < 0 || (size_t)n >= alias_avail - alias_len)
+            break;
+         alias_len += (size_t)n;
       }
    }
 
@@ -1674,11 +1710,13 @@ static bool gl_glsl_set_coords(void *shader_data,
    {
       /* Avoid hitting malloc on every single regular quad draw. */
 
+      /* Must match the four bind conditions below exactly: a stream
+       * the caller did not supply is not bound and takes no room. */
       size_t elems  = 0;
-      elems        += (uni->color >= 0)         * 4;
-      elems        += (uni->tex_coord >= 0)     * 2;
-      elems        += (uni->vertex_coord >= 0)  * 2;
-      elems        += (uni->lut_tex_coord >= 0) * 2;
+      elems        += (uni->color         >= 0 && coords->color)         * 4;
+      elems        += (uni->tex_coord     >= 0 && coords->tex_coord)     * 2;
+      elems        += (uni->vertex_coord  >= 0 && coords->vertex)        * 2;
+      elems        += (uni->lut_tex_coord >= 0 && coords->lut_tex_coord) * 2;
 
       elems        *= coords->vertices * sizeof(GLfloat);
 
@@ -1696,28 +1734,28 @@ static bool gl_glsl_set_coords(void *shader_data,
    }
 #endif
 
-   if (uni->tex_coord >= 0)
+   if (uni->tex_coord >= 0 && coords->tex_coord)
    {
       gl_glsl_set_coord_array(attribs, uni->tex_coord,
             coords->tex_coord, coords, size, 2);
       attribs_size++;
    }
 
-   if (uni->vertex_coord >= 0)
+   if (uni->vertex_coord >= 0 && coords->vertex)
    {
       gl_glsl_set_coord_array(attribs, uni->vertex_coord,
             coords->vertex, coords, size, 2);
       attribs_size++;
    }
 
-   if (uni->color >= 0)
+   if (uni->color >= 0 && coords->color)
    {
       gl_glsl_set_coord_array(attribs, uni->color,
             coords->color, coords, size, 4);
       attribs_size++;
    }
 
-   if (uni->lut_tex_coord >= 0)
+   if (uni->lut_tex_coord >= 0 && coords->lut_tex_coord)
    {
       gl_glsl_set_coord_array(attribs, uni->lut_tex_coord,
             coords->lut_tex_coord, coords, size, 2);

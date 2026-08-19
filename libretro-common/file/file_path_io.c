@@ -27,6 +27,22 @@
 
 #include <sys/stat.h>
 
+/* MinGW's <sys/stat.h> defines stat (and in some configs mkdir) as
+ * function-like macros that map to _stat64/_stati64/_mkdir.  This must
+ * be undone BEFORE including libretro.h below: otherwise the macro
+ * rewrites the struct member name in the retro_vfs_interface definition
+ * (retro_vfs_stat_t stat -> _stat64), and then the use sites
+ * vfs_iface->stat / vfs_iface->mkdir no longer match it, breaking the
+ * Windows build.  The POSIX functions are still reachable via their
+ * real names where this TU needs them (it doesn't call stat()/mkdir()
+ * directly; all I/O goes through the VFS *_impl callbacks). */
+#ifdef stat
+#undef stat
+#endif
+#ifdef mkdir
+#undef mkdir
+#endif
+
 #include <boolean.h>
 #include <file/file_path.h>
 #include <compat/strl.h>
@@ -39,6 +55,16 @@
 #include <direct.h>
 #else
 #include <unistd.h> /* stat() is defined here */
+#endif
+
+/* <direct.h> (MinGW, included just above) can re-establish the mkdir
+ * macro after the earlier #undef, so drop it again here before the use
+ * site below.  Same rationale for stat, defensively. */
+#ifdef stat
+#undef stat
+#endif
+#ifdef mkdir
+#undef mkdir
 #endif
 
 /* TODO/FIXME - globals */
@@ -134,6 +160,28 @@ bool path_mkdir(const char *dir)
 
    if (!(dir && *dir))
       return false;
+
+   /* Nothing to do if it is already there.
+    *
+    * Without this the common case - which for archive extraction is
+    * every member after the first in a given directory - still costs
+    * a strdup, a path_parent_dir, a strcmp, a stat of the parent, a
+    * mkdir that is guaranteed to fail with EEXIST, and then a stat of
+    * the leaf to interpret that failure.  Two directory probes and a
+    * doomed syscall to answer a question one probe answers.  On Win32
+    * each of those probes is a UTF-16 conversion allocation plus both
+    * GetFileAttributesW and _wstat64, so the saving there is larger
+    * than the syscall count suggests.
+    *
+    * This is not a shortcut around the slow path's result: the slow
+    * path already returns true for an existing directory, by way of
+    * the mkdir -> -2 -> path_is_directory sequence at the bottom.  The
+    * one behavioural difference is at a filesystem root ("/", "C:\"),
+    * where path_parent_dir empties the string and the !*basedir guard
+    * below returns false today; such a directory does exist, so
+    * reporting true for it is the correction, not a regression. */
+   if (path_is_directory(dir))
+      return true;
 
    /* Use heap. Real chance of stack 
     * overflow if we recurse too hard. */

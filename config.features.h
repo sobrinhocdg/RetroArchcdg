@@ -62,6 +62,12 @@
 #define SUPPORTS_SDL2 false
 #endif
 
+#ifdef HAVE_SDL3
+#define SUPPORTS_SDL3 true
+#else
+#define SUPPORTS_SDL3 false
+#endif
+
 #ifdef HAVE_THREADS
 #define SUPPORTS_THREAD true
 #else
@@ -278,13 +284,19 @@
 #define SUPPORTS_ZLIB false
 #endif
 
+#ifdef HAVE_CHD
+#define SUPPORTS_CHD true
+#else
+#define SUPPORTS_CHD false
+#endif
+
 #ifdef HAVE_7ZIP
 #define SUPPORTS_7ZIP true
 #else
 #define SUPPORTS_7ZIP false
 #endif
 
-#ifdef HAVE_ZSTD
+#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
 #define SUPPORTS_ZSTD true
 #else
 #define SUPPORTS_ZSTD false
@@ -344,11 +356,7 @@
 #define SUPPORTS_FREETYPE false
 #endif
 
-#ifdef HAVE_STB_FONT
 #define SUPPORTS_STBFONT true
-#else
-#define SUPPORTS_STBFONT false
-#endif
 
 #ifdef HAVE_NETWORKING
 #define SUPPORTS_NETPLAY true
@@ -408,6 +416,24 @@
 #define SUPPORTS_RWEBP true
 #else
 #define SUPPORTS_RWEBP false
+#endif
+
+#ifdef HAVE_RWEBM
+#define SUPPORTS_RWEBM true
+#else
+#define SUPPORTS_RWEBM false
+#endif
+
+#ifdef HAVE_RVP9
+#define SUPPORTS_RVP9 true
+#else
+#define SUPPORTS_RVP9 false
+#endif
+
+#ifdef HAVE_RDDS
+#define SUPPORTS_RDDS true
+#else
+#define SUPPORTS_RDDS false
 #endif
 
 #ifdef HAVE_CORETEXT

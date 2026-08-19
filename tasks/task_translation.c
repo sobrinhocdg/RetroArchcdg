@@ -309,7 +309,6 @@ static void handle_translation_response(
 #ifdef HAVE_GFX_WIDGETS
    bool gfx_widgets_paused           = (video_st->flags &
       VIDEO_FLAG_WIDGETS_PAUSED) ? true : false;
-   dispgfx_widget_t *p_dispwidget    = dispwidget_get_ptr();
 #endif
    bool ai_service_pause             = settings->bools.ai_service_pause;
    unsigned ai_service_mode          = settings->uints.ai_service_mode;
@@ -325,7 +324,7 @@ static void handle_translation_response(
 #ifdef HAVE_ACCESSIBILITY
    /* When auto mode is on, we turn off the overlay
     * once we have the result for the next call.*/
-   if (p_dispwidget->ai_service_overlay_state != 0
+   if (gfx_widgets_ai_service_overlay_get_state() != 0
        && access_st->ai_service_auto == 2)
       gfx_widgets_ai_service_overlay_unload();
 #endif
@@ -339,7 +338,7 @@ static void handle_translation_response(
           && gfx_widgets_paused)
       {
          /* In this case we have to unpause and then repause for a frame */
-         p_dispwidget->ai_service_overlay_state = 2;
+         gfx_widgets_ai_service_overlay_set_state(2);
          command_event(CMD_EVENT_UNPAUSE, NULL);
       }
 #endif
@@ -352,9 +351,11 @@ static void handle_translation_response(
       int new_image_size        = (int)response->image_size;
       unsigned image_width, image_height;
       /* Get the video frame dimensions reference */
-      const void *dummy_data = video_st->frame_cache_data;
-      unsigned width         = video_st->frame_cache_width;
-      unsigned height        = video_st->frame_cache_height;
+      unsigned width  = 0;
+      unsigned height = 0;
+      bool     is_hw_fb;
+      video_driver_cached_frame_info(&width, &height, NULL, NULL);
+      is_hw_fb = video_driver_cached_frame_is_hw_render();
 
       /* try two different modes for text display *
        * In the first mode, we use display widget overlays, but they require
@@ -396,7 +397,7 @@ static void handle_translation_response(
          {
             /* In this case we have to unpause and then repause for a frame */
             /* Unpausing state */
-            p_dispwidget->ai_service_overlay_state = 2;
+            gfx_widgets_ai_service_overlay_set_state(2);
             command_event(CMD_EVENT_UNPAUSE, NULL);
          }
       }
@@ -434,6 +435,7 @@ static void handle_translation_response(
                && raw_image_file_data[3] == 'G')
          {
             /* PNG file */
+#ifdef HAVE_RPNG
             int retval   = 0;
             rpng_t *rpng = rpng_alloc();
             if (!rpng)
@@ -493,6 +495,11 @@ static void handle_translation_response(
                }
             }
             rpng_free(rpng);
+#else
+            /* PNG decoding requires RPNG; without it we cannot handle this
+             * screenshot format, so fail the request cleanly. */
+            goto finish;
+#endif
          }
          else
          {
@@ -503,7 +510,7 @@ static void handle_translation_response(
          if (!(scaler = (struct scaler_ctx*)calloc(1, sizeof(struct scaler_ctx))))
             goto finish;
 
-         if (dummy_data == RETRO_HW_FRAME_BUFFER_VALID)
+         if (is_hw_fb)
          {
             /*
                In this case, we used the viewport to grab the image
@@ -567,6 +574,9 @@ static void handle_translation_response(
       params.buf                  = response->sound_data;
       params.bufsize              = response->sound_size;
       params.cb                   = NULL;
+      params.buf_owner            = NULL;
+      params.buf_owner_free       = NULL;
+      params.out_slot             = NULL;
       params.basename             = NULL;
 
       audio_driver_mixer_add_stream(&params);
@@ -839,12 +849,46 @@ static const char *ai_service_get_str(enum translation_lang id)
    return "";
 }
 
+/* Read-side callback used by run_translation_service for the SW
+ * core path: convert the cached frame's pixels to BGR24 in-place
+ * into a pre-allocated heap buffer.  The callback runs inside
+ * video_driver_cached_frame_read's lifetime envelope so the
+ * source pointer is guaranteed valid for the duration. */
+struct translation_sw_ctx
+{
+   struct scaler_ctx *scaler;
+   uint8_t           *dst;
+   unsigned           width;
+   unsigned           height;
+   size_t             pitch;
+};
+
+static void translation_sw_convert_cb(void *userdata,
+      const void *data,
+      unsigned width, unsigned height, size_t pitch)
+{
+   struct translation_sw_ctx *ctx = (struct translation_sw_ctx*)userdata;
+   if (!data || !ctx || !ctx->dst)
+      return;
+   /* If the dimensions shifted between cached_frame_info and
+    * here (shouldn't with same-thread access but cheap to defend),
+    * trust the cached_frame_read parameters which describe the
+    * actual buffer we were given. */
+   video_frame_convert_to_bgr24(
+         ctx->scaler,
+         ctx->dst,
+         (const uint8_t*)data + ((int)height - 1) * pitch,
+         width, height,
+         (int)-pitch,
+         width, height,
+         width * 3);
+}
+
 bool run_translation_service(settings_t *settings, bool paused)
 {
    struct video_viewport vp;
    size_t pitch;
    unsigned width, height;
-   const void *data                  = NULL;
    uint8_t *bit24_image              = NULL;
    uint8_t *bit24_image_prev         = NULL;
    struct scaler_ctx *scaler         = NULL;
@@ -854,9 +898,8 @@ bool run_translation_service(settings_t *settings, bool paused)
    video_driver_state_t *video_st    = video_state_get_ptr();
    access_state_t *access_st         = access_state_get_ptr();
 #ifdef HAVE_GFX_WIDGETS
-   dispgfx_widget_t *p_dispwidget    = dispwidget_get_ptr();
    /* For the case when ai service pause is disabled. */
-   if (     (p_dispwidget->ai_service_overlay_state != 0)
+   if (     (gfx_widgets_ai_service_overlay_get_state() != 0)
          && (access_st->ai_service_auto == 1))
    {
       gfx_widgets_ai_service_overlay_unload();
@@ -903,83 +946,97 @@ bool run_translation_service(settings_t *settings, bool paused)
       }
    }
 
-   data       = video_st->frame_cache_data;
-   width      = video_st->frame_cache_width;
-   height     = video_st->frame_cache_height;
-   pitch      = video_st->frame_cache_pitch;
-
-   if (!data)
-      goto finish;
-
-   if (data == RETRO_HW_FRAME_BUFFER_VALID)
    {
-      /*
-        The direct frame capture didn't work, so try getting it
-        from the viewport instead.  This isn't as good as the
-        raw frame buffer, since the viewport may us bilinear
-        filtering, or other shaders that will completely trash
-        the OCR, but it's better than nothing.
-      */
-      vp.x                           = 0;
-      vp.y                           = 0;
-      vp.width                       = 0;
-      vp.height                      = 0;
-      vp.full_width                  = 0;
-      vp.full_height                 = 0;
-
-      video_driver_get_viewport_info(&vp);
-
-      if (!vp.width || !vp.height)
+      bool has_cpu_pixels = false;
+      if (!video_driver_cached_frame_info(&width, &height, &pitch,
+               &has_cpu_pixels))
          goto finish;
 
-      bit24_image_prev = (uint8_t*)malloc(vp.width * vp.height * 3);
-      bit24_image      = (uint8_t*)malloc(width * height * 3);
-
-      if (!bit24_image_prev || !bit24_image)
-         goto finish;
-
-      if (!(      video_st->current_video->read_viewport
-               && video_st->current_video->read_viewport(
-                  video_st->data, bit24_image_prev, false)))
+      if (!has_cpu_pixels)
       {
-         RARCH_LOG("[Translation] Could not read viewport for translation service.\n");
-         goto finish;
+         /* HW render core, or no cached frame yet.  Fall back to
+          * read_viewport for OCR -- not ideal (the viewport may
+          * have shaders applied that degrade OCR quality), but
+          * better than nothing.
+          *
+          * RETRO_HW_FRAME_BUFFER_VALID is treated identically to
+          * "no cached frame yet" here: in both cases there are no
+          * CPU-side pixels to read directly. */
+         vp.x                           = 0;
+         vp.y                           = 0;
+         vp.width                       = 0;
+         vp.height                      = 0;
+         vp.full_width                  = 0;
+         vp.full_height                 = 0;
+
+         video_driver_get_viewport_info(&vp);
+
+         if (!vp.width || !vp.height)
+            goto finish;
+
+         bit24_image_prev = (uint8_t*)malloc(vp.width * vp.height * 3);
+         bit24_image      = (uint8_t*)malloc(width * height * 3);
+
+         if (!bit24_image_prev || !bit24_image)
+            goto finish;
+
+         if (!(      video_st->current_video->read_viewport
+                  && video_st->current_video->read_viewport(
+                     video_st->data, bit24_image_prev, false)))
+         {
+            RARCH_LOG("[Translation] Could not read viewport for translation service.\n");
+            goto finish;
+         }
+
+         /* TODO: Rescale down to regular resolution */
+         scaler->in_fmt      = SCALER_FMT_BGR24;
+         scaler->out_fmt     = SCALER_FMT_BGR24;
+         scaler->scaler_type = SCALER_TYPE_POINT;
+         scaler->in_width    = vp.width;
+         scaler->in_height   = vp.height;
+         scaler->out_width   = width;
+         scaler->out_height  = height;
+         scaler_ctx_gen_filter(scaler);
+
+         scaler->in_stride   = vp.width*3;
+         scaler->out_stride  = width*3;
+         scaler_ctx_scale_direct(scaler, bit24_image, bit24_image_prev);
       }
-
-      /* TODO: Rescale down to regular resolution */
-      scaler->in_fmt      = SCALER_FMT_BGR24;
-      scaler->out_fmt     = SCALER_FMT_BGR24;
-      scaler->scaler_type = SCALER_TYPE_POINT;
-      scaler->in_width    = vp.width;
-      scaler->in_height   = vp.height;
-      scaler->out_width   = width;
-      scaler->out_height  = height;
-      scaler_ctx_gen_filter(scaler);
-
-      scaler->in_stride   = vp.width*3;
-      scaler->out_stride  = width*3;
-      scaler_ctx_scale_direct(scaler, bit24_image, bit24_image_prev);
-   }
-   else
-   {
-      const enum retro_pixel_format
-         video_driver_pix_fmt           = video_st->pix_fmt;
-      /* This is a software core, so just change the pixel format to 24-bit. */
-      if (!(bit24_image = (uint8_t*)malloc(width * height * 3)))
-          goto finish;
-
-      if (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
-         scaler->in_fmt = SCALER_FMT_ARGB8888;
       else
-         scaler->in_fmt = SCALER_FMT_RGB565;
-      video_frame_convert_to_bgr24(
-         scaler,
-         (uint8_t *)bit24_image,
-         (const uint8_t*)data + ((int)height - 1)*pitch,
-         width, height,
-         (int)-pitch,
-         width, height,
-         width * 3);
+      {
+         /* SW core path: convert the cached frame to BGR24 inside
+          * the cached_frame_read callback.  The conversion fully
+          * consumes the cached frame's pointer before the call
+          * returns, so the heap-owned bit24_image is the only
+          * thing that escapes the read API's lifetime envelope.
+          *
+          * Pre-stage everything the conversion needs (scaler
+          * settings, output buffer) before invoking the read --
+          * the callback should be as short as possible to keep
+          * the lifetime lock (once enforced in the final commit)
+          * held briefly. */
+         const enum retro_pixel_format
+            video_driver_pix_fmt           = video_st->pix_fmt;
+
+         if (!(bit24_image = (uint8_t*)malloc(width * height * 3)))
+            goto finish;
+
+         if (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
+            scaler->in_fmt = SCALER_FMT_ARGB8888;
+         else
+            scaler->in_fmt = SCALER_FMT_RGB565;
+
+         {
+            struct translation_sw_ctx ctx;
+            ctx.scaler = scaler;
+            ctx.dst    = bit24_image;
+            ctx.width  = width;
+            ctx.height = height;
+            ctx.pitch  = pitch;
+            video_driver_cached_frame_read(&ctx,
+                  translation_sw_convert_cb);
+         }
+      }
    }
    scaler_ctx_gen_reset(scaler);
 
@@ -1232,9 +1289,16 @@ static bool http_translate(
     * branch has been deleted as dead code). */
    {
       size_t pitch = width * 3;
+#ifdef HAVE_RPNG
       bmp_buffer   = rpng_save_image_bgr24_string(
             bit24_image + width * (height - 1) * 3,
             width, height, (signed)-pitch, &buffer_bytes);
+#else
+      /* Encoding the screenshot requires RPNG; without it the translation
+       * request cannot be built, so fail cleanly below on the NULL buffer. */
+      (void)pitch;
+      bmp_buffer   = NULL;
+#endif
    }
 
    if (!(bmp64_buffer = base64((void *)bmp_buffer,

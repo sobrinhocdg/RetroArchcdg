@@ -292,8 +292,12 @@ bool recording_init(void)
    params.filename                  = output;
    params.fps                       = av_info->timing.fps;
    params.samplerate                = av_info->timing.sample_rate;
+   /* XRGB2101010 source frames are down-converted to XRGB8888 before the
+    * recording path sees them (see video_driver_frame), so they record as
+    * ARGB8888 just like a native XRGB8888 core. */
    params.pix_fmt                   =
-      (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
+      (   video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888
+       || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB2101010)
       ? FFEMU_PIX_ARGB8888
       : FFEMU_PIX_RGB565;
    params.config                    = NULL;
@@ -420,12 +424,24 @@ void recording_driver_update_streaming_url(void)
    const char     *youtube_url   = "rtmp://a.rtmp.youtube.com/live2/";
    const char     *twitch_url    = "rtmp://live.twitch.tv/app/";
    const char     *facebook_url  = "rtmps://live-api-s.facebook.com:443/rtmp/";
+   const char     *kick_url      = "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app/";
 
    if (!settings)
       return;
 
    switch (settings->uints.streaming_mode)
    {
+      case STREAMING_MODE_KICK:
+         if (*settings->arrays.kick_stream_key)
+         {
+            size_t _len = strlcpy(settings->paths.path_stream_url,
+                  kick_url,
+                  sizeof(settings->paths.path_stream_url));
+            strlcpy(settings->paths.path_stream_url       + _len,
+                  settings->arrays.kick_stream_key,
+                  sizeof(settings->paths.path_stream_url) - _len);
+         }
+         break;
       case STREAMING_MODE_TWITCH:
          if (*settings->arrays.twitch_stream_key)
          {

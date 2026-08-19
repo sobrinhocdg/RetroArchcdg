@@ -34,7 +34,7 @@
 #include <unistd.h>
 #endif
 
-#if (defined(__linux__) || defined(__unix__) || defined(DINGUX)) && !defined(EMSCRIPTEN)
+#if (defined(__linux__) || defined(__unix__) || defined(DINGUX)) && !defined(__EMSCRIPTEN__)
 #include <signal.h>
 #endif
 
@@ -89,7 +89,7 @@
 #include <retro_miscellaneous.h>
 #include <lists/dir_list.h>
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #include "frontend/drivers/platform_emscripten.h"
 #include "gfx/common/gl_common.h"
@@ -101,6 +101,7 @@
 #endif
 
 #if defined(ANDROID)
+#include <android/api-level.h>
 #include "play_feature_delivery/play_feature_delivery.h"
 #endif
 
@@ -139,6 +140,7 @@
 #ifdef HAVE_NETWORKING
 #include <net/net_compat.h>
 #include <net/net_socket.h>
+#include <net/net_http.h>
 #endif
 
 #include <audio/audio_resampler.h>
@@ -223,7 +225,27 @@
 #include "ai/game_ai.h"
 #endif
 
-#if defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX)
+/* RetroArch provides its own entry point (main, below) and runloop,
+ * creates its own Win32 window (gfx/common/win32_common.c), and
+ * initialises SDL subsystems explicitly (SDL_Init/SDL_InitSubSystem
+ * in the SDL audio/video/input drivers). SDL is used purely as a
+ * driver backend, never as the application framework. Tell SDL not to
+ * #define main->SDL_main and not to supply its own WinMain: without
+ * this, SDL.h renames our main to SDL_main and the link pulls in
+ * libSDL2main's WinMain, which (a) is unwanted given -mwindows /
+ * -ENTRY:mainCRTStartup already designate our entry point, and (b)
+ * breaks under CXX_BUILD where the renamed main is compiled as C++
+ * and no longer matches the C 'SDL_main' that WinMain calls
+ * (undefined reference to SDL_main). */
+#if defined(HAVE_SDL3)
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
+#include <SDL3/SDL.h>
+#elif defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX)
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
 #include "SDL.h"
 #endif
 
@@ -603,6 +625,7 @@ midi_driver_t *midi_drivers[]   = {
 #ifdef HAVE_COREMIDI
    &midi_coremidi,
 #endif
+   &midi_fmsynth,
    &midi_null
 };
 
@@ -735,6 +758,21 @@ static bool midi_driver_init_io_buffers(void)
    rarch_midi_drv_output_event.data_size = 0;
 
    return true;
+}
+
+bool midi_driver_synth_active(void)
+{
+   return midi_drv
+       && midi_drv->render
+       && rarch_midi_drv_data
+       && rarch_midi_drv_data != (void*)-1;
+}
+
+bool midi_driver_render_audio(float *out, size_t frames, unsigned rate)
+{
+   if (!midi_driver_synth_active())
+      return false;
+   return midi_drv->render(rarch_midi_drv_data, out, frames, rate);
 }
 
 static void midi_driver_free(void)
@@ -1574,6 +1612,8 @@ void drivers_init(
       menu_st->flags             |= MENU_ST_FLAG_DATA_OWN;
 #endif
 
+   DRIVER_FLAGS_NORMALIZE(flags);
+
    /* Content av_info based automatic swap interval must be set early. */
    runloop_set_video_swap_interval(settings);
 
@@ -1589,21 +1629,21 @@ void drivers_init(
 #ifdef HAVE_VIDEO_FILTER
       video_driver_filter_free();
 #endif
-      video_st->frame_cache_data  = NULL;
+      video_driver_cached_frame_invalidate();
       if (!video_driver_init_internal(&video_is_threaded,
                verbosity_enabled))
          retroarch_fail(1, "video_driver_init_internal()");
 
-      if (   !(video_st->flags & VIDEO_FLAG_CACHE_CONTEXT_ACK)
+      if (   !video_driver_cache_context_ack_test()
             && hwr->context_reset)
          hwr->context_reset();
-      video_st->flags            &= ~VIDEO_FLAG_CACHE_CONTEXT_ACK;
+      video_driver_cache_context_ack_clear();
       runloop_st->frame_time_last = 0;
    }
 
    /* Regular display refresh rate startup autoswitch based on content av_info. */
    if (     flags & (DRIVER_VIDEO_MASK | DRIVER_AUDIO_MASK)
-         && !(runloop_st->flags & RUNLOOP_FLAG_IS_INITED))
+         && !runloop_is_inited())
    {
       float refresh_rate               = video_st->av_info.timing.fps;
       unsigned autoswitch_refresh_rate = settings->uints.video_autoswitch_refresh_rate;
@@ -1818,6 +1858,8 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
    dispgfx_widget_t *p_dispwidget   = dispwidget_get_ptr();
 #endif
 
+   DRIVER_FLAGS_NORMALIZE(flags);
+
    core_info_deinit_list();
    core_info_free_current_core();
 
@@ -1830,7 +1872,7 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
     * use-after-free crashes on D3D12/Vulkan under threaded video.
     *
     * No-op when threaded video is not active. */
-   if (     (flags & DRIVERS_VIDEO_INPUT)
+   if (     (flags & DRIVER_VIDEO_AND_INPUT_MASK)
          && VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
          && (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE))
       video_thread_wait_idle();
@@ -1889,10 +1931,10 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       wifi_driver_ctl(RARCH_WIFI_CTL_DEINIT, NULL);
 #endif
 
-   if (flags & DRIVER_LED)
+   if (flags & DRIVER_LED_MASK)
       led_driver_free();
 
-   if (flags & DRIVERS_VIDEO_INPUT)
+   if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
    {
       video_driver_free_internal();
 #ifdef HAVE_THREADS
@@ -1902,14 +1944,11 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       video_st->context_lock      = NULL;
 #endif
       video_st->data              = NULL;
-      video_st->frame_cache_data  = NULL;
+      video_driver_cached_frame_invalidate();
    }
 
    if (flags & DRIVER_AUDIO_MASK)
       audio_driver_deinit();
-
-   if ((flags & DRIVER_VIDEO_MASK))
-      video_st->data = NULL;
 
    if ((flags & DRIVER_INPUT_MASK))
       input_state_get_ptr()->current_data = NULL;
@@ -1961,13 +2000,13 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
    /* Video */
    video_display_server_destroy();
 
-   video_st->flags &= ~(VIDEO_FLAG_ACTIVE      | VIDEO_FLAG_USE_RGBA      |
-                        VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_CACHE_CONTEXT |
-                        VIDEO_FLAG_CACHE_CONTEXT_ACK
-                       );
+   video_driver_modify_disp_flags(0,
+         VIDEO_FLAG_ACTIVE      | VIDEO_FLAG_USE_RGBA      |
+         VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_CACHE_CONTEXT);
+   video_driver_cache_context_ack_clear();
    video_st->record_gpu_buffer          = NULL;
    video_st->current_video              = NULL;
-   video_st->frame_cache_data           = NULL;
+   video_driver_cached_frame_invalidate();
 
    /* Audio */
    audio_state_get_ptr()->flags        &= ~AUDIO_FLAG_ACTIVE;
@@ -2035,12 +2074,44 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
 
             video_monitor_set_refresh_rate(*hz);
 
+            /* With no content loaded it is the dummy core that is
+             * running, and its retro_get_system_av_info() reports
+             * timing.fps as whatever GET_TARGET_REFRESH_RATE answered
+             * at core init - that is, the display rate.  Nothing
+             * re-queries it when the display rate changes afterwards,
+             * so it goes stale the moment the user switches mode.
+             *
+             * That matters because audio_driver_menu_sample() emits
+             * timing.sample_rate / timing.fps frames per runloop
+             * iteration, while the runloop is driven at the *actual*
+             * display rate.  A stale fps scales the menu audio feed by
+             * (real rate / stale fps): after a 120 Hz -> 60 Hz switch
+             * it is halved, so the mixer - which audio_driver_flush()
+             * advances by the post-resample output frame count -
+             * starves and menu BGM garbles.
+             *
+             * driver_adjust_system_rates() below cannot repair this,
+             * because it derives audio_st->input from this very
+             * timing.fps and so re-derives the same wrong answer.
+             *
+             * Only the dummy core gets this treatment: a real core's
+             * fps is a property of the emulated system, not of the
+             * display, and must never be overwritten here. */
+            if (     *hz > 0.0f
+                  && runloop_st->current_core_type == CORE_TYPE_DUMMY)
+               video_st->av_info.timing.fps = *hz;
+
             /* Sets audio monitor rate to new value. */
             audio_st->src_ratio_orig   =
             audio_st->src_ratio_curr   =
             (double)audio_output_sample_rate / audio_st->input;
 
             driver_adjust_system_rates(runloop_st, video_st, settings);
+
+            /* driver_adjust_system_rates may have updated audio_st->input
+             * for the new refresh rate; recompute the DRC threshold so
+             * it tracks one frame's worth of samples at the new rate. */
+            audio_driver_update_drc_threshold(audio_st);
          }
          break;
       case RARCH_DRIVER_CTL_FIND_FIRST:
@@ -2785,26 +2856,10 @@ static void ram_state_to_file(void)
       command_event(CMD_EVENT_RAM_STATE_TO_FILE, state_path);
 }
 
-/**
- * Compute DJB2 hash of a short string, lowercasing ASCII on the fly.
- * Assumes ext points to a valid, short (extension-length) string.
- */
-static INLINE uint32_t djb2_calculate_lower(const char *s)
-{
-   uint32_t h = 5381;
-   for (; *s; s++)
-   {
-      unsigned char c = (unsigned char)*s;
-      /* Branchless ASCII tolower: set bit 5 if uppercase letter */
-      c |= ((unsigned int)c - 'A' < 26u) ? 0x20 : 0x00;
-      h = (h << 5) + h + c;
-   }
-   return h;
-}
-
 enum rarch_content_type path_is_media_type(const char *path)
 {
    const char *ext;
+   char ext_lower[16];
 
    if (!path || !*path)
       return RARCH_CONTENT_NONE;
@@ -2839,10 +2894,32 @@ enum rarch_content_type path_is_media_type(const char *path)
    if (!ext || !*ext)
       return RARCH_CONTENT_NONE;
 
-   /* Hash the extension directly, lowercasing during hashing —
-    * eliminates strlcpy, string_to_lower, and the stack buffer. */
-   switch (msg_hash_to_file_type(djb2_calculate_lower(ext)))
+   /* Lowercase the extension into a tiny stack buffer so the
+    * value-table lookup matches the lowercase entries regardless
+    * of what case the filesystem returned (e.g. "MP4" vs "mp4").
+    * Real file extensions are short; truncate at 15 chars. */
    {
+      size_t i;
+      for (i = 0; i < sizeof(ext_lower) - 1 && ext[i]; i++)
+      {
+         unsigned char c = (unsigned char)ext[i];
+         ext_lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c | 0x20) : (char)c;
+      }
+      ext_lower[i] = '\0';
+   }
+
+   switch (msg_hash_to_file_type(ext_lower))
+   {
+#if defined(HAVE_WEBMPLAYER) && !defined(HAVE_FFMPEG) && !defined(HAVE_MPV)
+      case FILE_TYPE_MKV:
+      case FILE_TYPE_WEBM:
+#ifdef HAVE_RMP4
+      /* the built-in player also handles ISO-BMFF containers */
+      case FILE_TYPE_MP4:
+      case FILE_TYPE_MOV:
+#endif
+         return RARCH_CONTENT_MOVIE;
+#endif
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
       case FILE_TYPE_OGM:
       case FILE_TYPE_MKV:
@@ -2871,22 +2948,38 @@ enum rarch_content_type path_is_media_type(const char *path)
       case FILE_TYPE_M4A:
 #endif
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_AUDIOMIXER)
-#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_STB_VORBIS)
+#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RVORBIS)
       case FILE_TYPE_OGG:
 #endif
-#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_DR_MP3)
+#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RMP3)
       case FILE_TYPE_MP3:
 #endif
-#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_DR_FLAC)
+#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RFLAC)
       case FILE_TYPE_FLAC:
 #endif
 #if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RWAV)
       case FILE_TYPE_WAV:
 #endif
-#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_IBXM)
+#if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RMODTRACKER)
       case FILE_TYPE_MOD:
       case FILE_TYPE_S3M:
       case FILE_TYPE_XM:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAAC) && defined(HAVE_RMP4) \
+      && !defined(HAVE_FFMPEG) && !defined(HAVE_MPV)
+      /* without FFmpeg/MPV (which claim m4a above), the mixer's AAC
+       * path takes it as music */
+      case FILE_TYPE_M4A:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAAC)
+      case FILE_TYPE_AAC:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_ROPUS)
+      case FILE_TYPE_OPUS:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RWEBM) \
+      && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))
+      case FILE_TYPE_WEBA:
 #endif
          return RARCH_CONTENT_MUSIC;
 #endif
@@ -3120,6 +3213,90 @@ bool is_accessibility_enabled(bool accessibility_enable, bool accessibility_enab
  *
  * Returns: true (1) on success, otherwise false (0).
  **/
+/* Everything closing content does once nothing is left running in
+ * the core.
+ *
+ * Split out of CMD_EVENT_CORE_DEINIT unchanged, and still called
+ * from exactly where it used to run.  It is separated because it has
+ * to become resumable: the wait above it is the freeze this work is
+ * about, and removing that wait means this half runs later, from the
+ * frame loop, once the tasks have finished.  Extracting it on its
+ * own keeps that change a question of WHEN this is called rather
+ * than what it does.
+ *
+ * Every local is re-derived from its accessor rather than passed in,
+ * so it carries no dependency on the caller's frame. */
+static void command_event_finish_content_deinit(void)
+{
+   runloop_state_t *runloop_st          = runloop_state_get_ptr();
+   settings_t *settings                 = config_get_ptr();
+   video_driver_state_t
+      *video_st                         = video_state_get_ptr();
+   rarch_system_info_t *sys_info        = &runloop_st->system;
+   struct retro_hw_render_callback *hwr = NULL;
+
+         /* Save last selected disk index, if required */
+         if (sys_info)
+            disk_control_save_image_index(&sys_info->disk_control);
+
+         runloop_runtime_log_deinit(runloop_st,
+               settings->bools.content_runtime_log,
+               settings->bools.content_runtime_log_aggregate,
+               settings->paths.directory_runtime_log,
+               settings->paths.directory_playlist);
+
+         content_reset_savestate_backups();
+         hwr = VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
+#ifdef HAVE_CHEEVOS
+         rcheevos_unload();
+#endif
+#ifdef HAVE_NETWORKING
+         /* The core may have registered a netpacket interface
+          * (RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE). We hold a
+          * heap copy of that struct, but it carries function
+          * pointers into the core. Clear it before the core's dylib
+          * is closed by runloop_event_deinit_core(), otherwise those
+          * pointers dangle into unloaded code. Passing NULL frees and
+          * nulls the cached interface via the existing handler. */
+         netplay_driver_ctl(RARCH_NETPLAY_CTL_SET_CORE_PACKET_INTERFACE,
+               NULL);
+#endif
+         runloop_event_deinit_core();
+
+         /* Clear turbo and hold button state on core unload */
+         {
+            input_driver_state_t *input_st = input_state_get_ptr();
+            if (input_st)
+            {
+               memset(&input_st->turbo_btns, 0, sizeof(turbo_buttons_t));
+               memset(&input_st->hold_btns, 0, sizeof(hold_buttons_t));
+            }
+         }
+
+#ifdef HAVE_RUNAHEAD
+         /* If 'runahead_available' is false, then
+          * runahead is enabled by the user but an
+          * error occurred while the core was running
+          * (typically a save state issue). In this
+          * case we have to 'manually' reset the runahead
+          * runtime variables, otherwise runahead will
+          * remain disabled until the user restarts
+          * RetroArch */
+         if (runloop_st)
+         {
+            if (!(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_AVAILABLE))
+               runahead_clear_variables(runloop_st);
+
+            /* Deallocate preemptive frames */
+            preempt_deinit(runloop_st);
+         }
+#endif
+
+         if (hwr)
+            memset(hwr, 0, sizeof(*hwr));
+
+}
+
 bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
@@ -3151,7 +3328,7 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_SAVE_FILES:
          return event_save_files(
                runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
-#if defined(HAVE_ZLIB)
+#if defined(HAVE_COMPRESSION)
                settings->bools.save_file_compression,
 #else
                false,
@@ -3170,7 +3347,7 @@ bool command_event(enum event_command cmd, void *data)
          /* Because the overlay is a display widget,
           * it's going to be written
           * over the menu, so we unset it here. */
-         if (dispwidget_get_ptr()->ai_service_overlay_state != 0)
+         if (gfx_widgets_ai_service_overlay_get_state() != 0)
             gfx_widgets_ai_service_overlay_unload();
 #endif
          break;
@@ -3178,7 +3355,17 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_OVERLAY
          input_overlay_init();
 #endif
+	 break;
+      case CMD_EVENT_VIDEO_FILTER_INIT:
+      {
+#ifdef HAVE_VIDEO_FILTER
+         const enum retro_pixel_format
+            video_driver_pix_fmt       = video_st->pix_fmt;
+         settings_t  *settings      = config_get_ptr();
+         video_driver_init_filter(video_driver_pix_fmt, settings);
+#endif
          break;
+      }
       case CMD_EVENT_CHEAT_INDEX_PLUS:
 #ifdef HAVE_CHEATS
          cheat_manager_index_next();
@@ -3493,7 +3680,14 @@ bool command_event(enum event_command cmd, void *data)
 
          if (!runloop_st->secondary_lib_handle)
          {
-            if (!secondary_core_ensure_exists(runloop_st, settings))
+            enum runahead_copy_status status =
+               secondary_core_ensure_exists(runloop_st, settings);
+            if (status == RUNAHEAD_COPY_PENDING)
+               /* Copy task still running: not loaded yet, but do
+                * not tear down - the task completes in the
+                * background and a later attempt succeeds. */
+               return false;
+            if (status == RUNAHEAD_COPY_UNAVAILABLE)
             {
                runahead_secondary_core_destroy(runloop_st);
                runloop_st->flags &=
@@ -3548,6 +3742,24 @@ bool command_event(enum event_command cmd, void *data)
              (settings,
               runloop_st->pending_windowed_scale))
             return false;
+         break;
+      case CMD_VIDEO_FILTER_TOGGLE:
+         {
+#ifdef HAVE_VIDEO_FILTER
+            const char *_msg;
+            /* Allow video filter toggle only when there is an active core. */
+            if (!(runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING))
+               break;
+            settings->bools.video_filter_enable = !(settings->bools.video_filter_enable);
+            _msg =
+               settings->bools.video_filter_enable ?
+               msg_hash_to_str(MSG_VIDEO_FILTER_ENABLE_ON) :
+               msg_hash_to_str(MSG_VIDEO_FILTER_ENABLE_OFF);
+
+            runloop_msg_queue_push(_msg, strlen(_msg), 1, 60, true, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+#endif
+         }
          break;
       case CMD_EVENT_MENU_TOGGLE:
 #ifdef HAVE_MENU
@@ -3661,8 +3873,15 @@ bool command_event(enum event_command cmd, void *data)
          {
             if (settings->bools.savestate_auto_index)
             {
+               int prev_slot = settings->ints.state_slot;
+               int next_slot = command_event_get_next_savestate_auto_index(
+                     settings);
+               RARCH_LOG("[State] auto-index advance: slot %d -> %d "
+                     "(max_keep %u) before save.\n",
+                     prev_slot, next_slot,
+                     settings->uints.savestate_max_keep);
                configuration_set_int(settings, settings->ints.state_slot,
-                  command_event_get_next_savestate_auto_index(settings));
+                  next_slot);
             }
          }
          if (!command_event_main_state(cmd))
@@ -3727,11 +3946,10 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_SCREENSHOTS
          {
             const char *dir_screenshot      = settings->paths.directory_screenshot;
-            video_driver_state_t *video_st  = video_state_get_ptr();
             if (!take_screenshot(dir_screenshot,
                      runloop_st->runtime_content_path_basename,
                      false,
-                     video_st->frame_cache_data && (video_st->frame_cache_data == RETRO_HW_FRAME_BUFFER_VALID),
+                     video_driver_cached_frame_is_hw_render(),
                      false,
                      true))
                return false;
@@ -3753,8 +3971,8 @@ bool command_event(enum event_command cmd, void *data)
             ram_state_to_file();
 
             /* Save auto state */
-            if (settings->bools.savestate_auto_save &&
-                runloop_st->current_core_type != CORE_TYPE_DUMMY)
+            if (     settings->bools.savestate_auto_save
+                  && runloop_st->current_core_type != CORE_TYPE_DUMMY)
                command_event_save_auto_state();
 
             /* Save last selected disk index, if required */
@@ -3871,15 +4089,21 @@ bool command_event(enum event_command cmd, void *data)
             command_event(CMD_EVENT_QUIT, NULL);
             break;
          }
+
          /* Closing content via hotkey requires toggling menu
           * and resetting the position later on to prevent
           * going to empty Quick Menu */
          if (!(menu_st->flags & MENU_ST_FLAG_ALIVE))
-         {
-            menu_st->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
-            menu_st->flags |= MENU_ST_FLAG_PENDING_RELOAD_CORE;
             command_event(CMD_EVENT_MENU_TOGGLE, NULL);
-         }
+
+         menu_st->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
+         menu_st->flags |= MENU_ST_FLAG_PENDING_RELOAD_CORE;
+
+#if defined(HAVE_GFX_WIDGETS)
+         /* Remove stale notifications after reinit */
+         dispwidget_get_ptr()->flags &= ~DISPGFX_WIDGET_FLAG_PERSISTING;
+#endif
+
 #else
          command_event(CMD_EVENT_QUIT, NULL);
 #endif
@@ -3893,8 +4117,74 @@ bool command_event(enum event_command cmd, void *data)
          rcheevos_toggle_hardcore_paused();
 #endif
          break;
+      case CMD_EVENT_OSD_NOTIFICATION_TOGGLE:
+#if defined(HAVE_GFX_WIDGETS)
+         {
+            /* Toggle the gfx_widgets notification system to match current
+             * settings WITHOUT a full driver reinit. The classic OSD font is
+             * always initialised by the video drivers and gated per-frame, so
+             * only the widget lifecycle needs adjusting. Mirrors the enable
+             * decision in drivers_init() and the threaded deinit barrier in
+             * driver_uninit(). */
+            /* Gate on the *active* state -- what gfx_widgets_ready() and the
+             * menu read -- not the INITED flag. A persisting deinit leaves
+             * INITED set, which would wedge the toggle after the first use
+             * (toggle worked once, then the menu stopped updating). */
+            dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
+            bool widgets_active            = p_dispwidget->active;
+            bool want_widgets              =
+                     settings->bools.video_font_enable
+                  && settings->bools.menu_enable_widgets
+                  && video_st->current_video
+                  && video_st->current_video->gfx_widgets_enabled
+                  && video_st->current_video->gfx_widgets_enabled(
+                        video_st->data);
+
+            if (want_widgets && !widgets_active)
+            {
+               bool force_fs            = (video_st->flags &
+                     VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
+               bool video_is_fullscreen = settings->bools.video_fullscreen
+                     || force_fs;
+               p_dispwidget->active     = gfx_widgets_init(
+                     disp_get_ptr(),
+                     anim_get_ptr(),
+                     settings,
+                     (uintptr_t)&p_dispwidget->active,
+                     VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st),
+                     video_st->width,
+                     video_st->height,
+                     video_is_fullscreen,
+                     settings->paths.directory_assets,
+                     settings->paths.path_font);
+            }
+            else if (!want_widgets && widgets_active)
+            {
+#ifdef HAVE_THREADS
+               /* Same barrier as driver_uninit(): never free widget GPU
+                * resources while the video thread may still reference them. */
+               if (     VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
+                     && (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE))
+                  video_thread_wait_idle();
+#endif
+               /* Full teardown (not persisting): a real user toggle-off
+                * must clear INITED so a later toggle-on re-inits cleanly. */
+               gfx_widgets_deinit(false);
+               p_dispwidget->active = false;
+            }
+         }
+#endif
+#ifdef HAVE_MENU
+         /* Toggling notifications/widgets can change which dependent entries
+          * are shown, so rebuild the current menu list. The old full reinit
+          * did this implicitly via menu_driver_init(); set the flag after the
+          * widget work so it survives into the next menu iteration. */
+         menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                         |  MENU_ST_FLAG_PREVENT_POPULATE;
+#endif
+         break;
       case CMD_EVENT_REINIT_FROM_TOGGLE:
-         video_st->flags &= ~VIDEO_FLAG_FORCE_FULLSCREEN;
+         video_driver_modify_disp_flags(0, VIDEO_FLAG_FORCE_FULLSCREEN);
          /* this fallthrough is on purpose, it should do
             a CMD_EVENT_REINIT too */
       case CMD_EVENT_REINIT:
@@ -4001,7 +4291,7 @@ bool command_event(enum event_command cmd, void *data)
 #endif
             {
                if (autosave_init(
-#if defined(HAVE_ZLIB)
+#if defined(HAVE_COMPRESSION)
                         settings->bools.save_file_compression,
 #else
                         false,
@@ -4121,6 +4411,7 @@ bool command_event(enum event_command cmd, void *data)
 
             ol->index                      = ol->next_index;
             ol->active                     = &ol->overlays[ol->index];
+            ((struct overlay *)ol->active)->viewport_override_logged = false;
 
             input_overlay_opacity          = (ol->flags & INPUT_OVERLAY_IS_OSK)
                   ? settings->floats.input_osk_overlay_opacity
@@ -4327,6 +4618,19 @@ bool command_event(enum event_command cmd, void *data)
             const char *path_libretro_info = settings->paths.path_libretro_info;
             bool show_hidden_files         = settings->bools.show_hidden_files;
             bool core_info_cache_enable    = settings->bools.core_info_cache_enable;
+            /* data is an optional bool: when true, rescan even if the
+             * list is already current (used after cores or info files
+             * change on disk - core install/delete/restore, info file
+             * download). All other callers only need the list to
+             * exist, so a redundant rescan (a full pass over the info
+             * directory) is skipped. */
+            bool force                     = data ? *(bool*)data : false;
+
+            if (  !force
+                && core_info_list_is_current(
+                     path_libretro_info, dir_libretro,
+                     show_hidden_files, core_info_cache_enable))
+               break;
 
             command_event(CMD_EVENT_CORE_INFO_DEINIT, NULL);
 
@@ -4362,7 +4666,12 @@ bool command_event(enum event_command cmd, void *data)
                *video_st                         = video_state_get_ptr();
             rarch_system_info_t *sys_info        = &runloop_st->system;
             
-            /* Restore unpaused state */
+            /* Restore unpaused state. The recursive command_event call
+             * here re-enters this dispatcher; the UNPAUSE branch is
+             * deliberately small (clears flags, resumes audio) and
+             * does not touch core state, so the self-call is safe.
+             * Any future addition to the UNPAUSE handler that would
+             * touch core state must consider that we're mid-deinit. */
             runloop_st->paused_hotkey = false;
             command_event(CMD_EVENT_UNPAUSE, NULL);
 
@@ -4373,60 +4682,68 @@ bool command_event(enum event_command cmd, void *data)
             /* Save auto state */
             if (     runloop_st
                   && (runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING)
+                  && !(runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
                   && settings->bools.savestate_auto_save)
-            {
                command_event_save_auto_state();
-               content_wait_for_save_state_task();
-            }
 
-            /* Save last selected disk index, if required */
-            if (sys_info)
-               disk_control_save_image_index(&sys_info->disk_control);
+            /* Wait for any in-flight save / load state tasks before
+             * tearing down the core. Both task_save_handler and
+             * task_load_handler run on the threaded task worker and
+             * call into core function pointers (retro_serialize via
+             * content_get_serialized_data, retro_unserialize via
+             * core_unserialize). If a worker is mid-call when
+             * runloop_event_deinit_core runs uninit_libretro_symbols,
+             * the worker dispatches into a closed dylib.
+             *
+             * This covers the auto-state save conditionally kicked
+             * off just above as well: it runs unconditionally,
+             * against the same condition, with nothing in between
+             * that can push a task, so the auto-save path needs no
+             * wait of its own. It also covers what that one could
+             * not - a manually triggered save (menu / hotkey /
+             * netplay) already in flight when the user closed
+             * content with savestate_auto_save disabled. */
+            /* Say what the pause is for before blocking on it.
+             *
+             * This does not shorten the wait - the invariant above
+             * means it cannot be skipped - but an unexplained frozen
+             * frame and a frame that says "saving state" are very
+             * different experiences, and on slow storage this is
+             * seconds.  The message is pushed and one frame forced
+             * out first, because nothing draws once the wait starts.
+             *
+             * Only when there is actually something to wait for:
+             * content_save_state_in_progress() is the same condition
+             * the wait uses, so a close with no save in flight - the
+             * common case - is untouched and shows nothing. */
+            /* Closing content starts here.
+             *
+             * Set around the whole teardown, including the waits
+             * below: they are part of closing, and once the wait
+             * stops blocking they are the part that will still be
+             * running when the frame loop resumes. Nothing observes
+             * this yet - the main thread does not leave this block -
+             * which is the point of introducing it on its own. */
+            runloop_st->content_closing = true;
 
-            runloop_runtime_log_deinit(runloop_st,
-                  settings->bools.content_runtime_log,
-                  settings->bools.content_runtime_log_aggregate,
-                  settings->paths.directory_runtime_log,
-                  settings->paths.directory_playlist);
-
-            content_reset_savestate_backups();
-            hwr = VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
-#ifdef HAVE_CHEEVOS
-            rcheevos_unload();
-#endif
-            runloop_event_deinit_core();
-
-            /* Clear turbo and hold button state on core unload */
+            if (content_save_state_in_progress(NULL))
             {
-               input_driver_state_t *input_st = input_state_get_ptr();
-               if (input_st)
-               {
-                  memset(&input_st->turbo_btns, 0, sizeof(turbo_buttons_t));
-                  memset(&input_st->hold_btns, 0, sizeof(hold_buttons_t));
-               }
+               const char *_msg = msg_hash_to_str(MSG_SAVING_STATE);
+               runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true,
+                     NULL, MESSAGE_QUEUE_ICON_DEFAULT,
+                     MESSAGE_QUEUE_CATEGORY_INFO);
+               video_driver_cached_frame();
             }
 
-#ifdef HAVE_RUNAHEAD
-            /* If 'runahead_available' is false, then
-             * runahead is enabled by the user but an
-             * error occurred while the core was running
-             * (typically a save state issue). In this
-             * case we have to 'manually' reset the runahead
-             * runtime variables, otherwise runahead will
-             * remain disabled until the user restarts
-             * RetroArch */
-            if (runloop_st)
-            {
-               if (!(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_AVAILABLE))
-                  runahead_clear_variables(runloop_st);
+            content_wait_for_save_state_task();
+            content_wait_for_load_state_task();
 
-               /* Deallocate preemptive frames */
-               preempt_deinit(runloop_st);
-            }
-#endif
+            command_event_finish_content_deinit();
 
-            if (hwr)
-               memset(hwr, 0, sizeof(*hwr));
+            /* Closing content is finished.  One clear covers the
+             * whole block: it has a single exit, with no early
+             * return or goto between the set above and here. */
+            runloop_st->content_closing = false;
 
             break;
          }
@@ -5142,6 +5459,19 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_NETPLAY_ENABLE_HOST:
          {
+            /* Ask the lobby server for the tunnel address now.
+             *
+             * This is the point where the user has committed to
+             * hosting; host setup does not need the address until
+             * later, and on the content-reload path below not until
+             * content has finished loading.  Starting the round trip
+             * here lets it overlap that, so the wait for it in host
+             * setup usually finds the answer already present.
+             *
+             * Best effort - if this is skipped or fails, host setup
+             * asks exactly as it did before. */
+            netplay_mitm_query_prefetch();
+
             if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
             {
                netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_SERVER, NULL);
@@ -5230,7 +5560,7 @@ bool command_event(enum event_command cmd, void *data)
                return false;
 
             audio_st->flags |= AUDIO_FLAG_SUSPENDED;
-            video_st->flags |= VIDEO_FLAG_IS_SWITCHING_DISPLAY_MODE;
+            video_driver_modify_disp_flags(VIDEO_FLAG_IS_SWITCHING_DISPLAY_MODE, 0);
 
             /* we toggled manually, write the new value to settings */
             configuration_set_bool(settings, settings->bools.video_fullscreen,
@@ -5240,7 +5570,7 @@ bool command_event(enum event_command cmd, void *data)
 
             /* we toggled manually, the CLI arg is irrelevant now */
             if (ra_is_forced_fs)
-               video_st->flags &= ~VIDEO_FLAG_FORCE_FULLSCREEN;
+               video_driver_modify_disp_flags(0, VIDEO_FLAG_FORCE_FULLSCREEN);
 
             /* If we go fullscreen we drop all drivers and
              * reinitialize to be safe. */
@@ -5267,7 +5597,7 @@ bool command_event(enum event_command cmd, void *data)
             input_overlay_check_mouse_cursor();
 #endif
 
-            video_st->flags &= ~VIDEO_FLAG_IS_SWITCHING_DISPLAY_MODE;
+            video_driver_modify_disp_flags(0, VIDEO_FLAG_IS_SWITCHING_DISPLAY_MODE);
             audio_st->flags &= ~AUDIO_FLAG_SUSPENDED;
 
             if (userdata && *userdata == true)
@@ -5712,6 +6042,11 @@ bool command_event(enum event_command cmd, void *data)
                      settings->bools.vrr_runloop_enable ? MSG_VRR_RUNLOOP_ENABLED
                      : MSG_VRR_RUNLOOP_DISABLED);
             settings->bools.vrr_runloop_enable = !(settings->bools.vrr_runloop_enable);
+            /* Re-adjust audio/video system rates for the new VRR mode so the
+             * hotkey matches the menu toggle instead of leaving the audio
+             * input rate stale until the next reinit. */
+            driver_ctl(RARCH_DRIVER_CTL_SET_REFRESH_RATE,
+                  &settings->floats.video_refresh_rate);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, false, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
          }
@@ -5975,7 +6310,7 @@ static void global_free(struct rarch_state *p_rarch)
    retroarch_override_setting_free_state();
 }
 
-#if defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX)
+#if defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX) || defined(HAVE_SDL3)
 static void sdl_exit(void)
 {
    /* Quit any SDL subsystems, then quit
@@ -6039,7 +6374,7 @@ void main_exit(void *args)
          p_rarch->launch_arguments);
 
    p_rarch->flags                  &= ~RARCH_FLAGS_HAS_SET_USERNAME;
-   runloop_st->flags               &= ~RUNLOOP_FLAG_IS_INITED;
+   runloop_is_inited_clear();
    global_get_ptr()->flags         &= ~GLOB_FLG_ERR_ON_INIT;
 #ifdef HAVE_CONFIGFILE
    p_rarch->flags                  &= ~RARCH_FLAGS_BLOCK_CONFIG_READ;
@@ -6053,6 +6388,11 @@ void main_exit(void *args)
    retroarch_ctl(RARCH_CTL_STATE_FREE,  NULL);
    global_free(p_rarch);
    task_queue_deinit();
+#ifdef HAVE_NETWORKING
+   /* After task_queue_deinit(), so no transfer can still be holding a
+    * pooled connection. */
+   net_http_deinit();
+#endif
 
    ui_companion_driver_deinit();
    retroarch_config_deinit();
@@ -6077,7 +6417,7 @@ void main_exit(void *args)
    CoUninitialize();
 #endif
 
-#if defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX)
+#if defined(HAVE_SDL) || defined(HAVE_SDL2) || defined(HAVE_SDL_DINGUX) || defined(HAVE_SDL3)
    sdl_exit();
 #endif
 }
@@ -6121,12 +6461,18 @@ int rarch_main(int argc, char *argv[], void *data)
    settings_t *settings;
    struct rarch_state *p_rarch         = &rarch_st;
    runloop_state_t *runloop_st         = runloop_state_get_ptr();
-   video_driver_state_t *video_st      = video_state_get_ptr();
+   /* Register file access for the config parser before anything can
+    * load a config - including config-from-string paths that carry
+    * '#include' directives, which resolve through this interface.
+    * The constructors in config_file_io.c self-register too; this
+    * explicit call just removes any ordering dependency on which
+    * config API gets used first. */
+   config_file_set_io_default(config_file_io_filestream());
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
-   video_st->flags   |= VIDEO_FLAG_SHADER_PRESETS_NEED_RELOAD;
+   video_driver_modify_disp_flags(VIDEO_FLAG_SHADER_PRESETS_NEED_RELOAD, 0);
 #endif
 #ifdef HAVE_RUNAHEAD
-   video_st->flags   |= VIDEO_FLAG_RUNAHEAD_IS_ACTIVE;
+   video_driver_modify_disp_flags(VIDEO_FLAG_RUNAHEAD_IS_ACTIVE, 0);
    runloop_st->flags |= (
                          RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE
                       |  RUNLOOP_FLAG_RUNAHEAD_AVAILABLE
@@ -6171,6 +6517,8 @@ int rarch_main(int argc, char *argv[], void *data)
       }
    }
 
+   if (getenv("APPID") == NULL)
+      setenv("APPID", WEBOS_APP_ID, 0);
    /* compatibility with webOS 3 - 5 */
    if (getenv("EGL_PLATFORM") == NULL)
       setenv("EGL_PLATFORM", "wayland", 0);
@@ -6224,14 +6572,14 @@ int rarch_main(int argc, char *argv[], void *data)
       }
    }
 
-   if (runloop_st->flags & RUNLOOP_FLAG_IS_INITED)
+   if (runloop_is_inited())
       driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
 
 #ifdef HAVE_THREAD_STORAGE
    sthread_tls_create(&p_rarch->rarch_tls);
    sthread_tls_set(&p_rarch->rarch_tls, MAGIC_POINTER);
 #endif
-   video_st->flags              |= VIDEO_FLAG_ACTIVE;
+   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
    audio_state_get_ptr()->flags |= AUDIO_FLAG_ACTIVE;
 
    {
@@ -6241,6 +6589,10 @@ int rarch_main(int argc, char *argv[], void *data)
    }
 
    runloop_msg_queue_init();
+
+#ifdef HAVE_SMBCLIENT
+   retroarch_smb_init();
+#endif
 
    if (frontend_state_get_ptr()->current_frontend_ctx)
    {
@@ -6262,10 +6614,6 @@ int rarch_main(int argc, char *argv[], void *data)
    }
 
    settings = config_get_ptr();
-
-#ifdef HAVE_SMBCLIENT
-   retroarch_smb_init();
-#endif
 
    ui_companion_driver_init_first(
 #ifdef HAVE_QT
@@ -6319,7 +6667,7 @@ int rarch_main(int argc, char *argv[], void *data)
    return 0;
 }
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 
 bool platform_emscripten_finish_deferred_sleep(void);
 
@@ -6561,11 +6909,17 @@ static void retroarch_print_features(void)
 #ifdef HAVE_RWEBP
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_RWEBP,           "RWEBP",           "WebP (RWEBP) image loading");
 #endif
+#ifdef HAVE_RDDS
+   _len += _PSUPP_BUF(buf, _len, SUPPORTS_RDDS,            "RDDS",            "DDS (RDDS) image loading");
+#endif
 #ifdef HAVE_SDL
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_SDL,             "SDL1",            "SDL1 input/audio/video drivers");
 #endif
 #ifdef HAVE_SDL2
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_SDL2,            "SDL2",            "SDL2 input/audio/video drivers");
+#endif
+#ifdef HAVE_SDL3
+   _len += _PSUPP_BUF(buf, _len, SUPPORTS_SDL3,            "SDL3",            "SDL3 input/audio/video drivers");
 #endif
 #ifdef HAVE_X11
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_X11,             "X11",             "X11 input/video drivers");
@@ -6662,13 +7016,16 @@ static void retroarch_print_features(void)
 #ifdef HAVE_XAUDIO
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_XAUDIO,          "XAudio2",         "Audio driver");
 #endif
+#ifdef HAVE_CHD
+   _len += _PSUPP_BUF(buf, _len, SUPPORTS_CHD,             "CHD",             "CHD support");
+#endif
 #ifdef HAVE_7ZIP
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_7ZIP,            "7zip",            "7zip support");
 #endif
 #ifdef HAVE_ZLIB
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZLIB,            "zlib",            "zlib support");
 #endif
-#ifdef HAVE_ZSTD
+#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZSTD,            "zstd",            "Zstandard support");
 #endif
 #ifdef HAVE_FFMPEG
@@ -6686,9 +7043,7 @@ static void retroarch_print_features(void)
 #ifdef HAVE_FREETYPE
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_FREETYPE,        "FreeType",        "TTF font rendering driver");
 #endif
-#ifdef HAVE_STB_FONT
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_STBFONT,         "STB TrueType",    "TTF font rendering driver");
-#endif
 #ifdef HAVE_V4L2
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_V4L2,            "Video4Linux2",    "Camera driver");
 #endif
@@ -7107,6 +7462,11 @@ static void retroarch_parse_input_libretro_path(
          runloop_set_current_core_type(CORE_TYPE_MPV, true);
          return;
       }
+      else if (!memcmp(path, "webm", STRLEN_CONST("webm")))
+      {
+         runloop_set_current_core_type(CORE_TYPE_WEBM, true);
+         return;
+      }
       else if (!memcmp(path, "imageviewer", STRLEN_CONST("imageviewer")))
       {
          runloop_set_current_core_type(CORE_TYPE_IMAGEVIEWER, true);
@@ -7185,7 +7545,6 @@ static bool retroarch_parse_input_and_config(
    bool               cli_core_set = false;
    bool            cli_content_set = false;
    recording_state_t *rec_st       = recording_state_get_ptr();
-   video_driver_state_t *video_st  = video_state_get_ptr();
    runloop_state_t     *runloop_st = runloop_state_get_ptr();
    settings_t          *settings   = config_get_ptr();
 #ifdef HAVE_ACCESSIBILITY
@@ -7561,7 +7920,7 @@ static bool retroarch_parse_input_and_config(
                break;
 
             case 'f':
-               video_st->flags |= VIDEO_FLAG_FORCE_FULLSCREEN;
+               video_driver_modify_disp_flags(VIDEO_FLAG_FORCE_FULLSCREEN, 0);
                break;
 
             case 'N':
@@ -7590,21 +7949,24 @@ static bool retroarch_parse_input_and_config(
 
             case RA_OPT_SET_SHADER:
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
-               /* disable auto-shaders */
+               /* Disable auto-shaders */
                if (!optarg || !*optarg)
                {
-                  video_st->flags |= VIDEO_FLAG_CLI_SHADER_DISABLE;
+                  video_driver_modify_disp_flags(VIDEO_FLAG_CLI_SHADER_DISABLE, 0);
                   break;
                }
 
-               /* rebase on shader directory */
-               if (path_is_absolute(optarg))
-                  strlcpy(video_st->cli_shader_path, optarg,
-                        sizeof(video_st->cli_shader_path));
-               else
-                  fill_pathname_join_special(video_st->cli_shader_path,
-                        settings->paths.directory_video_shader,
-                        optarg, sizeof(video_st->cli_shader_path));
+               {
+                  video_driver_state_t *video_st  = video_state_get_ptr();
+                  /* Rebase on shader directory */
+                  if (path_is_absolute(optarg))
+                     strlcpy(video_st->cli_shader_path, optarg,
+                           sizeof(video_st->cli_shader_path));
+                  else
+                     fill_pathname_join_special(video_st->cli_shader_path,
+                           settings->paths.directory_video_shader,
+                           optarg, sizeof(video_st->cli_shader_path));
+               }
 #endif
                break;
 
@@ -8028,6 +8390,16 @@ static void retroarch_validate_cpu_features(void)
  *
  * @return true on success, otherwise false if there was an error.
  **/
+/* Runtime savestate probe for core_info. A running core that reports a
+ * nonzero serializable size can save/load state even if its info file
+ * declares otherwise; core_info.c consults this via a registered seam so
+ * it need not depend on the runloop/retroarch backend directly. */
+static bool retroarch_core_info_savestate_probe(void)
+{
+   return (runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING)
+         && core_serialize_size() > 0;
+}
+
 bool retroarch_main_init(int argc, char *argv[])
 {
 #if defined(DEBUG) && defined(HAVE_DRMINGW)
@@ -8039,7 +8411,6 @@ bool retroarch_main_init(int argc, char *argv[])
    runloop_state_t *runloop_st   = runloop_state_get_ptr();
    input_driver_state_t
       *input_st                  = input_state_get_ptr();
-   video_driver_state_t*video_st = video_state_get_ptr();
    settings_t *settings          = config_get_ptr();
    recording_state_t *rec_st     = recording_state_get_ptr();
    global_t            *global   = global_get_ptr();
@@ -8052,8 +8423,10 @@ bool retroarch_main_init(int argc, char *argv[])
    struct menu_state *menu_st    = menu_state_get_ptr();
 #endif
 
+   core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
+
    input_st->osk_idx             = OSK_LOWERCASE_LATIN;
-   video_st->flags              |= VIDEO_FLAG_ACTIVE;
+   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
    audio_state_get_ptr()->flags |= AUDIO_FLAG_ACTIVE;
 
    if (setjmp(global->error_sjlj_context) > 0)
@@ -8063,6 +8436,12 @@ bool retroarch_main_init(int argc, char *argv[])
             global_get_ptr()->error_string);
       goto error;
    }
+
+   /* Mark error_sjlj_context as live. retroarch_fail checks this
+    * before longjmp'ing; reinit-time driver_init failures that
+    * reach retroarch_fail outside this function will log and
+    * return rather than landing in a stale jmp_buf. */
+   global->flags |= GLOB_FLG_INIT_IN_PROGRESS;
 
    global->flags |= GLOB_FLG_ERR_ON_INIT;
 
@@ -8104,27 +8483,8 @@ bool retroarch_main_init(int argc, char *argv[])
          char str_output[384];
          const char *cpu_model  = frontend_driver_get_cpu_model_name();
          size_t _len = strlcpy(str_output,
-               "=== Build =======================================\n",
+               "=== Build =================================================\n",
                sizeof(str_output));
-
-#ifdef WEBOS
-         {
-            char osbuf[128];
-            int major = 0, minor = 0;
-            frontend_state_t *frontend_st = frontend_state_get_ptr();
-            if (frontend_st)
-            {
-               frontend_ctx_driver_t *frontend = frontend_st->current_frontend_ctx;
-               if (frontend && frontend->get_os)
-               {
-                  frontend->get_os(osbuf, sizeof(osbuf), &major, &minor);
-                  _len += snprintf(str_output + _len, sizeof(str_output) - _len,
-                        FILE_PATH_LOG_INFO " Running on: %s\n",
-                        osbuf);
-               }
-            }
-         }
-#endif
 
          if (cpu_model && *cpu_model)
          {
@@ -8145,28 +8505,96 @@ bool retroarch_main_init(int argc, char *argv[])
       {
          char str_output[256];
          char str[128];
+         int len;
          retroarch_get_capabilities(RARCH_CAPABILITIES_CPU, str, sizeof(str));
 
+         len = snprintf(str_output, sizeof(str_output),
+            "%s: %s\n"
+            FILE_PATH_LOG_INFO " Version: " PACKAGE_VERSION "\n",
+            msg_hash_to_str(MSG_CAPABILITIES),
+            str);
 #ifdef HAVE_GIT_VERSION
-         snprintf(str_output, sizeof(str_output),
-               "%s: %s" "\n"
-               FILE_PATH_LOG_INFO " Version: " PACKAGE_VERSION "\n"
-               FILE_PATH_LOG_INFO " Git: %s" "\n"
-               FILE_PATH_LOG_INFO " Built: " __DATE__ "\n"
-               FILE_PATH_LOG_INFO " =================================================\n",
-               msg_hash_to_str(MSG_CAPABILITIES),
-               str,
-               retroarch_git_version
-               );
-#else
-         snprintf(str_output, sizeof(str_output),
-               "%s: %s" "\n"
-               FILE_PATH_LOG_INFO " Version: " PACKAGE_VERSION "\n"
-               FILE_PATH_LOG_INFO " Built: " __DATE__ "\n"
-               FILE_PATH_LOG_INFO " =================================================\n",
-               msg_hash_to_str(MSG_CAPABILITIES),
-               str);
+         len += snprintf(str_output + len, sizeof(str_output) - len,
+            FILE_PATH_LOG_INFO " Git: %s\n",
+            retroarch_git_version);
 #endif
+         snprintf(str_output + len, sizeof(str_output) - len,
+               FILE_PATH_LOG_INFO " Built: " __DATE__ "\n");
+         RARCH_LOG_OUTPUT("%s", str_output);
+      }
+
+#if defined(ANDROID)
+      {
+         char str_output[128];
+         char manufacturer_model[PROP_VALUE_MAX * 2];
+         int32_t major = 0;
+         int32_t minor = 0;
+         int32_t rel   = 0;
+
+         const char *abi =
+#if defined(__aarch64__)
+            "arm64-v8a";
+#elif defined(__arm__)
+            "armeabi-v7a";
+#elif defined(__x86_64__)
+            "x86_64";
+#elif defined(__i386__)
+            "x86";
+#else
+            "unknown";
+#endif
+
+         const char *build_type =
+            !g_android ? "Unknown" :
+            g_android->is_play_store_build ? "Play Store" :
+            "Sideload";
+
+         frontend_android_get_version(&major, &minor, &rel);
+         frontend_android_get_manufacturer_model(
+            manufacturer_model, sizeof(manufacturer_model));
+
+         snprintf(str_output, sizeof(str_output),
+            FILE_PATH_LOG_INFO " Running on: Android v%d.%d.%d (%s, %s)\n"
+            FILE_PATH_LOG_INFO " Device: %s\n",
+            major,
+            minor,
+            rel,
+            build_type,
+            abi,
+            manufacturer_model);
+         RARCH_LOG_OUTPUT("%s", str_output);
+      }
+#elif defined(WEBOS)
+      {
+         char str_output[256];
+         char osbuf[128];
+         int major = 0, minor = 0;
+         frontend_state_t *frontend_st = frontend_state_get_ptr();
+
+         if (frontend_st)
+         {
+            frontend_ctx_driver_t *frontend = frontend_st->current_frontend_ctx;
+            if (frontend && frontend->get_os)
+            {
+               frontend->get_os(osbuf, sizeof(osbuf), &major, &minor);
+
+#ifdef __aarch64__
+               const char *arch = " (64-bit)";
+#else
+               const char *arch = " (32-bit)";
+#endif
+               snprintf(str_output, sizeof(str_output),
+                  "Running on: %s%s\n",
+                  osbuf, arch);
+               RARCH_LOG_OUTPUT("%s", str_output);
+            }
+         }
+      }
+#endif
+      {
+         char str_output[64];
+         snprintf(str_output, sizeof(str_output),
+            "===========================================================\n");
          RARCH_LOG_OUTPUT("%s", str_output);
       }
    }
@@ -8207,6 +8635,12 @@ bool retroarch_main_init(int argc, char *argv[])
 #elif defined(HAVE_FFMPEG)
                   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_LIBRETRO, NULL);
                   runloop_set_current_core_type(CORE_TYPE_FFMPEG, false);
+#elif defined(HAVE_WEBMPLAYER)
+                  if (cont_type == RARCH_CONTENT_MOVIE)
+                  {
+                     retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_LIBRETRO, NULL);
+                     runloop_set_current_core_type(CORE_TYPE_WEBM, false);
+                  }
 #endif
                }
                break;
@@ -8257,9 +8691,35 @@ bool retroarch_main_init(int argc, char *argv[])
          "location driver", verbosity_enabled);
 #ifdef HAVE_MENU
    {
-      if (!(menu_st->driver_ctx = menu_driver_find_driver(settings,
-                  "menu driver", verbosity_enabled)))
+      const menu_ctx_driver_t *menu_ctx_new = menu_driver_find_driver(
+            settings, "menu driver", verbosity_enabled);
+      if (!menu_ctx_new)
          retroarch_fail(1, "menu_driver_find_driver()");
+
+      /* If a menu driver instance is already allocated and the
+       * selected menu driver has changed since that instance was
+       * created - e.g. a configuration file specifying a different
+       * 'menu_driver' has just been loaded at runtime - the stale
+       * instance must be torn down here, while menu_st->driver_ctx
+       * still references the *old* driver (so that the correct
+       * free()/context_destroy() handlers are invoked on the old
+       * handle).
+       *
+       * Otherwise menu_driver_init() would skip (re)initialisation
+       * - because driver_data is non-NULL - and invoke the new
+       * driver's context_reset() on the old driver's handle,
+       * dereferencing it as the wrong type (crash). */
+      if (     menu_st->driver_data
+            &&  menu_st->driver_ctx
+            && (menu_st->driver_ctx != menu_ctx_new))
+      {
+         uint16_t menu_data_own = (menu_st->flags & MENU_ST_FLAG_DATA_OWN);
+         menu_st->flags        &= ~MENU_ST_FLAG_DATA_OWN;
+         menu_driver_ctl(RARCH_MENU_CTL_DEINIT, NULL);
+         menu_st->flags        |= menu_data_own;
+      }
+
+      menu_st->driver_ctx = menu_ctx_new;
    }
 #endif
    /* Enforce stored brightness if needed */
@@ -8371,7 +8831,7 @@ bool retroarch_main_init(int argc, char *argv[])
    command_event(CMD_EVENT_SET_PER_GAME_RESOLUTION, NULL);
 
    global->flags                   &= ~GLOB_FLG_ERR_ON_INIT;
-   runloop_st->flags               |=  RUNLOOP_FLAG_IS_INITED;
+   runloop_is_inited_set();
 
 #ifdef HAVE_DISCORD
    {
@@ -8408,14 +8868,54 @@ bool retroarch_main_init(int argc, char *argv[])
    game_ai_init();
 #endif
 
+   global->flags &= ~GLOB_FLG_INIT_IN_PROGRESS;
    return true;
 
 error:
    command_event(CMD_EVENT_CORE_DEINIT, NULL);
-   runloop_state_get_ptr()->flags            &= ~RUNLOOP_FLAG_IS_INITED;
+   runloop_is_inited_clear();
+   global->flags &= ~GLOB_FLG_INIT_IN_PROGRESS;
 
    return false;
 }
+
+#ifdef DEBUG
+/* Reports a task handler that occupied the main thread for longer
+ * than its budget.  Rate-limited per handler: a task that stalls
+ * once usually stalls every invocation, and a warning per frame
+ * would bury the first (most useful) report. */
+static void runloop_task_slow_handler(retro_task_t *task,
+      retro_time_t usec)
+{
+   /* Held as the handler's own type: a function pointer is not
+    * convertible to void* in ISO C, and comparing the two is not
+    * valid either. */
+   static retro_task_handler_t last_handler;
+   static unsigned suppressed;
+
+   if (!task)
+      return;
+
+   if (task->handler == last_handler)
+   {
+      suppressed++;
+      return;
+   }
+
+   if (suppressed)
+      RARCH_WARN("[Task] (%u further over-budget invocations suppressed)\n",
+            suppressed);
+
+   last_handler = task->handler;
+   suppressed   = 0;
+
+   RARCH_WARN("[Task] Handler occupied the main thread for %d ms"
+         " (budget %d ms)%s%s.\n",
+         (int)(usec / 1000), 16,
+         task->title ? " - " : "",
+         task->title ? task->title : "");
+}
+#endif
 
 void retroarch_init_task_queue(void)
 {
@@ -8427,7 +8927,37 @@ void retroarch_init_task_queue(void)
 #endif
 
    task_queue_deinit();
+#ifdef HAVE_NETWORKING
+   /* Before task_queue_init(), which is what spawns the task thread.
+    * net_http's DNS cache and connection pool locks used to be
+    * created lazily on first use, so the first two concurrent
+    * transfers of the process could each create one and then lock
+    * different objects. */
+   net_http_init();
+#endif
    task_queue_init(threaded_enable, runloop_task_msg_queue_push);
+
+#ifdef DEBUG
+   /* With Threaded Tasks off, task handlers run on the thread that
+    * also drives the frame loop, so a handler that does not return
+    * promptly is a visible stall - and the queue is the only place
+    * that can attribute one to a specific task rather than to
+    * "something in the frame".  Debug builds only: this exists to
+    * catch a regression during development, not to police release
+    * builds, and with no callback registered the queue reads no
+    * clock at all.
+    *
+    * The budget is a whole frame at 60Hz.  Handlers designed to be
+    * sliced (the budgeted directory walks, playlist parse and scan)
+    * aim far below it and consult the shared per-frame I/O window;
+    * anything crossing a full frame in one call is either
+    * unsliced work or a slice that has stopped honouring its
+    * budget. */
+   if (!threaded_enable)
+      task_queue_set_slow_handler_cb(runloop_task_slow_handler, 16000);
+   else
+      task_queue_set_slow_handler_cb(NULL, 0);
+#endif
 }
 
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)
@@ -8460,6 +8990,22 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
       case RARCH_CTL_IS_DUMMY_CORE:
          return runloop_st->current_core_type == CORE_TYPE_DUMMY;
       case RARCH_CTL_IS_CORE_LOADED:
+#ifdef HAVE_STATIC_DUMMY
+         /* A static dummy build links no libretro core, yet
+          * RARCH_PATH_CORE may still name one: on static
+          * platforms it is populated from the salamander
+          * config at startup, and the argv[0] overwrite in
+          * the frontend's process_args is skipped when the
+          * process is launched without arguments (e.g. via
+          * title override on Switch). Comparing names against
+          * that phantom path yields false positives, causing
+          * content to be loaded in-process into the dummy
+          * core instead of forking the real core, and history
+          * entries/runtime logs to be recorded against the
+          * wrong core. No core can ever be loaded in this
+          * process, so always report false. */
+         return false;
+#else
          {
             const char *core_path = (const char*)data;
             const char *core_file = path_basename_nocompression(core_path);
@@ -8476,6 +9022,7 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
             }
          }
          return false;
+#endif
 #if defined(HAVE_RUNAHEAD) && (defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB))
       case RARCH_CTL_IS_SECOND_CORE_AVAILABLE:
          return
@@ -8489,9 +9036,34 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
       case RARCH_CTL_MAIN_DEINIT:
          {
             input_driver_state_t *input_st = input_state_get_ptr();
-            if (!(runloop_st->flags & RUNLOOP_FLAG_IS_INITED))
+            if (!runloop_is_inited())
                return false;
             command_event(CMD_EVENT_NETPLAY_DEINIT, NULL);
+#ifdef HAVE_NETWORKING
+            /* Free netplay lobby state at shutdown. room_list and
+             * rooms_data are populated when browsing the netplay lobby
+             * and recycled on each refresh, but nothing frees them at
+             * exit, so the last-populated allocation leaks. This is the
+             * one-time teardown point: deinit_netplay() above runs on
+             * every session start/stop and must not free the lobby list
+             * (the menu may still be reading room_list to join a room). */
+            {
+               net_driver_state_t *net_st = networking_state_get_ptr();
+               netplay_rooms_free();
+               if (net_st->room_list)
+               {
+                  free(net_st->room_list);
+                  net_st->room_list  = NULL;
+               }
+               net_st->room_count = 0;
+#ifdef HAVE_NETPLAYDISCOVERY
+               /* Same story for the LAN discovery list, which is grown
+                * by the scan task and only ever truncated between
+                * scans. */
+               netplay_discovery_free_hosts();
+#endif
+            }
+#endif
 #ifdef HAVE_COMMAND
             input_driver_deinit_command(input_st);
 #endif
@@ -8528,7 +9100,7 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
             runloop_path_deinit_subsystem();
             path_deinit_savefile();
 
-            runloop_st->flags &= ~RUNLOOP_FLAG_IS_INITED;
+            runloop_is_inited_clear();
 
 #ifdef HAVE_THREAD_STORAGE
             sthread_tls_delete(&p_rarch->rarch_tls);
@@ -8823,12 +9395,29 @@ size_t retroarch_get_capabilities(enum rarch_capabilities type,
 void retroarch_fail(int err_code, const char *err)
 {
    global_t *global                = global_get_ptr();
-   /* We cannot longjmp unless we're in retroarch_main_init().
-    * If not, something went very wrong, and we should
-    * just exit right away. */
    strlcpy(global->error_string, err,
          sizeof(global->error_string));
-   longjmp(global->error_sjlj_context, err_code);
+
+   /* Only longjmp if retroarch_main_init's setjmp is still live.
+    * Outside that scope (e.g. when drivers_init runs from
+    * command_event_reinit for a fullscreen toggle, video driver
+    * swap, or any other CMD_EVENT_REINIT path) the
+    * error_sjlj_context jmp_buf points into stack memory that
+    * was unwound long ago. Jumping there is undefined behavior;
+    * on most platforms it crashes or silently corrupts state.
+    *
+    * Driver init failures during reinit are not recoverable in
+    * this function (we don't have a clean rollback path for the
+    * partial reinit), but they're survivable - the prior driver
+    * state is gone but we can leave the user in the menu rather
+    * than crashing. The caller (drivers_init) will see the
+    * subsystem fail to init and that subsystem's downstream code
+    * is expected to NULL-check its driver pointers. */
+   if (global->flags & GLOB_FLG_INIT_IN_PROGRESS)
+      longjmp(global->error_sjlj_context, err_code);
+
+   RARCH_ERR("[Core] retroarch_fail outside retroarch_main_init: %s\n",
+         err);
 }
 
 /* Called on close content, checks if we need to also exit retroarch */
@@ -8862,6 +9451,11 @@ bool retroarch_main_quit(void)
    /* Restore video driver before saving */
    video_driver_restore_cached(settings);
 
+   /* Restore original refresh rate, if it has been changed
+    * automatically in SET_SYSTEM_AV_INFO */
+   if (video_st->video_refresh_rate_original)
+      video_display_server_restore_refresh_rate();
+
 #if !defined(HAVE_DYNAMIC)
    {
       /* Salamander sets RUNLOOP_FLAG_SHUTDOWN_INITIATED prior, so we need to handle it separately */
@@ -8892,11 +9486,6 @@ bool retroarch_main_quit(void)
       discord_st->inited         = false;
    }
 #endif
-
-   /* Restore original refresh rate, if it has been changed
-    * automatically in SET_SYSTEM_AV_INFO */
-   if (video_st->video_refresh_rate_original)
-      video_display_server_restore_refresh_rate();
 
    if (!(runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED))
    {

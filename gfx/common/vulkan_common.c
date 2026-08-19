@@ -36,6 +36,13 @@
 #include "vksym.h"
 #include <libretro_vulkan.h>
 
+#ifdef HAVE_SDL3
+/* Must come after the Vulkan headers so SDL_vulkan.h picks up the
+ * real Vk* types instead of forward-declaring its own. */
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#endif
+
 #include "../../verbosity.h"
 #include "../../configuration.h"
 
@@ -64,11 +71,29 @@
 #define VULKAN_EMULATE_MAILBOX
 #endif
 
-/* TODO/FIXME - static globals */
+/* TODO/FIXME - static globals
+ * WARNING: These globals prevent safe use of multiple concurrent
+ * Vulkan contexts (multi-window, etc.). The cached_device_vk
+ * mechanism assumes single-context ownership. */
 static dylib_t                       vulkan_library;
 static VkInstance                    cached_instance_vk;
 static VkDevice                      cached_device_vk;
 static retro_vulkan_destroy_device_t cached_destroy_device_vk;
+
+#ifdef __APPLE__
+/* On Apple platforms the Vulkan implementation is provided by MoltenVK
+ * (loaded dynamically, either directly or through the Vulkan loader).
+ * The version string is captured once, when the physical device is
+ * selected, and cached here so that the System Information menu can
+ * report it without needing a live Vulkan context. Empty until a
+ * context has been brought up at least once. */
+static char                          moltenvk_version_str[64];
+
+const char *vulkan_get_moltenvk_version(void)
+{
+   return moltenvk_version_str;
+}
+#endif
 
 #if 0
 #define WSI_HARDENING_TEST
@@ -103,14 +128,48 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vulkan_debug_cb(
       const VkDebugUtilsMessengerCallbackDataEXT *pCallbackData,
       void *pUserData)
 {
-   if (     (msg_severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-         && (msg_type     == VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
+   const char *severity = "";
+   const char *type     = "";
+
+   switch (msg_severity)
    {
-      RARCH_ERR("[Vulkan] Validation Error: %s.\n", pCallbackData->pMessage);
+      case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
+         severity = "ERROR";
+         break;
+      case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT:
+         severity = "WARNING";
+         break;
+      case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT:
+         severity = "INFO";
+         break;
+      default:
+         severity = "VERBOSE";
+         break;
    }
+
+   switch (msg_type)
+   {
+      case VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT:
+         type = "Validation";
+         break;
+      case VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT:
+         type = "Performance";
+         break;
+      default:
+         type = "General";
+         break;
+   }
+
+   RARCH_LOG("[Vulkan] %s %s: %s.\n", severity, type, pCallbackData->pMessage);
    return VK_FALSE;
 }
 #endif
+
+/* Timeout for the emulated mailbox background thread's
+ * vkAcquireNextImageKHR call. Using a finite timeout instead
+ * of UINT64_MAX guarantees the thread can check the DEAD flag
+ * and exit promptly during swapchain teardown, preventing TDRs. */
+#define VULKAN_MAILBOX_ACQUIRE_TIMEOUT_NS  500000000  /* 500 ms */
 
 static void vulkan_emulated_mailbox_deinit(
       struct vulkan_emulated_mailbox *mailbox)
@@ -121,6 +180,10 @@ static void vulkan_emulated_mailbox_deinit(
       mailbox->flags |= VK_MAILBOX_FLAG_DEAD;
       scond_signal(mailbox->cond);
       slock_unlock(mailbox->lock);
+      /* Wait for the background thread to see the DEAD flag.
+       * The thread uses a finite timeout on vkAcquireNextImageKHR
+       * so it will unblock within VULKAN_MAILBOX_ACQUIRE_TIMEOUT_NS
+       * and exit the loop. */
       sthread_join(mailbox->thread);
    }
 
@@ -177,7 +240,19 @@ static VkResult vulkan_emulated_mailbox_acquire_next_image_blocking(
    mailbox->flags |= VK_MAILBOX_FLAG_HAS_PENDING_REQUEST;
 
    while (!(mailbox->flags & VK_MAILBOX_FLAG_ACQUIRED))
-      scond_wait(mailbox->cond, mailbox->lock);
+   {
+      /* scond_wait_timeout prevents indefinite blocking
+       * if the background thread hits an error path that
+       * doesn't set ACQUIRED. */
+      if (!scond_wait_timeout(mailbox->cond, mailbox->lock,
+                VULKAN_MAILBOX_ACQUIRE_TIMEOUT_NS / 1000000))
+      {
+         /* Timed out - the background thread may be stuck.
+          * Return VK_TIMEOUT to let the caller handle it. */
+         slock_unlock(mailbox->lock);
+         return VK_TIMEOUT;
+      }
+   }
 
    if ((res = mailbox->result) == VK_SUCCESS)
       *index                    = mailbox->index;
@@ -220,8 +295,13 @@ static void vulkan_emulated_mailbox_loop(void *userdata)
       mailbox->flags &= ~VK_MAILBOX_FLAG_REQUEST_ACQUIRE;
       slock_unlock(mailbox->lock);
 
+      /* Use a finite timeout so the thread can regularly check
+       * for the DEAD flag and exit promptly during teardown.
+       * UINT64_MAX would block forever, causing sthread_join
+       * in vulkan_emulated_mailbox_deinit to deadlock. */
       mailbox->result          = vkAcquireNextImageKHR(
-            mailbox->device, mailbox->swapchain, UINT64_MAX,
+            mailbox->device, mailbox->swapchain,
+            VULKAN_MAILBOX_ACQUIRE_TIMEOUT_NS,
             VK_NULL_HANDLE, fence, &mailbox->index);
 
       /* VK_SUBOPTIMAL_KHR can be returned on Android 10
@@ -235,7 +315,16 @@ static void vulkan_emulated_mailbox_loop(void *userdata)
 
       if (mailbox->result == VK_SUCCESS)
       {
-         vkWaitForFences(mailbox->device, 1, &fence, true, UINT64_MAX);
+         VkResult wait_res;
+         wait_res  = vkWaitForFences(mailbox->device, 1,
+               &fence, true, VULKAN_MAILBOX_ACQUIRE_TIMEOUT_NS);
+         if (wait_res == VK_TIMEOUT)
+         {
+            /* Fence not signaled in time - unlikely but handle
+             * gracefully. Loop back to retry. */
+            mailbox->result = VK_TIMEOUT;
+            continue;
+         }
          vkResetFences(mailbox->device, 1, &fence);
 
          slock_lock(mailbox->lock);
@@ -243,8 +332,31 @@ static void vulkan_emulated_mailbox_loop(void *userdata)
          scond_signal(mailbox->cond);
          slock_unlock(mailbox->lock);
       }
+      else if (   mailbox->result == VK_TIMEOUT
+               || mailbox->result == VK_NOT_READY)
+      {
+         /* No image available this round.
+          * Check DEAD flag without clearing request,
+          * then loop back to try again. */
+         slock_lock(mailbox->lock);
+         if (mailbox->flags & VK_MAILBOX_FLAG_DEAD)
+         {
+            slock_unlock(mailbox->lock);
+            break;
+         }
+         slock_unlock(mailbox->lock);
+      }
       else
+      {
+         /* VK_ERROR_OUT_OF_DATE_KHR, VK_ERROR_DEVICE_LOST, etc.
+          * Propagate to the main thread via ACQUIRED + result.
+          * The caller (non-blocking acquire) will return this error. */
          vkResetFences(mailbox->device, 1, &fence);
+         slock_lock(mailbox->lock);
+         mailbox->flags |= VK_MAILBOX_FLAG_ACQUIRED;
+         scond_signal(mailbox->cond);
+         slock_unlock(mailbox->lock);
+      }
    }
 
    vkDestroyFence(mailbox->device, fence, NULL);
@@ -294,7 +406,15 @@ static void vulkan_debug_mark_object(VkDevice device,
    {
       char merged_name[1024];
       VkDebugUtilsObjectNameInfoEXT info;
+      /* strlcpy() returns the length of the SOURCE, not the number of
+       * bytes copied, so a name longer than the buffer would put
+       * merged_name + _len past the end and underflow the remaining
+       * size to near SIZE_MAX.  Every caller in tree passes a short
+       * literal, so this is not reachable today -- but the next one
+       * need not. */
       size_t _len                        = strlcpy(merged_name, name, sizeof(merged_name));
+      if (_len >= sizeof(merged_name))
+         _len                            = sizeof(merged_name) - 1;
       snprintf(merged_name + _len, sizeof(merged_name) - _len, " (%u)", count);
 
       info.sType                         = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
@@ -539,6 +659,32 @@ static bool vulkan_context_init_gpu(gfx_ctx_vulkan_data_t *vk)
    }
 
    free(gpus);
+
+#ifdef __APPLE__
+   /* Capture the MoltenVK version from the selected physical device.
+    * MoltenVK encodes its version into VkPhysicalDeviceProperties's
+    * driverVersion field as a decimal (major * 10000 + minor * 100 +
+    * patch) and derives the string it logs to the console the exact same
+    * way, so decode it identically here. This uses only core Vulkan 1.0
+    * data that is always populated; the legacy vkGetVersionStringsMVK
+    * entry point is no longer vended through the Vulkan loader, and the
+    * VK_KHR_driver_properties driverInfo string is not reliably filled
+    * for a standalone query. */
+   if (!moltenvk_version_str[0] && vk->context.gpu)
+   {
+      VkPhysicalDeviceProperties props;
+      unsigned dv, major, minor, patch;
+      vkGetPhysicalDeviceProperties(vk->context.gpu, &props);
+      dv    = (unsigned)props.driverVersion;
+      major = dv / 10000;
+      minor = (dv % 10000) / 100;
+      patch = dv % 100;
+      snprintf(moltenvk_version_str, sizeof(moltenvk_version_str),
+            "%u.%u.%u", major, minor, patch);
+      RARCH_LOG("[Vulkan] MoltenVK version: %s.\n", moltenvk_version_str);
+   }
+#endif
+
    return true;
 }
 
@@ -550,6 +696,13 @@ static const char *vulkan_optional_device_extensions[] = {
    "VK_KHR_sampler_mirror_clamp_to_edge",
    "VK_EXT_full_screen_exclusive",
    "VK_KHR_portability_subset"
+#ifdef VULKAN_HDR_SWAPCHAIN
+   /* Lets the app signal SMPTE-2086 mastering-display metadata to the
+    * compositor via vkSetHdrMetadataEXT. Optional: if absent (common on
+    * older NVIDIA Linux and pre-25.1 Mesa) the metadata call is skipped and
+    * HDR still works via the colour space alone. */
+   , "VK_EXT_hdr_metadata"
+#endif
 };
 
 static VkDevice vulkan_context_create_device_wrapper(
@@ -598,6 +751,9 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    VkDeviceQueueCreateInfo queue_info;
    static const float one                  = 1.0f;
    bool found_queue                        = false;
+#ifdef VULKAN_HDR_SWAPCHAIN
+   bool hdr_metadata_enabled               = false;
+#endif
    video_driver_state_t *video_st          = video_state_get_ptr();
 
    VkPhysicalDeviceFeatures features       = { false };
@@ -644,6 +800,8 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
 
    if (!vulkan_context_init_gpu(vk))
       return false;
+
+   vkGetPhysicalDeviceFeatures(vk->context.gpu, &features);
 
    if (!cached_device_vk && iface && iface->create_device)
    {
@@ -707,12 +865,6 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       {
          RARCH_WARN("[Vulkan] Failed to create device with negotiation interface. Falling back to default path.\n");
       }
-   }
-
-   if (cached_device_vk && cached_destroy_device_vk)
-   {
-      vk->context.destroy_device = cached_destroy_device_vk;
-      cached_destroy_device_vk   = NULL;
    }
 
    vkGetPhysicalDeviceProperties(vk->context.gpu,
@@ -825,6 +977,20 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          }
       }
 
+#ifdef VULKAN_HDR_SWAPCHAIN
+      /* Note whether the extension was enabled; the actual entrypoint is
+       * loaded below, after the device exists. */
+      vk->set_hdr_metadata = NULL;
+      for (unsigned i = 0; i < enabled_device_extension_count; i++)
+      {
+         if (!strcmp(enabled_device_extensions[i], "VK_EXT_hdr_metadata"))
+         {
+            hdr_metadata_enabled = true;
+            break;
+         }
+      }
+#endif
+
       queue_info.queueFamilyIndex         = vk->context.graphics_queue_index;
       queue_info.queueCount               = 1;
       queue_info.pQueuePriorities         = &one;
@@ -840,7 +1006,13 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          vk->context.device = cached_device_vk;
          cached_device_vk   = NULL;
 
-         video_st->flags   |= VIDEO_FLAG_CACHE_CONTEXT_ACK;
+         if (cached_destroy_device_vk)
+         {
+            vk->context.destroy_device = cached_destroy_device_vk;
+            cached_destroy_device_vk   = NULL;
+         }
+
+         video_driver_cache_context_ack_set();
          RARCH_LOG("[Vulkan] Using cached Vulkan context.\n");
       }
       else if (vkCreateDevice(vk->context.gpu, &device_info,
@@ -856,6 +1028,14 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       RARCH_ERR("[Vulkan] Failed to load device symbols.\n");
       return false;
    }
+
+#ifdef VULKAN_HDR_SWAPCHAIN
+   /* Now that the device exists, resolve vkSetHdrMetadataEXT if the
+    * extension was enabled above. Stays NULL (call skipped) otherwise. */
+   if (hdr_metadata_enabled)
+      vk->set_hdr_metadata = (PFN_vkSetHdrMetadataEXT)
+         vkGetDeviceProcAddr(vk->context.device, "vkSetHdrMetadataEXT");
+#endif
 
    if (vk->context.queue == VK_NULL_HANDLE)
    {
@@ -894,17 +1074,17 @@ static const char *vulkan_optional_instance_extensions[] = {
 static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkInstanceCreateInfo *create_info)
 {
    VkResult res;
-   uint32_t i, layer_count;
-   VkLayerProperties properties[128];
+   uint32_t i;
    gfx_ctx_vulkan_data_t *vk        = (gfx_ctx_vulkan_data_t *)opaque;
    VkInstanceCreateInfo info        = *create_info;
    VkInstance instance              = VK_NULL_HANDLE;
-   const char **instance_extensions = (const char**)malloc((info.enabledExtensionCount + 3
-                                                          + ARRAY_SIZE(vulkan_optional_device_extensions)) * sizeof(const char *));
-   const char **instance_layers     = (const char**)malloc((info.enabledLayerCount     + 1)                * sizeof(const char *));
-
-   const char *required_extensions[3];
+   /* Room for VK_KHR_surface, WSI, SDL3, and the debug extension. */
+   const char *required_extensions[16];
    uint32_t required_extension_count = 0;
+   const char **instance_extensions = (const char**)malloc((info.enabledExtensionCount
+                                                          + ARRAY_SIZE(required_extensions)
+                                                          + ARRAY_SIZE(vulkan_optional_instance_extensions)) * sizeof(const char *));
+   const char **instance_layers     = (const char**)malloc((info.enabledLayerCount     + 1)                * sizeof(const char *));
 
    /* Both mallocs must have succeeded before the memcpy / field
     * assignments below dereference the buffers.  The 'end' label
@@ -918,8 +1098,13 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
       goto end;
    }
 
-   memcpy((void*)instance_extensions, info.ppEnabledExtensionNames, info.enabledExtensionCount * sizeof(const char *));
-   memcpy((void*)instance_layers,     info.ppEnabledLayerNames,     info.enabledLayerCount     * sizeof(const char *));
+   /* A caller enabling no extensions or no layers legitimately
+    * passes NULL with a zero count; memcpy's second argument is
+    * declared non-NULL even for n == 0, so guard each copy. */
+   if (info.enabledExtensionCount)
+      memcpy((void*)instance_extensions, info.ppEnabledExtensionNames, info.enabledExtensionCount * sizeof(const char *));
+   if (info.enabledLayerCount)
+      memcpy((void*)instance_layers,     info.ppEnabledLayerNames,     info.enabledLayerCount     * sizeof(const char *));
    info.ppEnabledExtensionNames     = instance_extensions;
    info.ppEnabledLayerNames         = instance_layers;
 
@@ -952,6 +1137,24 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
       case VULKAN_WSI_MVK_IOS:
          required_extensions[required_extension_count++] = "VK_EXT_metal_surface";
          break;
+#ifdef HAVE_SDL3
+      case VULKAN_WSI_SDL3:
+      {
+         Uint32 sdl_ext_count = 0;
+         const char * const *sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&sdl_ext_count);
+         for (i = 0; sdl_extensions && i < sdl_ext_count; i++)
+         {
+            /* VK_KHR_surface already added above. */
+            if (string_is_equal(sdl_extensions[i], "VK_KHR_surface"))
+               continue;
+            if (required_extension_count < ARRAY_SIZE(required_extensions))
+               required_extensions[required_extension_count++] = sdl_extensions[i];
+            else
+               RARCH_WARN("[Vulkan] Dropping SDL3 instance extension \"%s\": list full.\n", sdl_extensions[i]);
+         }
+         break;
+      }
+#endif
       case VULKAN_WSI_NONE:
       default:
          break;
@@ -959,11 +1162,11 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
 
 #ifdef VULKAN_DEBUG
    instance_layers[info.enabledLayerCount++]         = "VK_LAYER_KHRONOS_validation";
-   required_extensions[required_extension_count++] = "VK_EXT_debug_utils";
+   if (required_extension_count < ARRAY_SIZE(required_extensions))
+      required_extensions[required_extension_count++] = "VK_EXT_debug_utils";
+   else
+      RARCH_WARN("[Vulkan] Dropping VK_EXT_debug_utils: extension list full.\n");
 #endif
-
-   layer_count = ARRAY_SIZE(properties);
-   vkEnumerateInstanceLayerProperties(&layer_count, properties);
 
    if (!(vulkan_find_instance_extensions(
             instance_extensions, &info.enabledExtensionCount,
@@ -1311,6 +1514,23 @@ static void vulkan_destroy_swapchain(gfx_ctx_vulkan_data_t *vk)
    vk->context.num_recycled_acquire_semaphores = 0;
 }
 
+bool vulkan_surface_destroy(gfx_ctx_vulkan_data_t *vk)
+{
+   if (!vk || !vk->context.instance)
+      return false;
+
+   vulkan_destroy_swapchain(vk);
+
+   if (vk->vk_surface != VK_NULL_HANDLE)
+   {
+      vkDestroySurfaceKHR(vk->context.instance,
+            vk->vk_surface, NULL);
+      vk->vk_surface = VK_NULL_HANDLE;
+   }
+
+   return true;
+}
+
 static void vulkan_acquire_clear_fences(gfx_ctx_vulkan_data_t *vk)
 {
    unsigned i;
@@ -1599,21 +1819,65 @@ bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
          }
 #endif
          break;
+      case VULKAN_WSI_SDL3:
+#ifdef HAVE_SDL3
+         /* The SDL3 context driver passes its SDL_Window through the
+          * 'surface' parameter; SDL picks the platform surface path. */
+         if (!SDL_Vulkan_CreateSurface((SDL_Window*)surface, vk->context.instance, NULL, &vk->vk_surface))
+         {
+            RARCH_ERR("[Vulkan] Failed to create SDL3 surface: %s.\n",
+                  SDL_GetError());
+            return false;
+         }
+#endif
+         break;
       case VULKAN_WSI_NONE:
       default:
          return false;
    }
 
-   /* Must create device after surface since we need to be able to query queues to use for presentation. */
-   if (!vulkan_context_init_device(vk))
-      return false;
+   /* Must create device after surface since we need to be able to query queues
+    * to use for presentation. When replacing a lost surface, retain the
+    * existing device and verify that its queue can present to the new one. */
+   if (vk->context.device == VK_NULL_HANDLE)
+   {
+      if (!vulkan_context_init_device(vk))
+         goto error_surface;
+   }
+   else
+   {
+      VkResult res;
+      VkBool32 supported = VK_FALSE;
+
+      res = vkGetPhysicalDeviceSurfaceSupportKHR(
+            vk->context.gpu,
+            vk->context.graphics_queue_index,
+            vk->vk_surface, &supported);
+      if (res != VK_SUCCESS || !supported)
+      {
+         RARCH_ERR("[Vulkan] Existing queue cannot present to replacement surface (err = %d).\n",
+               (int)res);
+         goto error_surface;
+      }
+   }
 
    if (!vulkan_create_swapchain(
             vk, width, height, swap_interval))
-      return false;
+      goto error_swapchain;
 
    vulkan_acquire_next_image(vk);
    return true;
+
+error_swapchain:
+   vulkan_destroy_swapchain(vk);
+error_surface:
+   if (vk->vk_surface != VK_NULL_HANDLE)
+   {
+      vkDestroySurfaceKHR(vk->context.instance,
+            vk->vk_surface, NULL);
+      vk->vk_surface = VK_NULL_HANDLE;
+   }
+   return false;
 }
 
 uint32_t vulkan_find_memory_type(
@@ -1732,16 +1996,20 @@ retry:
 
       if (vk->context.swapchain_acquire_semaphore)
       {
-#ifdef HAVE_THREADS
-         slock_lock(vk->context.queue_lock);
-#endif
+         VkSemaphore old_sem                = vk->context.swapchain_acquire_semaphore;
+         vk->context.swapchain_acquire_semaphore = semaphore;
+         /* Swap out the old semaphore first, then destroy it
+          * outside queue_lock.  The old semaphore may still be
+          * in use by a pending queue submission, so we need
+          * vkDeviceWaitIdle before destruction -- but we must
+          * NOT hold queue_lock during the wait, otherwise
+          * vkQueuePresentKHR (which also takes queue_lock)
+          * stalls and can trigger a TDR (0x887A0006). */
          vkDeviceWaitIdle(vk->context.device);
-         vkDestroySemaphore(vk->context.device, vk->context.swapchain_acquire_semaphore, NULL);
-#ifdef HAVE_THREADS
-         slock_unlock(vk->context.queue_lock);
-#endif
+         vkDestroySemaphore(vk->context.device, old_sem, NULL);
       }
-      vk->context.swapchain_acquire_semaphore = semaphore;
+      else
+         vk->context.swapchain_acquire_semaphore = semaphore;
    }
    else
    {
@@ -1872,6 +2140,9 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
          && (vk->flags & VK_DATA_FLAG_EMULATE_MAILBOX)
          && vsync)
    {
+      RARCH_LOG("[Vulkan] swap_interval 0 (vsync off) overridden to %d because "
+            "VK_DATA_FLAG_EMULATE_MAILBOX requires non-zero swap_interval.\n",
+            adaptive_vsync ? -1 : 1);
       swap_interval  =  (adaptive_vsync) ? -1 : 1;
       vk->flags     |=  VK_DATA_FLAG_EMULATING_MAILBOX;
    }
@@ -1895,8 +2166,13 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       if (     (vk->flags & VK_DATA_FLAG_EMULATING_MAILBOX)
             && (vk->mailbox.swapchain == VK_NULL_HANDLE))
       {
-         vulkan_emulated_mailbox_init(
-               &vk->mailbox, vk->context.device, vk->swapchain);
+         if (!vulkan_emulated_mailbox_init(
+               &vk->mailbox, vk->context.device, vk->swapchain))
+         {
+            RARCH_WARN("[Vulkan] Failed to initialize emulated mailbox -- "
+                  "falling back to blocking acquire.\n");
+            vk->flags &= ~VK_DATA_FLAG_EMULATING_MAILBOX;
+         }
          vk->flags                &= ~VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN;
          return true;
       }
@@ -2229,15 +2505,44 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       if (!(vk->context.flags & VK_CTX_FLAG_HDR_ENABLE))
 #endif /* VULKAN_HDR_SWAPCHAIN */
       {
-         for (i = 0; i < format_count; i++)
+         /* A 10-bit SDR swapchain is the useful state for shader chains
+          * that darken heavily (CRT beam profiles, aperture grilles): it
+          * removes the final-pass quantisation without dragging in the
+          * whole HDR pipeline.  Opt-in, since it is not free on every
+          * compositor, and fall back to 8-bit when unavailable. */
+         if (settings->uints.video_swapchain_bit_depth == 2)
          {
-            if (
-                     formats[i].format == VK_FORMAT_R8G8B8A8_UNORM
-                  || formats[i].format == VK_FORMAT_B8G8R8A8_UNORM
-                  || formats[i].format == VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+            for (i = 0; i < format_count; i++)
             {
-               format = formats[i];
-               break;
+               if (     (   formats[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                         || formats[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)
+                     && (formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR))
+               {
+                  format = formats[i];
+                  break;
+               }
+            }
+
+            if (format.format == VK_FORMAT_UNDEFINED)
+               RARCH_WARN("[Vulkan] 10-bit SDR swapchain requested but not"
+                     " available, falling back to 8-bit.\n");
+            else
+               RARCH_LOG("[Vulkan] Using 10-bit SDR swapchain format %u.\n",
+                     format.format);
+         }
+
+         if (format.format == VK_FORMAT_UNDEFINED)
+         {
+            for (i = 0; i < format_count; i++)
+            {
+               if (
+                        formats[i].format == VK_FORMAT_R8G8B8A8_UNORM
+                     || formats[i].format == VK_FORMAT_B8G8R8A8_UNORM
+                     || formats[i].format == VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+               {
+                  format = formats[i];
+                  break;
+               }
             }
          }
       }
@@ -2305,6 +2610,12 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
          && (desired_swapchain_images > surface_properties.maxImageCount))
       desired_swapchain_images = surface_properties.maxImageCount;
 
+   /* Clamp up to minImageCount to satisfy the spec requirement.
+    * Some drivers (MESA) are lenient, but Vulkan requires
+    * minImageCount >= max(minImageCount, 1). */
+   if (desired_swapchain_images < surface_properties.minImageCount)
+      desired_swapchain_images = surface_properties.minImageCount;
+
    /* Cap our request to what we can actually hold. Per-image arrays
     * (swapchain_images, swapchain_fences, the various semaphore
     * arrays, vk->swapchain[], readback.staging[]) are all sized to
@@ -2355,7 +2666,7 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
 
    /* TODO/FIXME:
     * Weird shenanigans necessary for Apple otherwise the following happens:
-    * The menu sometimes refuses to display, but still responds to input. 
+    * The menu sometimes refuses to display, but still responds to input.
     * This happens about 1/5 times on macOS but 100% in the quick menu on iOS
     */
 #ifdef __APPLE__
@@ -2477,13 +2788,67 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
    /* Force driver to reset swapchain image handles. */
    vk->context.flags                 |=  VK_CTX_FLAG_INVALID_SWAPCHAIN;
    vk->context.flags                 &= ~VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN;
+   /* A replacement swapchain can have fewer images than its predecessor.
+    * Do not retain an image index from the old swapchain while waiting for
+    * the first acquire from the new one. */
+   vk->context.current_swapchain_index = 0;
    vulkan_create_wait_fences(vk);
 
    if (vk->flags & VK_DATA_FLAG_EMULATING_MAILBOX)
-      vulkan_emulated_mailbox_init(&vk->mailbox, vk->context.device, vk->swapchain);
+   {
+      if (!vulkan_emulated_mailbox_init(&vk->mailbox, vk->context.device, vk->swapchain))
+      {
+         RARCH_WARN("[Vulkan] Failed to initialize emulated mailbox -- "
+               "falling back to blocking acquire.\n");
+         vk->flags &= ~VK_DATA_FLAG_EMULATING_MAILBOX;
+      }
+   }
 
    /* This flag needs to be cleared otherwise elsewhere it can be perceived as if there's a new swapchain created everytime its being called */
    vk->flags &= ~VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN;
+
+#ifdef VULKAN_HDR_SWAPCHAIN
+   /* Signal SMPTE-2086 mastering-display metadata to the compositor for an
+    * HDR10 swapchain. Best-effort: only when VK_EXT_hdr_metadata was enabled
+    * (set_hdr_metadata non-NULL) and the swapchain is an HDR10 surface.
+    * Uses Rec.2020 primaries (matching the D3D path) and RetroArch's
+    * configured output-luminance range. Touches no formats or pipelines, so
+    * a wrong or ignored value at worst affects display tone mapping. */
+   /* MoltenVK before 1.3.0 over-releases the autoreleased CAEDRMetadata
+    * and NSData objects it creates inside MVKSwapchain::setHDRMetadataEXT()
+    * (upstream commits 3b77dea and 8caa1d5, first shipped in 1.3.0); the
+    * pending autoreleases then crash the main-thread pool drain shortly
+    * after the call.  MoltenVK encodes driverVersion as
+    * major * 10000 + minor * 100 + patch, so 1.3.0 is 10300.  Skipping
+    * the call on affected versions only omits the SMPTE-2086 mastering
+    * hint; the layer colour space and EDR flag are still derived from
+    * the swapchain colour space by MoltenVK itself. */
+   if (     vk->set_hdr_metadata
+         && (vk->context.flags & VK_CTX_FLAG_HDR_ENABLE)
+         && vulkan_is_hdr10_format(vk->context.swapchain_format)
+         && !(   vk->wsi_type == VULKAN_WSI_MVK_MACOS
+              && vk->context.gpu_properties.driverVersion < 10300))
+   {
+      VkHdrMetadataEXT meta;
+      meta.sType                     = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+      meta.pNext                     = NULL;
+      /* Rec.2020 display primaries and D65 white point. */
+      meta.displayPrimaryRed.x       = 0.708f;
+      meta.displayPrimaryRed.y       = 0.292f;
+      meta.displayPrimaryGreen.x     = 0.170f;
+      meta.displayPrimaryGreen.y     = 0.797f;
+      meta.displayPrimaryBlue.x      = 0.131f;
+      meta.displayPrimaryBlue.y      = 0.046f;
+      meta.whitePoint.x              = 0.3127f;
+      meta.whitePoint.y              = 0.3290f;
+      meta.maxLuminance              = 1000.0f;
+      meta.minLuminance              = 0.001f;
+      meta.maxContentLightLevel      = 1000.0f;
+      meta.maxFrameAverageLightLevel = 1000.0f;
+      vk->set_hdr_metadata(vk->context.device, 1, &vk->swapchain, &meta);
+   }
+#endif
+
    return true;
 }
 
@@ -2729,15 +3094,19 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
    {
       if (vk->context.device)
       {
+         /* Call the frontend's destroy_device callback BEFORE
+          * vkDestroyDevice, so the frontend can clean up its
+          * per-device resources while the device handle is still
+          * valid. */
+         if (vk->context.destroy_device)
+            vk->context.destroy_device();
+         vk->context.destroy_device = NULL;
          vkDestroyDevice(vk->context.device, NULL);
          vk->context.device = NULL;
       }
 
       if (vk->context.instance)
       {
-         if (vk->context.destroy_device)
-            vk->context.destroy_device();
-
          vkDestroyInstance(vk->context.instance, NULL);
          vk->context.instance = NULL;
 
@@ -2755,6 +3124,23 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       string_list_free(vk->gpu_list);
       vk->gpu_list = NULL;
    }
+
+#ifdef HAVE_THREADS
+   /* vulkan_context_init_device() creates a fresh queue_lock on
+    * every bring-up -- including the cached-context path, which
+    * restores the device and then falls through to slock_new() like
+    * any other init -- so the lock's lifetime ends here regardless
+    * of whether the device itself is being cached.  Everything that
+    * takes it (vulkan_present, the frame submission paths) is done
+    * by this point: vkDeviceWaitIdle() ran at the top of this
+    * function.  Freeing it here stops one slock leaking per driver
+    * reinit -- every resolution change and fullscreen toggle. */
+   if (vk->context.queue_lock)
+   {
+      slock_free(vk->context.queue_lock);
+      vk->context.queue_lock = NULL;
+   }
+#endif
 }
 
 void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index)

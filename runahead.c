@@ -31,6 +31,7 @@
 #include <encodings/utf.h>
 #include <string/stdstring.h>
 #include <streams/file_stream.h>
+#include <queues/task_queue.h>
 #include <time/rtime.h>
 
 #include "configuration.h"
@@ -146,6 +147,10 @@ void runahead_set_load_content_info(void *data,
 
 /* RUNAHEAD - SECONDARY CORE  */
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
+/* enum runahead_copy_status lives in runloop.h (shared with the
+ * secondary_core_ensure_exists() callers) */
+static void runahead_copy_reset(bool delete_file);
+
 static void strcat_alloc(char **dst, const char *s)
 {
    char *tmp;
@@ -186,6 +191,13 @@ static void strcat_alloc(char **dst, const char *s)
 void runahead_secondary_core_destroy(void *data)
 {
    runloop_state_t *runloop_st      = (runloop_state_t*)data;
+
+   /* Drop any unconsumed async copy result (deleting its temp
+    * file) and tell an in-flight copy task to discard its result;
+    * this runs regardless of whether a secondary instance was
+    * ever actually created. */
+   runahead_copy_reset(true);
+
    if (!runloop_st->secondary_lib_handle)
       return;
 
@@ -201,10 +213,17 @@ void runahead_secondary_core_destroy(void *data)
 
    dylib_close(runloop_st->secondary_lib_handle);
    runloop_st->secondary_lib_handle = NULL;
-   filestream_delete(runloop_st->secondary_library_path);
+   /* Delete the on-disk copy of the secondary core and free the
+    * path string. The NULL check guards both: filestream_delete
+    * is currently NULL-safe but the explicit guard here also
+    * documents the intent and protects against future changes
+    * to the VFS layer's NULL handling. */
    if (runloop_st->secondary_library_path)
+   {
+      filestream_delete(runloop_st->secondary_library_path);
       free(runloop_st->secondary_library_path);
-   runloop_st->secondary_library_path = NULL;
+      runloop_st->secondary_library_path = NULL;
+   }
 }
 
 static char *get_tmpdir_alloc(const char *override_dir)
@@ -257,8 +276,108 @@ static char *get_tmpdir_alloc(const char *override_dir)
    return path;
 }
 
-static bool write_file_with_random_name(char **temp_dll_path,
-      const char *tmp_path, const void* data, ssize_t dataSize)
+/* ===== BEGIN runahead core-copy fragment =====
+ * Everything between the BEGIN/END markers depends only on
+ * libretro-common (filestream, task_queue, path) plus libc and the
+ * static helpers above, so a test harness can extract and execute
+ * it verbatim.
+ *
+ * Duplicating the core binary for the secondary instance is pure
+ * file IO sized by the core (MAME and friends run hundreds of
+ * megabytes), so it must not run synchronously on the thread that
+ * drives frames. The copy runs as a task; while it is in flight,
+ * secondary_core_create() reports 'pending' and run-ahead falls
+ * back to the single-instance savestate method for those frames -
+ * identical output, no stall - then upgrades to the secondary
+ * instance when the copy completes. All slot state below is
+ * touched only from the main thread (the task callback runs on the
+ * main thread); the worker touches only its own task state. */
+
+#define RUNAHEAD_COPY_CHUNK_SIZE (1 * 1024 * 1024)
+
+/* Result slot, published by the task callback (main thread) */
+static char *runahead_copy_slot_path     = NULL;
+static char *runahead_copy_slot_src      = NULL; /* identity of the copy */
+static bool  runahead_copy_slot_done     = false;
+static bool  runahead_copy_slot_failed   = false;
+/* Bumped by runahead_copy_reset(); a task publishes its result only
+ * if its recorded generation still matches, otherwise it discards
+ * it (deleting the temp file). This covers every teardown window,
+ * including the race where the worker has already finished but the
+ * main-thread callback has not yet run - a plain 'in flight?' check
+ * misses that window. All reads/writes happen on the main thread
+ * (the handler never touches it). */
+static unsigned runahead_copy_generation = 0;
+/* True from a successful task push until that task's main-thread
+ * callback has run. This must NOT be derived from
+ * task_queue_find(): the threaded queue has a window where the
+ * worker has finished (task no longer in the running list) but the
+ * callback has not yet executed - a find-based check reports 'not
+ * in flight' there, and a concurrent poll would push a second copy
+ * task racing the first onto the same destination path. The flag
+ * transitions strictly on the main thread (push / callback), so no
+ * such window exists. */
+static bool runahead_copy_task_pending   = false;
+
+typedef struct runahead_copy_handle
+{
+   char *src_path;
+   char *dir_libretro;
+   char *out_path;   /* produced temp file on success */
+   bool  failed;
+   unsigned generation;
+} runahead_copy_handle_t;
+
+static bool runahead_copy_file_chunked(const char *src_path,
+      const char *dst_path)
+{
+   RFILE *src   = NULL;
+   RFILE *dst   = NULL;
+   char *buf    = NULL;
+   bool  okay   = false;
+
+   if (!(buf = (char*)malloc(RUNAHEAD_COPY_CHUNK_SIZE)))
+      return false;
+
+   if (!(src = filestream_open(src_path,
+         RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      goto end;
+
+   if (!(dst = filestream_open(dst_path,
+         RETRO_VFS_FILE_ACCESS_WRITE,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      goto end;
+
+   for (;;)
+   {
+      int64_t n = filestream_read(src, buf, RUNAHEAD_COPY_CHUNK_SIZE);
+      if (n < 0)
+         goto end;
+      if (n == 0)
+         break;
+      if (filestream_write(dst, buf, n) != n)
+         goto end;
+   }
+
+   okay = true;
+
+end:
+   if (src)
+      filestream_close(src);
+   if (dst)
+   {
+      filestream_close(dst);
+      /* Don't leave a truncated copy behind on failure */
+      if (!okay)
+         filestream_delete(dst_path);
+   }
+   free(buf);
+   return okay;
+}
+
+static bool copy_file_with_random_name(char **temp_dll_path,
+      const char *tmp_path, const char *src_dll_path)
 {
    int i;
    char number_buf[32];
@@ -308,7 +427,7 @@ static bool write_file_with_random_name(char **temp_dll_path,
       strcat_alloc(temp_dll_path, number_buf);
       strcat_alloc(temp_dll_path, ext);
 
-      if (filestream_write_file(*temp_dll_path, data, dataSize))
+      if (runahead_copy_file_chunked(src_dll_path, *temp_dll_path))
       {
          okay = true;
          break;
@@ -321,72 +440,213 @@ static bool write_file_with_random_name(char **temp_dll_path,
    return okay;
 }
 
-
-static char *copy_core_to_temp_file(
-      const char *core_path,
-      const char *dir_libretro)
+/* Worker: builds the temp path and performs the chunked copy into
+ * the task's own state. No shared state is touched here. */
+static void runahead_copy_task_handler(retro_task_t *task)
 {
-   char tmp_path[PATH_MAX_LENGTH];
-   bool  failed                = false;
-   char  *tmpdir               = NULL;
-   char  *tmp_dll_path         = NULL;
-   void  *dll_file_data        = NULL;
-   int64_t  dll_file_size      = 0;
-   const char  *core_base_name = path_basename_nocompression(core_path);
-
-   if (!core_base_name || !*core_base_name)
-      return NULL;
-
-   if (!(tmpdir = get_tmpdir_alloc(dir_libretro)))
-      return NULL;
-
-   fill_pathname_join_special(tmp_path,
-         tmpdir, "retroarch_temp",
-         sizeof(tmp_path));
-
-   if (!path_mkdir(tmp_path))
+   if (task)
    {
-      failed = true;
-      goto end;
+      runahead_copy_handle_t *h = (runahead_copy_handle_t*)task->state;
+      if (h)
+      {
+         char tmp_path[PATH_MAX_LENGTH];
+         char *tmpdir              = NULL;
+         char *dst                 = NULL;
+         const char *core_base     = path_basename_nocompression(h->src_path);
+
+         h->failed = true;
+
+         if (     core_base && *core_base
+               && (tmpdir = get_tmpdir_alloc(h->dir_libretro)))
+         {
+            fill_pathname_join_special(tmp_path,
+                  tmpdir, "retroarch_temp", sizeof(tmp_path));
+
+            if (path_mkdir(tmp_path))
+            {
+               strcat_alloc(&dst, tmp_path);
+               strcat_alloc(&dst, PATH_DEFAULT_SLASH());
+               strcat_alloc(&dst, core_base);
+
+               if (runahead_copy_file_chunked(h->src_path, dst))
+               {
+                  h->out_path = dst;
+                  h->failed   = false;
+                  dst         = NULL;
+               }
+               else if (copy_file_with_random_name(&dst,
+                        tmp_path, h->src_path))
+               {
+                  h->out_path = dst;
+                  h->failed   = false;
+                  dst         = NULL;
+               }
+            }
+         }
+
+         if (dst)
+            free(dst);
+         if (tmpdir)
+            free(tmpdir);
+      }
+      task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
    }
-
-   if (!filestream_read_file(core_path, &dll_file_data, &dll_file_size))
-   {
-      failed = true;
-      goto end;
-   }
-
-   strcat_alloc(&tmp_dll_path, tmp_path);
-   strcat_alloc(&tmp_dll_path, PATH_DEFAULT_SLASH());
-   strcat_alloc(&tmp_dll_path, core_base_name);
-
-   if (!filestream_write_file(tmp_dll_path, dll_file_data, dll_file_size))
-   {
-      /* try other file names */
-      if (!write_file_with_random_name(&tmp_dll_path,
-               tmp_path, dll_file_data, dll_file_size))
-         failed = true;
-   }
-
-end:
-   if (tmpdir)
-      free(tmpdir);
-   if (dll_file_data)
-      free(dll_file_data);
-
-   tmpdir              = NULL;
-   dll_file_data       = NULL;
-
-   if (!failed)
-      return tmp_dll_path;
-
-   if (tmp_dll_path)
-      free(tmp_dll_path);
-
-   tmp_dll_path     = NULL;
-
-   return NULL;
 }
+
+/* Main thread: publish the result to the slot - unless teardown
+ * abandoned the copy in the meantime, in which case discard it. */
+static void runahead_copy_task_cb(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   runahead_copy_handle_t *h = NULL;
+
+   if (!task)
+      return;
+   if (!(h = (runahead_copy_handle_t*)task->state))
+      return;
+
+   /* The pipeline is free again in every case below - including
+    * the discard path: that task is done. */
+   runahead_copy_task_pending = false;
+
+   if (h->generation != runahead_copy_generation)
+   {
+      /* Teardown happened while this copy was running (or after it
+       * finished but before this callback ran): discard. */
+      if (h->out_path)
+         filestream_delete(h->out_path);
+      return;
+   }
+
+   runahead_copy_slot_path   = h->out_path;
+   h->out_path               = NULL;
+   runahead_copy_slot_src    = h->src_path;
+   h->src_path               = NULL;
+   runahead_copy_slot_failed = h->failed;
+   runahead_copy_slot_done   = true;
+}
+
+static void runahead_copy_task_free(retro_task_t *task)
+{
+   runahead_copy_handle_t *h = NULL;
+   if (!task)
+      return;
+   if ((h = (runahead_copy_handle_t*)task->state))
+   {
+      if (h->src_path)
+         free(h->src_path);
+      if (h->dir_libretro)
+         free(h->dir_libretro);
+      if (h->out_path)
+         free(h->out_path);
+      free(h);
+   }
+   task->state = NULL;
+}
+
+static bool runahead_copy_in_flight(void)
+{
+   return runahead_copy_task_pending;
+}
+
+/* Main thread. Resets the result slot; if a copy is in flight, the
+ * callback is told to discard its result. delete_file also removes
+ * an already-published (but unconsumed) temp file. */
+static void runahead_copy_reset(bool delete_file)
+{
+   if (runahead_copy_slot_path)
+   {
+      if (delete_file)
+         filestream_delete(runahead_copy_slot_path);
+      free(runahead_copy_slot_path);
+      runahead_copy_slot_path = NULL;
+   }
+   if (runahead_copy_slot_src)
+   {
+      free(runahead_copy_slot_src);
+      runahead_copy_slot_src = NULL;
+   }
+   runahead_copy_slot_done   = false;
+   runahead_copy_slot_failed = false;
+   /* Invalidate any copy that is in flight or awaiting its
+    * callback; see runahead_copy_generation. Note that
+    * runahead_copy_task_pending is deliberately NOT cleared here:
+    * a superseded task still occupies the pipeline until its
+    * callback runs, which keeps poll from starting an overlapping
+    * copy to the same destination path. */
+   runahead_copy_generation++;
+}
+
+/* Main thread. Polls / advances the async copy:
+ * - no result and no task -> push the task, report PENDING
+ * - task in flight        -> PENDING
+ * - finished with failure -> UNAVAILABLE (slot reset, so a later
+ *                            attempt starts a fresh copy)
+ * - finished ok           -> READY; ownership of the temp path is
+ *                            transferred to *out_path */
+static enum runahead_copy_status runahead_copy_poll(
+      const char *core_path, const char *dir_libretro,
+      char **out_path)
+{
+   /* A published result for a different core binary is stale
+    * (e.g. core switched without an intervening teardown, or any
+    * path we have not anticipated): drop it and start over. */
+   if (     runahead_copy_slot_done
+         && !string_is_equal(runahead_copy_slot_src ? runahead_copy_slot_src : "",
+               core_path ? core_path : ""))
+      runahead_copy_reset(true);
+
+   if (!runahead_copy_slot_done)
+   {
+      if (!runahead_copy_in_flight())
+      {
+         retro_task_t *task        = NULL;
+         runahead_copy_handle_t *h = NULL;
+
+         task = task_init();
+         h    = (runahead_copy_handle_t*)calloc(1, sizeof(*h));
+
+         if (!task || !h)
+         {
+            if (task)
+               free(task);
+            if (h)
+               free(h);
+            return RUNAHEAD_COPY_UNAVAILABLE;
+         }
+
+         h->src_path     = strdup(core_path);
+         h->dir_libretro = dir_libretro ? strdup(dir_libretro) : NULL;
+         h->generation   = runahead_copy_generation;
+
+         task->handler   = runahead_copy_task_handler;
+         task->state     = h;
+         task->title     = NULL;
+         task->callback  = runahead_copy_task_cb;
+         task->cleanup   = runahead_copy_task_free;
+         task->flags    |= RETRO_TASK_FLG_MUTE;
+
+         runahead_copy_task_pending = true;
+         task_queue_push(task);
+      }
+      return RUNAHEAD_COPY_PENDING;
+   }
+
+   if (runahead_copy_slot_failed)
+   {
+      runahead_copy_reset(false);
+      return RUNAHEAD_COPY_UNAVAILABLE;
+   }
+
+   *out_path               = runahead_copy_slot_path;
+   runahead_copy_slot_path = NULL;
+   runahead_copy_reset(false);
+   return RUNAHEAD_COPY_READY;
+   /* note: the generation bump in the reset above also invalidates
+    * any concurrent task, which cannot exist here (poll is the only
+    * pusher and the slot was occupied) - harmless */
+}
+/* ===== END runahead core-copy fragment ===== */
 
 static bool runloop_environment_secondary_core_hook(
       unsigned cmd, void *data)
@@ -417,9 +677,12 @@ void runahead_clear_controller_port_map(void *data)
       runloop_st->port_map[i] = -1;
 }
 
-static bool secondary_core_create(runloop_state_t *runloop_st,
+static enum runahead_copy_status secondary_core_create(
+      runloop_state_t *runloop_st,
       const char *path_directory_libretro, unsigned num_active_users)
 {
+   enum runahead_copy_status copy_status;
+   char *copied_path             = NULL;
    const enum rarch_core_type
       last_core_type             = runloop_st->last_core_type;
    rarch_system_info_t *sys_info = &runloop_st->system;
@@ -428,16 +691,20 @@ static bool secondary_core_create(runloop_state_t *runloop_st,
    if (     (last_core_type != CORE_TYPE_PLAIN)
          || (!runloop_st->load_content_info)
          || ( runloop_st->load_content_info->special))
-      return false;
+      return RUNAHEAD_COPY_UNAVAILABLE;
+
+   /* The core binary is duplicated by a task; until the copy
+    * completes this reports PENDING and the caller runs the
+    * single-instance fallback for the frame - no stall. */
+   copy_status = runahead_copy_poll(
+         path_get(RARCH_PATH_CORE), path_directory_libretro,
+         &copied_path);
+   if (copy_status != RUNAHEAD_COPY_READY)
+      return copy_status;
 
    if (runloop_st->secondary_library_path)
       free(runloop_st->secondary_library_path);
-   runloop_st->secondary_library_path = NULL;
-   runloop_st->secondary_library_path = copy_core_to_temp_file(
-		   path_get(RARCH_PATH_CORE), path_directory_libretro);
-
-   if (!runloop_st->secondary_library_path)
-      return false;
+   runloop_st->secondary_library_path = copied_path;
 
    /* Load Core */
    if (!runloop_init_libretro_symbols(runloop_st,
@@ -522,15 +789,16 @@ static bool secondary_core_create(runloop_state_t *runloop_st,
    runahead_clear_controller_port_map(runloop_st);
 #endif
 
-   return true;
+   return RUNAHEAD_COPY_READY;
 
 error:
    runahead_secondary_core_destroy(runloop_st);
-   return false;
+   return RUNAHEAD_COPY_UNAVAILABLE;
 }
 
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
-bool secondary_core_ensure_exists(void *data, settings_t *settings)
+enum runahead_copy_status secondary_core_ensure_exists(void *data,
+      settings_t *settings)
 {
    runloop_state_t *runloop_st         = (runloop_state_t*)data;
    const char *path_directory_libretro = settings->paths.directory_libretro;
@@ -538,7 +806,7 @@ bool secondary_core_ensure_exists(void *data, settings_t *settings)
    if (!runloop_st->secondary_lib_handle)
       return secondary_core_create(runloop_st, path_directory_libretro,
                input_max_users);
-   return true;
+   return RUNAHEAD_COPY_READY;
 }
 #endif
 
@@ -547,15 +815,20 @@ static bool secondary_core_deserialize(runloop_state_t *runloop_st,
       settings_t *settings, const void *data, size_t len)
 {
    bool ret = false;
+   enum runahead_copy_status status =
+      secondary_core_ensure_exists(runloop_st, settings);
 
-   if (secondary_core_ensure_exists(runloop_st, settings))
+   if (status == RUNAHEAD_COPY_READY)
    {
       runloop_st->flags |=  RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
       ret                = runloop_st->secondary_core.retro_unserialize(data, len);
       runloop_st->flags &= ~RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
    }
-   else
+   else if (status == RUNAHEAD_COPY_UNAVAILABLE)
       runahead_secondary_core_destroy(runloop_st);
+   /* PENDING: copy still in flight - report failure quietly and
+    * leave the task running; do NOT destroy (that would abandon
+    * the copy and restart it on the next call). */
 
    return ret;
 }
@@ -568,10 +841,16 @@ static bool secondary_core_run_use_last_input(runloop_state_t *runloop_st)
    retro_input_poll_t old_poll_function;
    retro_input_state_t old_input_function;
 
-   if (!secondary_core_ensure_exists(runloop_st, config_get_ptr()))
    {
-      runahead_secondary_core_destroy(runloop_st);
-      return false;
+      enum runahead_copy_status status =
+         secondary_core_ensure_exists(runloop_st, config_get_ptr());
+      if (status != RUNAHEAD_COPY_READY)
+      {
+         if (status == RUNAHEAD_COPY_UNAVAILABLE)
+            runahead_secondary_core_destroy(runloop_st);
+         /* PENDING: leave the copy task running */
+         return false;
+      }
    }
 
    old_poll_function                        = runloop_st->secondary_callbacks.poll_cb;
@@ -629,12 +908,23 @@ static void mylist_resize(my_list *list,
 
    if (new_size > list->capacity)
    {
+      void **new_data;
+
       if (new_capacity < list->capacity * 2)
          new_capacity = list->capacity * 2;
 
-      /* try to realloc */
-      list->data      = (void**)realloc(
+      /* Try to realloc. On OOM, leave the list at its current
+       * capacity and silently no-op the resize - the caller
+       * (mylist_add_element) tolerates list->data[old_size]
+       * being NULL: runahead_input_state_set_last guards on
+       * 'if (element)' before writing to it, and downstream
+       * code already accepts that runahead state may be
+       * incomplete. */
+      new_data = (void**)realloc(
             (void*)list->data, new_capacity * sizeof(void*));
+      if (!new_data)
+         return;
+      list->data = new_data;
 
       for (i = list->capacity; i < new_capacity; i++)
          list->data[i] = NULL;
@@ -670,9 +960,16 @@ static void mylist_resize(my_list *list,
 
 static void *mylist_add_element(my_list *list)
 {
-   int old_size = list->size;
-   if (list)
-      mylist_resize(list, old_size + 1, true);
+   int old_size;
+   if (!list)
+      return NULL;
+   old_size = list->size;
+   mylist_resize(list, old_size + 1, true);
+   /* mylist_resize may have failed to grow on OOM, in which case
+    * list->size is still old_size and list->data[old_size] is
+    * out of bounds. Re-check before returning. */
+   if (list->size <= old_size)
+      return NULL;
    return list->data[old_size];
 }
 
@@ -706,12 +1003,20 @@ static void mylist_create(my_list **list_p, int initial_capacity,
       mylist_destroy(list_p);
 
    list               = (my_list*)malloc(sizeof(my_list));
+   if (!list)
+   {
+      *list_p         = NULL;
+      return;
+   }
    *list_p            = list;
    list->size         = 0;
    list->constructor  = constructor;
    list->destructor   = destructor;
    list->data         = (void**)calloc(initial_capacity, sizeof(void*));
-   list->capacity     = initial_capacity;
+   /* On calloc OOM, leave list->data NULL and capacity 0;
+    * mylist_resize's realloc grows from there on first add and
+    * a subsequent realloc(NULL, n) is well-defined. */
+   list->capacity     = list->data ? initial_capacity : 0;
 }
 
 static void *input_list_element_constructor(void)
@@ -934,59 +1239,43 @@ static void runahead_remove_input_state_hook(runloop_state_t *runloop_st)
    }
 }
 
-static void *runahead_save_state_alloc(void)
-{
-   runloop_state_t     *runloop_st       = runloop_state_get_ptr();
-   retro_ctx_serialize_info_t *savestate = (retro_ctx_serialize_info_t*)
-      malloc(sizeof(retro_ctx_serialize_info_t));
-
-   if (!savestate)
-      return NULL;
-
-   savestate->data          = NULL;
-   savestate->data_const    = NULL;
-   savestate->size          = 0;
-
-   if (     (runloop_st->runahead_save_state_size > 0)
-         && (runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN))
-   {
-      savestate->data       = malloc(runloop_st->runahead_save_state_size);
-      savestate->data_const = savestate->data;
-      /* Only record a non-zero size on successful alloc.  Pre-
-       * patch: on OOM data was left NULL but size was set to the
-       * requested value, which made downstream consumers treat
-       * the entry as a valid serialized-state buffer of that
-       * size and dereference data when reading.  Keeping size=0
-       * on failure matches the initial-state invariant above
-       * (data/data_const = NULL, size = 0) and makes the
-       * savestate a no-op placeholder that teardown
-       * (runahead_save_state_free) correctly handles via its
-       * free(savestate->data) with NULL being a safe no-op. */
-      if (savestate->data)
-         savestate->size    = runloop_st->runahead_save_state_size;
-   }
-
-   return savestate;
-}
-
-static void runahead_save_state_free(void *data)
-{
-   retro_ctx_serialize_info_t *savestate = (retro_ctx_serialize_info_t*)data;
-   if (!savestate)
-      return;
-   free(savestate->data);
-   free(savestate);
-}
-
-static void runahead_save_state_list_init(
+static bool runahead_savestate_info_init(
       runloop_state_t *runloop_st,
       size_t save_state_size)
 {
-   runloop_st->runahead_save_state_size  = save_state_size;
-   runloop_st->flags                    |= RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
+   retro_ctx_serialize_info_t *info       = &runloop_st->runahead_savestate_info;
 
-   mylist_create(&runloop_st->runahead_save_state_list, 16,
-         runahead_save_state_alloc, runahead_save_state_free);
+   runloop_st->runahead_save_state_size   = save_state_size;
+   runloop_st->flags                     |= RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
+
+   /* Free any previous buffer so callers can safely re-init.  The
+    * matching invariant (data NULL when nothing allocated) lets the
+    * per-frame save_state/load_state path use the buffer pointer as
+    * its readiness check. */
+   free(info->data);
+   info->data       = NULL;
+   info->data_const = NULL;
+   info->size       = 0;
+
+   if (save_state_size == 0)
+      return false;
+
+   info->data       = malloc(save_state_size);
+   if (!info->data)
+      return false;
+
+   info->data_const = info->data;
+   info->size       = save_state_size;
+   return true;
+}
+
+static void runahead_savestate_info_free(runloop_state_t *runloop_st)
+{
+   retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
+   free(info->data);
+   info->data       = NULL;
+   info->data_const = NULL;
+   info->size       = 0;
 }
 
 /* Hooks - Hooks to cleanup, and add dirty input hooks */
@@ -1010,7 +1299,7 @@ static void runahead_remove_hooks(runloop_state_t *runloop_st)
 
 static void runahead_destroy(runloop_state_t *runloop_st)
 {
-   mylist_destroy(&runloop_st->runahead_save_state_list);
+   runahead_savestate_info_free(runloop_st);
    runahead_remove_hooks(runloop_st);
    runahead_clear_variables(runloop_st);
 }
@@ -1060,7 +1349,7 @@ static void runahead_add_hooks(runloop_state_t *runloop_st)
 static void runahead_err(runloop_state_t *runloop_st)
 {
    runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_AVAILABLE;
-   mylist_destroy(&runloop_st->runahead_save_state_list);
+   runahead_savestate_info_free(runloop_st);
    runahead_remove_hooks(runloop_st);
    runloop_st->runahead_save_state_size       = 0;
    runloop_st->flags                         |= RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
@@ -1072,33 +1361,28 @@ static bool runahead_create(runloop_state_t *runloop_st)
    video_driver_state_t *video_st = video_state_get_ptr();
    size_t info_size               = core_serialize_size_special();
 
-   runahead_save_state_list_init(runloop_st, info_size);
-   if (video_st->flags & VIDEO_FLAG_ACTIVE)
-      video_st->flags |=  VIDEO_FLAG_RUNAHEAD_IS_ACTIVE;
-   else
-      video_st->flags &= ~VIDEO_FLAG_RUNAHEAD_IS_ACTIVE;
-
-   if (      (runloop_st->runahead_save_state_size == 0)
-         || !(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN))
+   if (!runahead_savestate_info_init(runloop_st, info_size))
    {
       runahead_err(runloop_st);
       return false;
    }
 
+   if (video_st->flags & VIDEO_FLAG_ACTIVE)
+      video_driver_modify_disp_flags(VIDEO_FLAG_RUNAHEAD_IS_ACTIVE, 0);
+   else
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_RUNAHEAD_IS_ACTIVE);
+
    runahead_add_hooks(runloop_st);
    runloop_st->flags |= RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY;
-   if (runloop_st->runahead_save_state_list)
-      mylist_resize(runloop_st->runahead_save_state_list, 1, true);
    return true;
 }
 
 static bool runahead_save_state(runloop_state_t *runloop_st)
 {
-   if (runloop_st->runahead_save_state_list)
+   retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
+   if (info->data)
    {
-      retro_ctx_serialize_info_t *serialize_info =
-         (retro_ctx_serialize_info_t*)runloop_st->runahead_save_state_list->data[0];
-      if (core_serialize_special(serialize_info))
+      if (core_serialize_special(info))
          return true;
       runahead_err(runloop_st);
    }
@@ -1107,15 +1391,13 @@ static bool runahead_save_state(runloop_state_t *runloop_st)
 
 static bool runahead_load_state(runloop_state_t *runloop_st)
 {
-   retro_ctx_serialize_info_t *serialize_info =
-      (retro_ctx_serialize_info_t*)
-      runloop_st->runahead_save_state_list->data[0];
-   bool last_dirty                            = (runloop_st->flags & RUNLOOP_FLAG_INPUT_IS_DIRTY) ? true : false;
-   bool ret                                   = core_unserialize_special(serialize_info);
+   retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
+   bool last_dirty                  = (runloop_st->flags & RUNLOOP_FLAG_INPUT_IS_DIRTY) ? true : false;
+   bool ret                         = core_unserialize_special(info);
    if (last_dirty)
-      runloop_st->flags                      |=  RUNLOOP_FLAG_INPUT_IS_DIRTY;
+      runloop_st->flags             |=  RUNLOOP_FLAG_INPUT_IS_DIRTY;
    else
-      runloop_st->flags                      &= ~RUNLOOP_FLAG_INPUT_IS_DIRTY;
+      runloop_st->flags             &= ~RUNLOOP_FLAG_INPUT_IS_DIRTY;
 
    if (!ret)
       runahead_err(runloop_st);
@@ -1126,11 +1408,10 @@ static bool runahead_load_state(runloop_state_t *runloop_st)
 #if HAVE_DYNAMIC
 static bool runahead_load_state_secondary(runloop_state_t *runloop_st, settings_t *settings)
 {
-   retro_ctx_serialize_info_t *serialize_info =
-      (retro_ctx_serialize_info_t*)runloop_st->runahead_save_state_list->data[0];
+   retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
 
    if (!secondary_core_deserialize(runloop_st, settings,
-            serialize_info->data_const, serialize_info->size))
+            info->data_const, info->size))
    {
       runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE;
       runahead_err(runloop_st);
@@ -1176,6 +1457,11 @@ void runahead_run(void *data,
    settings_t *settings    = config_get_ptr();
 #else
    const bool have_dynamic = false;
+#endif
+#if HAVE_DYNAMIC
+   enum runahead_copy_status sec_status = RUNAHEAD_COPY_UNAVAILABLE;
+#else
+   const enum runahead_copy_status sec_status = RUNAHEAD_COPY_UNAVAILABLE;
 #endif
    video_driver_state_t
       *video_st            = video_state_get_ptr();
@@ -1228,9 +1514,36 @@ void runahead_run(void *data,
 
    runloop_st->runahead_last_frame_count  = frame_count;
 
+#if HAVE_DYNAMIC
+   if (     use_secondary
+         && have_dynamic
+         && (runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE))
+   {
+      sec_status = secondary_core_ensure_exists(runloop_st, config_get_ptr());
+      if (sec_status == RUNAHEAD_COPY_UNAVAILABLE)
+      {
+         const char *_msg =
+            msg_hash_to_str(MSG_RUNAHEAD_FAILED_TO_CREATE_SECONDARY_INSTANCE);
+         runahead_secondary_core_destroy(runloop_st);
+         runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE;
+         runloop_msg_queue_push(_msg, strlen(_msg), 0, 3 * 60, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         RARCH_WARN("[Run-Ahead] %s\n", _msg);
+         goto force_input_dirty;
+      }
+      /* PENDING: the copy task is still duplicating the core
+       * binary. Run the single-instance savestate method for this
+       * frame (identical output) and retry next frame; the
+       * secondary instance attaches seamlessly once ready, since
+       * it is (re)synchronised from a savestate every time it
+       * runs anyway. */
+   }
+#endif
+
    if (     !use_secondary
          || !have_dynamic
-         || !(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE))
+         || !(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE)
+         || (sec_status != RUNAHEAD_COPY_READY))
    {
       /* TODO: multiple savestates for higher performance
        * when not using secondary core */
@@ -1242,7 +1555,7 @@ void runahead_run(void *data,
          if (suspended_frame)
          {
             audio_st->flags     |=  AUDIO_FLAG_SUSPENDED;
-            video_st->flags     &= ~VIDEO_FLAG_ACTIVE;
+            video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
          }
 
          if (frame_number == 0)
@@ -1253,9 +1566,9 @@ void runahead_run(void *data,
          if (suspended_frame)
          {
             if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
-               video_st->flags |=  VIDEO_FLAG_ACTIVE;
+               video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
             else
-               video_st->flags &= ~VIDEO_FLAG_ACTIVE;
+               video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
 
             audio_st->flags    &= ~AUDIO_FLAG_SUSPENDED;
          }
@@ -1289,25 +1602,15 @@ void runahead_run(void *data,
    else
    {
 #if HAVE_DYNAMIC
-      if (!secondary_core_ensure_exists(runloop_st, config_get_ptr()))
-      {
-         const char *_msg =
-            msg_hash_to_str(MSG_RUNAHEAD_FAILED_TO_CREATE_SECONDARY_INSTANCE);
-         runahead_secondary_core_destroy(runloop_st);
-         runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE;
-         runloop_msg_queue_push(_msg, strlen(_msg), 0, 3 * 60, true, NULL,
-               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
-         RARCH_WARN("[Run-Ahead] %s\n", _msg);
-         goto force_input_dirty;
-      }
+      /* sec_status == RUNAHEAD_COPY_READY here (checked above) */
 
       /* run main core with video suspended */
-      video_st->flags &= ~VIDEO_FLAG_ACTIVE;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
       core_run();
       if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
-         video_st->flags |=  VIDEO_FLAG_ACTIVE;
+         video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
       else
-         video_st->flags &= ~VIDEO_FLAG_ACTIVE;
+         video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
 
       if (     (runloop_st->flags & RUNLOOP_FLAG_INPUT_IS_DIRTY)
             || (runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY))
@@ -1334,7 +1637,7 @@ void runahead_run(void *data,
 
          for (frame_number = 0; frame_number < runahead_count - 1; frame_number++)
          {
-            video_st->flags             &= ~VIDEO_FLAG_ACTIVE;
+            video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
             audio_st->flags             |= AUDIO_FLAG_SUSPENDED
                                          | AUDIO_FLAG_HARD_DISABLE;
             if (secondary_core_run_use_last_input(runloop_st))
@@ -1344,9 +1647,9 @@ void runahead_run(void *data,
             audio_st->flags             &= ~(AUDIO_FLAG_SUSPENDED
                                          | AUDIO_FLAG_HARD_DISABLE);
             if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
-               video_st->flags          |=  VIDEO_FLAG_ACTIVE;
+               video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
             else
-               video_st->flags          &= ~VIDEO_FLAG_ACTIVE;
+               video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
          }
       }
       audio_st->flags                   |= AUDIO_FLAG_SUSPENDED
@@ -1656,7 +1959,6 @@ void preempt_run(preempt_t *preempt, void *data)
    struct retro_core_t *current_core = &runloop_st->current_core;
    const char *_msg                  = NULL;
    audio_driver_state_t *audio_st    = audio_state_get_ptr();
-   video_driver_state_t *video_st    = video_state_get_ptr();
    settings_t *settings              = config_get_ptr();
    unsigned input_max_users          = settings->uints.input_max_users;
    bool run_ahead_hide_warnings      = settings->bools.run_ahead_hide_warnings;
@@ -1671,7 +1973,7 @@ void preempt_run(preempt_t *preempt, void *data)
    {
       /* Suspend A/V and run preemptive frames */
       audio_st->flags |=  AUDIO_FLAG_SUSPENDED;
-      video_st->flags &= ~VIDEO_FLAG_ACTIVE;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
 
       if (!current_core->retro_unserialize(
             preempt->buffer[preempt->start_ptr], preempt->state_size))
@@ -1697,7 +1999,7 @@ void preempt_run(preempt_t *preempt, void *data)
       }
 
       audio_st->flags &= ~AUDIO_FLAG_SUSPENDED;
-      video_st->flags |=  VIDEO_FLAG_ACTIVE;
+      video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
    }
 
    /* Save current state and set start_ptr to oldest state */
@@ -1721,7 +2023,7 @@ error:
    runloop_st->flags &= ~(RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE
          | RUNLOOP_FLAG_INPUT_IS_DIRTY);
    audio_st->flags   &= ~AUDIO_FLAG_SUSPENDED;
-   video_st->flags   |=  VIDEO_FLAG_ACTIVE;
+   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
    preempt_deinit(runloop_st);
 
    if (!run_ahead_hide_warnings)
@@ -1733,10 +2035,9 @@ error:
 void runahead_clear_variables(void *data)
 {
    runloop_state_t *runloop_st            = (runloop_state_t*)data;
-   video_driver_state_t *video_st         = video_state_get_ptr();
    runloop_st->runahead_save_state_size   = 0;
    runloop_st->flags                     &= ~RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
-   video_st->flags                       |= VIDEO_FLAG_RUNAHEAD_IS_ACTIVE;
+   video_driver_modify_disp_flags(VIDEO_FLAG_RUNAHEAD_IS_ACTIVE, 0);
    runloop_st->flags                     |= RUNLOOP_FLAG_RUNAHEAD_AVAILABLE
                                           | RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE
                                           | RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY;

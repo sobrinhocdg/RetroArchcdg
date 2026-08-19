@@ -25,7 +25,7 @@
 #include <xmmintrin.h>
 #endif
 
-#if (defined(__ARM_NEON__) || defined(HAVE_NEON))
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
 #include <arm_neon.h>
 #include <features/features_cpu.h>
 #endif
@@ -40,6 +40,13 @@
 #include <memalign.h>
 #include <audio/conversion/float_to_s16.h>
 #include <audio/conversion/s16_to_float.h>
+#include <audio/sinc_resampler_int16.h>
+#ifdef HAVE_NEAREST_RESAMPLER
+#include <audio/nearest_resampler_int16.h>
+#endif
+#ifdef HAVE_CC_RESAMPLER
+#include <audio/cc_resampler_int16.h>
+#endif
 #include <audio/conversion/dual_mono.h>
 #ifdef HAVE_AUDIOMIXER
 #include <audio/audio_mixer.h>
@@ -76,6 +83,7 @@
 #include "../record/record_driver.h"
 #include "../tasks/task_content.h"
 #include "../runloop.h"
+#include "../midi_driver.h"
 #include "../verbosity.h"
 
 #define AUDIO_CHUNK_SIZE_BLOCKING      512
@@ -90,12 +98,27 @@
  * a consistent pitch when fast-forwarding. */
 #define AUDIO_FF_EXP_AVG_SAMPLES       16
 
+/* Assumed content fps when av_info.timing.fps is unset or implausible
+ * (cold start before core load, etc.). Used only to bootstrap the DRC
+ * threshold; once a core is loaded and SET_SYSTEM_AV_INFO has fired,
+ * audio_driver_update_drc_threshold uses the actual fps. */
+#define AUDIO_DRC_FALLBACK_FPS         60.0
+
+/* Floor on the DRC threshold (int16 stereo samples). Guards against
+ * pathological input rates or fps values resulting in a near-zero
+ * threshold that would fire on every call. ~10 ms at 48 kHz stereo. */
+#define AUDIO_DRC_MIN_THRESHOLD_INT16S 1024
+
 #define MENU_SOUND_FORMATS "ogg|mod|xm|s3m|mp3|flac|wav"
 
  /* Converts decibels to voltage gain. Returns voltage gain value. */
 #define DB_TO_GAIN(db) (powf(10.0f, (db) / 20.0f))
+/* The s16 mixer pipeline takes Q16.16 gains so that it needs no float
+ * of its own. The frontend still keeps its gains as floats, so the
+ * conversion happens here, at the boundary. */
+#define GAIN_TO_Q16(g) ((int32_t)((g) * 65536.0f + 0.5f))
 
-#if (defined(__ARM_NEON__) || defined(HAVE_NEON))
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
 static bool clamp_float_neon_enabled = false;
 
 static void audio_driver_clamp_init_simd(void)
@@ -177,6 +200,9 @@ audio_driver_t *audio_drivers[] = {
 #if defined(HAVE_SDL) || defined(HAVE_SDL2)
    &audio_sdl,
 #endif
+#ifdef HAVE_SDL3
+   &audio_sdl3,
+#endif
 #ifdef HAVE_PULSE
    &audio_pulse,
 #endif
@@ -253,6 +279,9 @@ microphone_driver_t *microphone_drivers[] = {
 #endif
 #ifdef HAVE_SDL2
       &microphone_sdl, /* Microphones are not supported in SDL 1 */
+#endif
+#ifdef HAVE_SDL3
+      &microphone_sdl3,
 #endif
 #ifdef HAVE_PIPEWIRE
       &microphone_pipewire,
@@ -344,10 +373,32 @@ static void audio_driver_deinit_resampler(void)
    audio_driver_state_t *audio_st = &audio_driver_st;
    if (audio_st->resampler && audio_st->resampler_data)
       audio_st->resampler->free(audio_st->resampler_data);
+   if (audio_st->resampler_data_int16 && audio_st->resampler_int16_free)
+      audio_st->resampler_int16_free(audio_st->resampler_data_int16);
    audio_st->resampler          = NULL;
    audio_st->resampler_data     = NULL;
+   audio_st->resampler_data_int16 = NULL;
+   audio_st->resampler_int16_process = NULL;
+   audio_st->resampler_int16_free    = NULL;
    audio_st->resampler_ident[0] = '\0';
    audio_st->resampler_quality  = RESAMPLER_QUALITY_DONTCARE;
+}
+
+/* Map the shared resampler quality enum onto the integer sinc driver's own
+ * quality enum (they use different orderings). */
+static enum sinc_int16_quality audio_sinc_int16_quality_map(
+      enum resampler_quality q)
+{
+   switch (q)
+   {
+      case RESAMPLER_QUALITY_LOWEST:  return SINC_INT16_QUALITY_LOWEST;
+      case RESAMPLER_QUALITY_LOWER:   return SINC_INT16_QUALITY_LOWER;
+      case RESAMPLER_QUALITY_HIGHER:  return SINC_INT16_QUALITY_HIGHER;
+      case RESAMPLER_QUALITY_HIGHEST: return SINC_INT16_QUALITY_HIGHEST;
+      case RESAMPLER_QUALITY_NORMAL:
+      case RESAMPLER_QUALITY_DONTCARE:
+      default:                        return SINC_INT16_QUALITY_NORMAL;
+   }
 }
 
 static bool audio_driver_deinit_internal(bool audio_enable)
@@ -361,14 +412,22 @@ static bool audio_driver_deinit_internal(bool audio_enable)
       audio_st->context_audio_data = NULL;
    }
 
-   if (audio_st->output_samples_conv_buf)
-      memalign_free(audio_st->output_samples_conv_buf);
-   audio_st->output_samples_conv_buf     = NULL;
+   if (audio_st->output_samples_int16)
+      memalign_free(audio_st->output_samples_int16);
+   audio_st->output_samples_int16     = NULL;
 
    if (audio_st->input_data)
       memalign_free(audio_st->input_data);
 
    audio_st->input_data = NULL;
+
+   if (audio_st->synth_buf)
+      memalign_free(audio_st->synth_buf);
+
+   audio_st->synth_buf  = NULL;
+   if (audio_st->input_data_int16)
+      memalign_free(audio_st->input_data_int16);
+   audio_st->input_data_int16 = NULL;
    audio_st->data_ptr   = 0;
 
 #ifdef HAVE_REWIND
@@ -472,9 +531,369 @@ bool audio_driver_find_driver(const char *audio_drv,
  * @param is_slowmotion True if the core is currently running in slow motion.
  * @param is_fastmotion True if the core is currently running in fast-forward.
  **/
+/**
+ * audio_driver_compute_rate_adjust:
+ *
+ * Compute the rate-control adjustment factor used to nudge the
+ * resampler ratio for A/V sync, by sampling the audio driver's
+ * FIFO write-available count and comparing it to the half-full
+ * mark. Records the sampled value in the rolling history at
+ * free_samples_buf[] for diagnostics, and ticks free_samples_count.
+ *
+ * Caller is responsible for checking that AUDIO_FLAG_CONTROL is set
+ * before calling this, and for sample-count rate-limiting (we don't
+ * want to call audio->write_avail more often than the DRC time
+ * constant warrants - see audio_driver_state_t::drc_threshold_int16s).
+ *
+ * Used by both the write_raw fast path (which applies the result
+ * as rate_adjust) and the resampler slow path (which multiplies
+ * src_ratio_orig by the result to produce src_ratio_curr). The two
+ * sites previously duplicated this body verbatim.
+ *
+ * Returns the rate-adjust factor (typically very near 1.0, within
+ * rate_control_delta) and also stores it in audio_st->cached_rate_adjust
+ * so callers that skip the recompute can read the most recent value
+ * without re-running the DRC.
+ **/
+static double audio_driver_compute_rate_adjust(audio_driver_state_t *audio_st)
+{
+   unsigned write_idx     =
+         audio_st->free_samples_count++ & (AUDIO_BUFFER_FREE_SAMPLES_COUNT - 1);
+   int avail              = (int)audio_st->current_audio->write_avail(
+         audio_st->context_audio_data);
+   int half_size          = (int)(audio_st->buffer_size / 2);
+   int delta_mid;
+   double direction;
+   double effective_delta;
+   double rate_adjust;
+   /* half_size is the setpoint's denominator. A driver may report a zero
+    * buffer size at runtime as well as at init - pulse pushes its size
+    * through audio_driver_set_buffer_size() from write_avail() on every
+    * sample, and notes there that it "can change spuriously" - so guard
+    * the division here too rather than relying only on the init-time
+    * gate. Returning 1.0 leaves the ratio untouched, which degrades to
+    * "no rate control" instead of feeding inf/NaN into src_ratio_curr. */
+   if (half_size <= 0)
+   {
+      audio_st->free_samples_buf[write_idx] = avail;
+      audio_st->cached_rate_adjust          = 1.0;
+      audio_st->samples_since_drc           = 0;
+      return 1.0;
+   }
+
+   delta_mid              = avail - half_size;
+   direction              = (double)delta_mid / half_size;
+   /* Scale rate_control_delta inversely with the resampling ratio
+    * so the effective loop gain stays constant regardless of output
+    * sample rate (e.g. 96 kHz+).  Without this, high ratios amplify
+    * the correction and the controller oscillates, causing audible
+    * volume pumping.
+    *
+    * Only scale down (ratio > 1.0).  At sub-unity ratios the original
+    * delta is already well-tuned and dividing by a fraction would
+    * over-amplify corrections. */
+   effective_delta        = (audio_st->src_ratio_orig > 1.0)
+         ? audio_st->rate_control_delta / audio_st->src_ratio_orig
+         : audio_st->rate_control_delta;
+   rate_adjust            = 1.0 + effective_delta * direction;
+
+   audio_st->free_samples_buf[write_idx] = avail;
+   audio_st->cached_rate_adjust          = rate_adjust;
+   audio_st->samples_since_drc           = 0;
+   return rate_adjust;
+}
+
+/**
+ * audio_driver_update_drc_threshold:
+ *
+ * Recompute drc_threshold_int16s for the current sample rate / fps.
+ * The threshold is one game-frame's worth of stereo int16 samples at
+ * the core's input rate: (input_rate / fps) * 2.
+ *
+ * Called by audio_driver_init_internal once input rate is set, and
+ * implicitly re-runs through it on every SET_SYSTEM_AV_INFO since
+ * that envcall forces an audio driver reinit. So rate/fps changes
+ * mid-session are picked up automatically.
+ *
+ * Uses video_state's av_info for fps. If fps is unset or implausibly
+ * small (cold start before core load), falls back to
+ * AUDIO_DRC_FALLBACK_FPS (60 Hz) so the menu audio path still has a
+ * sensible threshold. The minimum threshold is floored at
+ * AUDIO_DRC_MIN_THRESHOLD_INT16S to handle pathological rate/fps
+ * combinations.
+ **/
+void audio_driver_update_drc_threshold(audio_driver_state_t *audio_st)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   double fps                     = (video_st->av_info.timing.fps > 1.0)
+         ? video_st->av_info.timing.fps
+         : AUDIO_DRC_FALLBACK_FPS;
+   double input_rate              = (audio_st->input > 0.0f)
+         ? audio_st->input
+         : (double)config_get_ptr()->uints.audio_output_sample_rate;
+   /* (samples per frame at the core's submission rate) * 2 channels.
+    * Floor at AUDIO_DRC_MIN_THRESHOLD_INT16S so pathological inputs
+    * don't push the threshold below ~10 ms worth of audio. */
+   size_t threshold               = (size_t)floor(input_rate / fps) * 2;
+
+   if (threshold < AUDIO_DRC_MIN_THRESHOLD_INT16S)
+      threshold                   = AUDIO_DRC_MIN_THRESHOLD_INT16S;
+   audio_st->drc_threshold_int16s = threshold;
+}
+
+/* Fast-forward "speedup" pitch tracking, shared by the float and the
+ * deterministic s16 paths.  Measures the real wall-clock time between
+ * flushes, keeps an exponential moving average of it over the last
+ * AUDIO_FF_EXP_AVG_SAMPLES flushes, and returns a multiplier for the
+ * resampler ratio so the audio time-stretches to track the actual output
+ * speed rather than crackling or being muted.  The EMA smooths the estimate
+ * so pitches stay recognizable (it is not needed to avoid crackling -- the
+ * generated waves are continuous either way -- but it avoids time
+ * compression/decompression every frame; see
+ * https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average).
+ *
+ * The state (last_flush_time, avg_flush_delta) lives on audio_st and the
+ * arithmetic is identical regardless of caller, so it is float/int16
+ * agnostic: a session may move between the two paths mid-fast-forward and the
+ * wall-clock series stays continuous.  Returns 1.0 (no adjustment) on the
+ * first flush, seeding last_flush_time for the next one. */
+/* Bound a resampler ratio against the capacity of the output scratch.
+ *
+ * Neither struct resampler_data nor struct resampler_data_int16 carries an
+ * output-capacity field: every driver emits frames until its phase
+ * accumulator runs out of input and writes them straight to data_out (see
+ * the unbounded `while (resamp->time < phases)` loop in the sinc driver).
+ * The caller therefore owns the bound.
+ *
+ * audio_driver_init_internal sizes both output scratches at
+ * max_buffer_samples * AUDIO_MAX_RATIO * slowmotion_ratio samples, i.e. it
+ * assumes the effective ratio never exceeds AUDIO_MAX_RATIO relative to a
+ * full input batch.  But the effective ratio is a product -
+ * src_ratio_orig (output rate / core rate) * the rate-control adjustment *
+ * slowmotion_ratio * the fast-forward pitch multiplier - and only the last
+ * factor is clamped to AUDIO_MAX_RATIO.  src_ratio_orig is taken straight
+ * from the core's reported sample rate with no upper limit, so a core
+ * declaring a low rate against a high output rate overruns the headroom on
+ * its own; the fast-forward multiplier (which exceeds 1.0 whenever the core
+ * runs slower than realtime with fast-forward held) multiplies on top.
+ *
+ * Clamping rather than asserting keeps the failure mode proportionate: an
+ * over-range ratio only mistunes the output for as long as the condition
+ * lasts, whereas letting it through writes past the end of a heap block.
+ *
+ * The worst-case output count is not ceil(input_frames * ratio).  The drivers
+ * carry a phase accumulator between calls, and a call that begins with the
+ * accumulator already below `phases` emits before it consumes, so a single
+ * call can run ahead of the steady-state rate.  Measured across the sinc
+ * float, sinc int16, CC int16 and nearest drivers, the overshoot is about one
+ * input frame's worth of output at moderate ratios and grows with
+ * accumulator drift at extreme ones (~64 frames at a ratio of 1177).
+ *
+ * Rather than model that, reserve 16 input frames' worth of output, which is
+ * an order of magnitude more than any overshoot measured over the full ratio
+ * range.  The reservation is proportional, so the absolute margin scales with
+ * the buffer: ~470 frames at the default sizing, ~4700 at slowmotion_ratio
+ * 10.  It still admits every ratio the buffer can physically hold - the
+ * allocation supports 32 and this permits 31.5 - so a legitimate extreme such
+ * as an 8 kHz core against 192 kHz output (ratio 24) passes unclamped. */
+static double audio_driver_bound_ratio(double ratio,
+      size_t input_frames, size_t capacity_frames)
+{
+   double max_ratio;
+
+   if (input_frames == 0 || capacity_frames == 0)
+      return ratio;
+
+   max_ratio = (double)capacity_frames / (double)(input_frames + 16);
+
+   return (ratio > max_ratio) ? max_ratio : ratio;
+}
+
+static double audio_driver_fastforward_ratio_mult(
+      audio_driver_state_t *audio_st, size_t input_frames)
+{
+   const retro_time_t flush_time = cpu_features_get_time_usec();
+   double mult                   = 1.0;
+
+   if (audio_st->last_flush_time > 0)
+   {
+      /* What we should see if the speed was 1.0x, converted to microsecs. */
+      const double expected_flush_delta =
+            (input_frames / audio_st->input * 1000000);
+      const retro_time_t n      = AUDIO_FF_EXP_AVG_SAMPLES;
+      audio_st->avg_flush_delta = audio_st->avg_flush_delta * (n - 1) / n +
+            (flush_time - audio_st->last_flush_time) / n;
+
+      /* How much does avg_flush_delta deviate from the 1.0x delta? */
+      mult = MAX(AUDIO_MIN_RATIO,
+            MIN(AUDIO_MAX_RATIO,
+               audio_st->avg_flush_delta / expected_flush_delta));
+   }
+
+   audio_st->last_flush_time = flush_time;
+   return mult;
+}
+
+/* Frames of headroom deliberately resampled beyond what the device
+ * reports writable.  Covers the drain between the write_avail() sample
+ * below and the write itself (a fast-forward flush interval is a few
+ * hundred microseconds, i.e. some tens of frames at typical output
+ * rates), plus any avail rounding inside the driver.  Overfilling by
+ * this margin reproduces today's behaviour exactly - the driver's
+ * non-blocking write drops the excess - while underfilling would starve
+ * the device and open audible gaps, so the margin errs on the side of
+ * a little discarded work: at 16 taps the slack costs ~1 us per flush. */
+#define AUDIO_FF_DISCARD_SLACK_FRAMES 64
+
+/**
+ * audio_driver_ff_discard_bound:
+ *
+ * During fast-forward without "speedup" pitch tracking, the driver is
+ * non-blocking and its buffer is pinned close to full - it drains at
+ * real-time rate while flushes arrive at fast-forward rate - so almost
+ * every frame the resampler produces is dropped by the write below.
+ * At high multipliers that is >90% of the convolution (and of the
+ * conversion/clamp/write stages after it) spent on frames that are
+ * never heard.
+ *
+ * Bound the resampler's *input* so it only produces what the device
+ * can accept (plus slack): frames the write would have dropped from
+ * the tail of the chunk are instead never resampled.  The audible
+ * result is unchanged - the same head-of-chunk fragments reach the
+ * device either way - only the discard moves from after the resampler
+ * to before it.
+ *
+ * Deliberately input capping and not ratio bounding: shrinking the
+ * ratio would time-compress the chunk into the writable space, which
+ * is exactly the pitch-raising "speedup" behaviour the user declined
+ * by leaving that option off.
+ *
+ * write_avail() returns bytes (see wasapi/alsa/dsound implementations);
+ * under threaded audio it is the same locked accessor the rate-control
+ * path already calls once per DRC interval.  Drivers without
+ * write_avail() keep the old behaviour.
+ *
+ * Returns: capped input frame count (<= in_frames, never 0 while the
+ * slack is non-zero, so the resampler ring stays warm).
+ **/
+static size_t audio_driver_ff_discard_bound(audio_driver_state_t *audio_st,
+      double ratio, size_t in_frames)
+{
+   size_t avail_bytes;
+   size_t out_frame_bytes;
+   size_t max_out_frames;
+   size_t max_in_frames;
+   const audio_driver_t *audio = audio_st->current_audio;
+
+   if (!audio || !audio->write_avail || !audio_st->context_audio_data)
+      return in_frames;
+   /* Also rejects NaN. */
+   if (!(ratio > 0.0))
+      return in_frames;
+
+   avail_bytes     = audio->write_avail(audio_st->context_audio_data);
+   out_frame_bytes = (audio_st->flags & AUDIO_FLAG_USE_FLOAT)
+         ? (2 * sizeof(float))
+         : (2 * sizeof(int16_t));
+   max_out_frames  = avail_bytes / out_frame_bytes
+         + AUDIO_FF_DISCARD_SLACK_FRAMES;
+   max_in_frames   = (size_t)((double)max_out_frames / ratio);
+
+   return (in_frames < max_in_frames) ? in_frames : max_in_frames;
+}
+
+/* Whether the deterministic integer (s16) game path would run for a core
+ * delivering samples in format is_float.  Mirrors the use_i16 gate in
+ * audio_driver_flush; also used at mixer play() time to choose the voice
+ * format so mixer sounds decode/resample/mix in the same domain as the game
+ * audio, avoiding the s16<->float voice fold on the int16 path. */
+static bool audio_driver_mixer_use_s16(bool is_float)
+{
+   return    (audio_driver_st.resampler_data_int16 != NULL)
+          &&  config_get_ptr()->bools.audio_fastpath_s16
+          && !is_float
+#ifdef HAVE_DSP_FILTER
+          && (!audio_driver_st.dsp
+                || retro_dsp_filter_supports_int16(audio_driver_st.dsp))
+#endif
+          ;
+}
+
+/* Saturating, NaN-safe float -> s16 conversion of one sample.
+ *
+ * Mirrors the scalar tail of convert_float_to_s16() exactly - same
+ * round-half-away-from-zero, same NaN handling - so a value converted here
+ * is bit-identical to one converted by the shared routine.
+ *
+ * Casting a non-finite or out-of-int32-range float to an integer is
+ * undefined.  On x86 it yields the "integer indefinite" INT32_MIN, so a NaN
+ * or a large POSITIVE sample emerges as full-scale negative; other targets
+ * saturate, or produce something else again.  convert_float_to_s16() guards
+ * against this, but three sites in this file open-coded the same conversion
+ * without the guard.  They all route through here now.
+ *
+ * The NaN test is on the bit pattern rather than (v != v) because -ffast-math
+ * (implied by -Ofast on HAVE_C_A7A7 builds) is entitled to fold the latter to
+ * false.  Returns a value already clamped to the s16 range, so callers that
+ * sum it onto existing audio only need their own overflow clamp.
+ */
+static INLINE int32_t audio_float_to_s16_sat(float v)
+{
+   uint32_t bits;
+   float    scaled = v * 0x8000;
+
+   memcpy(&bits, &scaled, sizeof(bits));
+   if ((bits & 0x7FFFFFFFu) > 0x7F800000u)
+      return 0;
+
+   scaled += (scaled >= 0.0f ? 0.5f : -0.5f);
+
+   if (scaled >  32767.0f)
+      return  32767;
+   if (scaled < -32768.0f)
+      return -32768;
+   return (int32_t)scaled;
+}
+
+#ifdef HAVE_AUDIOMIXER
+/* Cross-format voice folds.  A voice's format is fixed at play() time but the
+ * game pipeline picks int16-vs-float per flush, so a voice can occasionally
+ * land on the other path (e.g. a float-only DSP loaded while an s16 voice was
+ * sounding).  These sum the "foreign" voices via their native mixer into a
+ * scratch, then fold onto the active buffer so nothing is ever dropped.  They
+ * are gated by audio_mixer_has_{float,s16}_voices() so the common single-
+ * format case skips them entirely. */
+static void audio_mixer_fold_s16_voices_into_float(float *dst,
+      int16_t *scratch, unsigned frames, float gain, bool override)
+{
+   unsigned k;
+   unsigned total = frames * 2;
+   memset(scratch, 0, total * sizeof(int16_t));
+   audio_mixer_mix_s16(scratch, frames, GAIN_TO_Q16(gain), override);
+   for (k = 0; k < total; k++)
+      dst[k] += (float)scratch[k] * (1.0f / 0x8000);
+}
+
+static void audio_mixer_fold_float_voices_into_s16(int16_t *dst,
+      float *scratch, unsigned frames, float gain, bool override)
+{
+   unsigned k;
+   unsigned total = frames * 2;
+   memset(scratch, 0, total * sizeof(float));
+   audio_mixer_mix(scratch, frames, gain, override);
+   for (k = 0; k < total; k++)
+   {
+      int32_t s  = (int32_t)dst[k] + audio_float_to_s16_sat(scratch[k]);
+      if      (s >  32767) s =  32767;
+      else if (s < -32768) s = -32768;
+      dst[k]     = (int16_t)s;
+   }
+}
+#endif
+
 static void audio_driver_flush(audio_driver_state_t *audio_st,
       float slowmotion_ratio,
-      const int16_t *data, size_t samples,
+      const void *data, size_t samples, bool is_float,
       bool is_slowmotion, bool is_fastforward)
 {
    struct resampler_data src_data;
@@ -495,9 +914,20 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
       return;
    }
 
+   /* Record the core's delivered sample format for the statistics overlay. */
+   audio_st->stat_core_is_float = is_float;
+
    /* Fast path: if driver handles resampling and no DSP/mixer is active,
-    * bypass software resampling entirely. */
+    * bypass software resampling entirely. An active in-process MIDI synth
+    * also disables the fast path, since its PCM is mixed into the float
+    * buffer below (which the fast path would skip).
+    * The fast path feeds int16 directly to audio->write_raw, so it is
+    * only available when the core delivered int16; float-native cores
+    * fall through to the float resampler path below (which is exactly
+    * where the redundant int16<->float round-trip is avoided). */
    if (audio->write_raw
+         && !is_float
+         && !midi_driver_synth_active()
 #ifdef HAVE_DSP_FILTER
          && !audio_st->dsp
 #endif
@@ -506,56 +936,381 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
 #endif
       )
    {
-      size_t frames                  = samples >> 1;
+      size_t frames                  = (unsigned)(samples >> 1);
       double rate_adjust             = 1.0;
       unsigned input_rate            = (unsigned)audio_st->input;
 
-      /* Rate control for A/V sync */
+      /* Rate control for A/V sync. The DRC compute is gated on a
+       * sample-count threshold so multi-batch cores don't fire it on
+       * every batch_cb; intermediate calls reuse the cached factor.
+       * Single-batch cores cross the threshold on the first call so
+       * behaviour is unchanged for them. */
       if (audio_st->flags & AUDIO_FLAG_CONTROL)
       {
-         unsigned write_idx          =
-               audio_st->free_samples_count++ & (AUDIO_BUFFER_FREE_SAMPLES_COUNT - 1);
-         int avail                   = (int)audio->write_avail(
-               audio_st->context_audio_data);
-         int half_size               = (int)(audio_st->buffer_size / 2);
-         int delta_mid               = avail - half_size;
-         double direction            = (double)delta_mid / half_size;
-         /* Scale rate_control_delta inversely with the resampling ratio
-          * so the effective loop gain stays constant regardless of
-          * output sample rate (e.g. 96 kHz+).  Without this, high
-          * ratios amplify the correction and the controller oscillates,
-          * causing audible volume pumping.
-          *
-          * Only scale down (ratio > 1.0).  At sub-unity ratios the
-          * original delta is already well-tuned and dividing by a
-          * fraction would over-amplify corrections. */
-         double effective_delta      = (audio_st->src_ratio_orig > 1.0)
-               ? audio_st->rate_control_delta / audio_st->src_ratio_orig
-               : audio_st->rate_control_delta;
-
-         audio_st->free_samples_buf[write_idx] = avail;
-         rate_adjust                 = 1.0 + effective_delta * direction;
+         audio_st->samples_since_drc += samples;
+         if (audio_st->samples_since_drc >= audio_st->drc_threshold_int16s)
+            rate_adjust = audio_driver_compute_rate_adjust(audio_st);
+         else
+            rate_adjust = audio_st->cached_rate_adjust;
       }
 
       if (is_slowmotion)
          rate_adjust                *= slowmotion_ratio;
 
-      /* Note: mute/volume is not applied here - driver must handle or ignore */
+      /* Note: mute/volume is not applied here.  Per the write_raw
+       * contract in audio_driver.h the driver MUST apply the passed
+       * gain (0.0 when muted) to its output - a driver that drops it
+       * silently disables the volume and mute settings. */
+      audio_st->stat_frontend_is_float = false;
       audio->write_raw(audio_st->context_audio_data,
             data, frames, input_rate, rate_adjust, audio_volume_gain);
       return;
+   }
+
+   /* Deterministic integer (s16) path.
+    *
+    * When enabled by the 'Resample to Fixed Integer' hint, the core delivered
+    * int16, and the selected resampler has an int16 variant (sinc, nearest,
+    * or CC), resample s16 -> s16 directly.  Volume is applied in fixed point
+    * (Q16), so non-unity gain no
+    * longer forces the float path; an int16-capable DSP chain runs in the
+    * integer domain, and the audio mixer is summed in float on top of the
+    * resampled game audio in both output branches below.  Fast-forward
+    * "speedup" pitch tracking is applied to the integer ratio too, so it no
+    * longer forces the float path.  An in-process MIDI synth (whose PCM is
+    * float) no longer forces it either: its samples are converted to s16 and
+    * summed into the game audio before the integer DSP/resample, exactly where
+    * the float path sums them.  This removes the s16<->float round-trip on the
+    * game signal and is bit-identical across platforms for that signal
+    * (reproducible output for validation and regression comparison).  Any
+    * condition failing falls through to the float path below.
+    *
+    * This buys determinism, not speed, and on hosts with a vector FPU it
+    * costs speed.  The float sinc driver is SIMD (SSE/NEON/AltiVec) while
+    * the int16 one is scalar, so on desktop x86 this path measures roughly
+    * twice the cost of the float path for the same output - about 30 us
+    * against 15 us for a 512-frame batch at 32 kHz -> 48 kHz.  It wins where
+    * there is no usable FPU, or with a cheap kernel: the nearest driver
+    * measures ~2.0 us here against ~3.5 us on the float path.  Pick it for
+    * reproducibility (netplay, rewind, regression comparison) or for
+    * soft-float targets, not as a general optimisation. */
+   {
+      static int audio_i16_path_logged = -1;
+      bool use_i16 = audio_driver_mixer_use_s16(is_float);
+
+      if (audio_i16_path_logged != (int)use_i16)
+      {
+         const char *rs_ident =
+               (audio_st->resampler && audio_st->resampler->short_ident)
+                     ? audio_st->resampler->short_ident : "resampler";
+         RARCH_LOG("[Audio] %s resampler active path: %s\n",
+               rs_ident,
+               use_i16 ? "integer s16 (no float round-trip)" : "float");
+         audio_i16_path_logged = (int)use_i16;
+      }
+
+      if (use_i16)
+      {
+         struct resampler_data_int16 s16;
+         const int16_t *rs_in = (const int16_t*)data;
+         unsigned rs_frames   = (unsigned)(samples >> 1);
+         double   i16_ratio;
+         unsigned out_frames;
+         bool     synth_on    = midi_driver_synth_active()
+               && audio_st->synth_buf && audio_st->input_data_int16;
+
+         audio_st->stat_frontend_is_float = false;
+
+         /* If an in-process synth is sounding, render its PCM at the input
+          * rate and sum it (converted to s16, saturating) into a writable
+          * copy of the game audio before DSP/resampling - mirroring the float
+          * path, which sums the synth into its pre-resample buffer.  The synth
+          * is added unscaled; the output stage applies the master volume gain
+          * to the combined signal, matching the float path's (game+synth)*gain
+          * ordering. */
+         if (synth_on)
+         {
+            memcpy(audio_st->input_data_int16, data, samples * sizeof(int16_t));
+            if (midi_driver_render_audio(audio_st->synth_buf, rs_frames,
+                     (unsigned)audio_st->input))
+            {
+               size_t s;
+               for (s = 0; s < samples; s++)
+               {
+                  int32_t v  = (int32_t)audio_st->input_data_int16[s]
+                            + audio_float_to_s16_sat(
+                                 audio_st->synth_buf[s]);
+                  if      (v >  32767) v =  32767;
+                  else if (v < -32768) v = -32768;
+                  audio_st->input_data_int16[s] = (int16_t)v;
+               }
+            }
+            rs_in = audio_st->input_data_int16;
+         }
+
+#ifdef HAVE_DSP_FILTER
+         /* Run an int16-capable DSP chain in place on an int16 scratch copy
+          * (the core's buffer is const), then resample its output.  When a
+          * synth was summed above the copy already holds game+synth. */
+         if (audio_st->dsp && audio_st->input_data_int16)
+         {
+            struct retro_dsp_data_int16 dsp_data;
+            if (!synth_on)
+               memcpy(audio_st->input_data_int16, data,
+                     samples * sizeof(int16_t));
+            dsp_data.input        = audio_st->input_data_int16;
+            dsp_data.input_frames = rs_frames;
+            dsp_data.output       = NULL;
+            dsp_data.output_frames = 0;
+            retro_dsp_filter_process_int16(audio_st->dsp, &dsp_data);
+            rs_in     = dsp_data.output;
+            rs_frames = dsp_data.output_frames;
+         }
+#endif
+
+         /* Rate control - identical to the float resampler path below. */
+         if (audio_st->flags & AUDIO_FLAG_CONTROL)
+         {
+            audio_st->samples_since_drc += samples;
+            if (audio_st->samples_since_drc >= audio_st->drc_threshold_int16s)
+               audio_st->src_ratio_curr = audio_st->src_ratio_orig *
+                     audio_driver_compute_rate_adjust(audio_st);
+         }
+         i16_ratio = audio_st->src_ratio_curr;
+         if (is_slowmotion)
+            i16_ratio *= slowmotion_ratio;
+         if (is_fastforward)
+         {
+            if (config_get_ptr()->bools.audio_fastforward_speedup)
+               i16_ratio *= audio_driver_fastforward_ratio_mult(
+                     audio_st, rs_frames);
+            /* Without speedup the device is pinned near full and the
+             * write below drops most of the output; resample only what
+             * it can accept.  See audio_driver_ff_discard_bound. */
+            else
+               rs_frames = (unsigned)audio_driver_ff_discard_bound(
+                     audio_st, i16_ratio, rs_frames);
+         }
+
+         /* The int16 resampler writes to output_samples_int16 with no
+          * capacity argument; bound the ratio to what that buffer holds. */
+         i16_ratio         = audio_driver_bound_ratio(i16_ratio, rs_frames,
+               audio_st->output_samples_int16_length
+                     / (2 * sizeof(int16_t)));
+
+         s16.data_in       = rs_in;
+         s16.data_out      = audio_st->output_samples_int16;
+         s16.input_frames  = rs_frames;
+         s16.output_frames = 0;
+         s16.ratio         = i16_ratio;
+         audio_st->resampler_int16_process(audio_st->resampler_data_int16, &s16);
+
+         out_frames = (unsigned)s16.output_frames;
+
+         if (audio_st->flags & AUDIO_FLAG_USE_FLOAT)
+         {
+            /* Float-output driver: fold volume into the single s16 -> float
+             * pass at the output rate.  The integer resampler already
+             * saturated to the s16 range. */
+            convert_s16_to_float(audio_st->output_samples_buf,
+                  audio_st->output_samples_int16, out_frames * 2,
+                  audio_volume_gain);
+#ifdef HAVE_AUDIOMIXER
+            /* Sum the mixer voices in float on top of the (already
+             * volume-scaled) game audio, mirroring the float path: game gets
+             * the master gain above, voices get mixer_gain here, and
+             * audio_mixer_mix() clamps the summed buffer as its final step. */
+            if (audio_st->flags & AUDIO_FLAG_MIXER_ACTIVE)
+            {
+               bool override                       = true;
+               float mixer_gain                    = 0.0f;
+               bool audio_driver_mixer_mute_enable = audio_st->mixer_mute_enable;
+
+               if (!audio_driver_mixer_mute_enable)
+               {
+                  if (audio_st->mixer_volume_gain == 1.0f)
+                     override                      = false;
+                  mixer_gain                       = audio_st->mixer_volume_gain;
+               }
+               /* s16 voices (the common case on this int16 path): fold onto
+                * the float game buffer first so audio_mixer_mix's final clamp
+                * covers them.  output_samples_int16 is free here -- the game
+                * s16 was already converted to float above. */
+               if (audio_mixer_has_s16_voices())
+                  audio_mixer_fold_s16_voices_into_float(
+                        audio_st->output_samples_buf,
+                        audio_st->output_samples_int16, out_frames,
+                        mixer_gain, override);
+               audio_mixer_mix(audio_st->output_samples_buf,
+                     out_frames, mixer_gain, override);
+            }
+#endif
+            audio->write(audio_st->context_audio_data,
+                  audio_st->output_samples_buf,
+                  out_frames * 2 * sizeof(float));
+         }
+         else
+         {
+            /* s16-output driver: apply volume as a deterministic Q16 gain
+             * (round half away from zero on the shift, saturate).
+             *
+             * The +0x8000 bias before the shift makes this round to
+             * nearest rather than toward zero.  Truncating here costs
+             * ~6 dB of quantisation noise (the error is uniform over
+             * two LSBs instead of one) and opens a deadband of
+             * 2*(65536/gain_q16)-1 input codes around silence, which
+             * swallows low-level detail at heavy attenuation.
+             *
+             * Mirroring the bias across the sign keeps the quantiser
+             * odd-symmetric, so it stays DC-free on symmetric signals
+             * and remains bit-exact reproducible - the s16 path's
+             * determinism guarantee for netplay/rewind is unaffected,
+             * this is integer arithmetic either way.
+             *
+             * No overflow risk: the largest |p| is 32768 * gain_q16,
+             * and gain_q16 tops out at 260904 (+12 dB), so |p| stays
+             * under 2^33. */
+            if (audio_volume_gain != 1.0f)
+            {
+               int32_t  gain_q16 = (int32_t)(audio_volume_gain * 65536.0f + 0.5f);
+               unsigned k;
+               unsigned total    = out_frames * 2;
+               int16_t *ob       = audio_st->output_samples_int16;
+               for (k = 0; k < total; k++)
+               {
+                  int64_t p = (int64_t)ob[k] * gain_q16;
+                  int64_t v = (p >= 0)
+                        ?  ((  p + 0x8000) >> 16)
+                        : -(((-p + 0x8000) >> 16));
+                  if      (v >  32767) v =  32767;
+                  else if (v < -32768) v = -32768;
+                  ob[k] = (int16_t)v;
+               }
+            }
+#ifdef HAVE_AUDIOMIXER
+            /* Sum the mixer voices onto the int16 game audio, in the integer
+             * domain.  Voices played on the s16 path (the common case here,
+             * since the game itself is on the int16 path) are summed
+             * directly via audio_mixer_mix_s16 with saturating add -- no float
+             * scratch, no round-trip.  Any voice that happens to be float (a
+             * voice that outlived a pipeline-format change) is folded via
+             * audio_mixer_mix into output_samples_buf and quantised on top,
+             * matching convert_float_to_s16's rounding. */
+            if (audio_st->flags & AUDIO_FLAG_MIXER_ACTIVE)
+            {
+               bool     override                   = true;
+               float    mixer_gain                 = 0.0f;
+               bool audio_driver_mixer_mute_enable  = audio_st->mixer_mute_enable;
+               int16_t *ob                         = audio_st->output_samples_int16;
+
+               if (!audio_driver_mixer_mute_enable)
+               {
+                  if (audio_st->mixer_volume_gain == 1.0f)
+                     override                      = false;
+                  mixer_gain                       = audio_st->mixer_volume_gain;
+               }
+
+               audio_mixer_mix_s16(ob, out_frames,
+                     GAIN_TO_Q16(mixer_gain), override);
+               if (audio_mixer_has_float_voices())
+                  audio_mixer_fold_float_voices_into_s16(ob,
+                        audio_st->output_samples_buf, out_frames,
+                        mixer_gain, override);
+            }
+#endif
+            audio->write(audio_st->context_audio_data,
+                  audio_st->output_samples_int16,
+                  out_frames * 2 * sizeof(int16_t));
+         }
+         return;
+      }
    }
 
    src_data.data_out                 = NULL;
    src_data.output_frames            = 0;
    /* We'll assign a proper output to the resampler later in this function */
 
-   convert_s16_to_float(audio_st->input_data, data, samples,
-         audio_volume_gain);
+   /* Reached only when neither integer path above returned: the core is
+    * float-native, or an int16 core fell through (s16 path disabled, or a
+    * float-only DSP/condition forced conversion). Either way the pipeline
+    * runs in float from here. */
+   audio_st->stat_frontend_is_float = true;
 
-   /* The resampler operates on floating-point frames,
-    * so we have to convert the input first */
-   src_data.data_in                  = audio_st->input_data;
+   /* Bring the core's audio into the float input buffer the resampler/DSP
+    * operate on. For a float-native core this is just a gain-scaled copy
+    * (or a plain copy at unity gain) - no int16<->float conversion - which
+    * is the whole point of float audio negotiation. */
+   /* Decide whether anything downstream actually needs to write to the
+    * pre-resample buffer.  Only four things ever produce into input_data:
+    * the s16 -> float conversion, a non-unity gain scale, the in-process
+    * synth sum, and the DSP chain (which processes in place because the
+    * core's buffer is const).  When none of them applies - a float-native
+    * core at unity gain with no synth sounding and no DSP filter loaded -
+    * the copy produces a byte-for-byte duplicate that the resampler only
+    * ever reads, since struct resampler_data::data_in is const.  Point the
+    * resampler at the core's buffer instead and skip a full pass over the
+    * batch.  The resampler sees identical bytes either way, so output is
+    * bit-exact.
+    *
+    * The pointer must still be suitably aligned: the CC resampler's ARM
+    * NEON assembly loads its input with an explicit alignment hint
+    * (`vld1.f32 d16, [r1, :64]!` in cc_resampler_neon.S), which faults on
+    * an under-aligned address.  input_data is memalign_alloc(64); a
+    * core-owned buffer carries no such guarantee, so fall back to the copy
+    * unless the pointer is at least 16-byte aligned. */
+   {
+      bool synth_on   = midi_driver_synth_active() && audio_st->synth_buf;
+      bool copy_input = !is_float
+            || (audio_volume_gain != 1.0f)
+            || synth_on
+            || (((uintptr_t)data & 0xf) != 0)
+#ifdef HAVE_DSP_FILTER
+            || (audio_st->dsp != NULL)
+#endif
+            ;
+
+      if (!copy_input)
+         src_data.data_in            = (const float*)data;
+      else
+      {
+         if (is_float)
+         {
+            const float *fin = (const float*)data;
+            if (audio_volume_gain == 1.0f)
+               memcpy(audio_st->input_data, fin, samples * sizeof(float));
+            else
+            {
+               size_t s;
+               for (s = 0; s < samples; s++)
+                  audio_st->input_data[s] = fin[s] * audio_volume_gain;
+            }
+         }
+         else
+            convert_s16_to_float(audio_st->input_data,
+                  (const int16_t*)data, samples, audio_volume_gain);
+
+         /* Mix in-process MIDI synth output (e.g. fmsynth) into the float
+          * input before resampling, so it shares the core's resampler, gain
+          * and output path. No-op unless a render-capable MIDI driver is
+          * active and sounding.  audio_st->synth_buf is allocated to the
+          * same size as input_data. */
+         if (synth_on)
+         {
+            size_t frames = samples >> 1;
+            if (midi_driver_render_audio(audio_st->synth_buf, frames,
+                     (unsigned)audio_st->input))
+            {
+               size_t s;
+               for (s = 0; s < samples; s++)
+                  audio_st->input_data[s] +=
+                        audio_st->synth_buf[s] * audio_volume_gain;
+            }
+         }
+
+         src_data.data_in            = audio_st->input_data;
+      }
+   }
+
    src_data.input_frames             = samples >> 1;
 
    /* Remember, we allocated buffers that are twice as big as needed.
@@ -594,41 +1349,26 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
 
    /* Now the resampler will write to the driver state's scratch buffer */
 
-   /* Count samples. */
+   /* Readjust the audio input rate. Gated on a sample-count threshold
+    * so multi-batch cores update the resampler ratio approximately
+    * once per frame rather than once per batch_cb call. When the
+    * threshold isn't reached, src_ratio_curr retains its previous
+    * value and the resampler runs with the existing ratio. */
+   if (audio_st->flags & AUDIO_FLAG_CONTROL)
    {
-      unsigned write_idx             =
-            audio_st->free_samples_count++ & (AUDIO_BUFFER_FREE_SAMPLES_COUNT - 1);
-
-      /* Readjust the audio input rate. */
-      if (audio_st->flags & AUDIO_FLAG_CONTROL)
+      audio_st->samples_since_drc += samples;
+      if (audio_st->samples_since_drc >= audio_st->drc_threshold_int16s)
       {
-         int avail                   = (int)audio->write_avail(
-               audio_st->context_audio_data);
-         int half_size               = (int)(audio_st->buffer_size / 2);
-         int delta_mid               = avail - half_size;
-         double direction            = (double)delta_mid / half_size;
-         /* Scale rate_control_delta inversely with the resampling ratio
-          * so the effective loop gain stays constant regardless of
-          * output sample rate (e.g. 96 kHz+).  Without this, high
-          * ratios amplify the correction and the controller oscillates,
-          * causing audible volume pumping.
-          *
-          * Only scale down (ratio > 1.0).  At sub-unity ratios the
-          * original delta is already well-tuned and dividing by a
-          * fraction would over-amplify corrections. */
-         double effective_delta      = (audio_st->src_ratio_orig > 1.0)
-               ? audio_st->rate_control_delta / audio_st->src_ratio_orig
-               : audio_st->rate_control_delta;
-         double adjust               = 1.0 + effective_delta * direction;
-
-         audio_st->free_samples_buf[write_idx] = avail;
+         double adjust            = audio_driver_compute_rate_adjust(audio_st);
          audio_st->src_ratio_curr = audio_st->src_ratio_orig * adjust;
 
 #if 0
          if (verbosity_is_enabled())
          {
             RARCH_LOG_OUTPUT("[Audio] Audio buffer is %u%% full\n",
-                  (unsigned)(100 - (avail * 100) /
+                  (unsigned)(100 - (audio_st->free_samples_buf[
+                     (audio_st->free_samples_count - 1)
+                     & (AUDIO_BUFFER_FREE_SAMPLES_COUNT - 1)] * 100) /
                      audio_st->buffer_size));
             RARCH_LOG_OUTPUT("[Audio] New rate: %lf, Orig rate: %lf\n",
                   audio_st->src_ratio_curr,
@@ -643,42 +1383,91 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
    if (is_slowmotion)
       src_data.ratio       *= slowmotion_ratio;
 
-   if (is_fastforward && config_get_ptr()->bools.audio_fastforward_speedup)
+   if (is_fastforward)
    {
-      const retro_time_t flush_time = cpu_features_get_time_usec();
-
-      if (audio_st->last_flush_time > 0)
-      {
-         /* What we should see if the speed was 1.0x, converted to microsecs */
-         const double expected_flush_delta =
-            (src_data.input_frames / audio_st->input * 1000000);
-         /* Exponential moving average of the last AUDIO_FF_EXP_AVG_SAMPLES
-            samples. This helps make sure pitches are recognizable by avoiding
-            too much variance flush-to-flush.
-
-            It's not needed to avoid crackling (the generated waves are going to
-            be continuous either way), but it's important to avoid time
-            compression and decompression every single frame, which would make
-            sounds irrecognizable.
-
-            https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
-          */
-         const retro_time_t n      = AUDIO_FF_EXP_AVG_SAMPLES;
-         audio_st->avg_flush_delta = audio_st->avg_flush_delta * (n - 1) / n +
-            (flush_time - audio_st->last_flush_time) / n;
-
-         /* How much does the avg_flush_delta deviate
-          * from the delta at 1.0x speed? */
-         src_data.ratio *=
-            MAX(AUDIO_MIN_RATIO,
-                  MIN(AUDIO_MAX_RATIO,
-                     audio_st->avg_flush_delta / expected_flush_delta));
-      }
-
-      audio_st->last_flush_time = flush_time;
+      if (config_get_ptr()->bools.audio_fastforward_speedup)
+         src_data.ratio *= audio_driver_fastforward_ratio_mult(
+               audio_st, src_data.input_frames);
+      /* Without speedup the device is pinned near full and the write
+       * below drops most of the output; resample only what it can
+       * accept.  See audio_driver_ff_discard_bound. */
+      else
+         src_data.input_frames = audio_driver_ff_discard_bound(
+               audio_st, src_data.ratio, src_data.input_frames);
    }
 
-   audio_st->resampler->process(audio_st->resampler_data, &src_data);
+   /* Bound the ratio to what the output scratch holds.  The float result is
+    * later narrowed into output_samples_int16 for s16 drivers, so take the
+    * smaller of the two capacities rather than assuming they match. */
+   {
+      size_t cap_f = audio_st->output_samples_buf_length
+            / (2 * sizeof(float));
+      size_t cap_i = audio_st->output_samples_int16_length
+            / (2 * sizeof(int16_t));
+
+      src_data.ratio = audio_driver_bound_ratio(src_data.ratio,
+            src_data.input_frames, (cap_f < cap_i) ? cap_f : cap_i);
+   }
+
+   /* Unity passthrough: with dynamic rate control disabled the resampler
+    * ratio is static, and when it is exactly 1.0 (input rate == output
+    * rate, no slow-motion / fast-forward pitch change) the resampler would
+    * only apply its non-identity unity-ratio response for no benefit.
+    * Copy the already gain/synth/DSP-processed input straight to the output
+    * buffer instead, skipping the convolution (and, for int16 drivers, the
+    * s16<->float round-trip performed in the write stage below).
+    *
+    * process() is skipped while passing through, so the resampler ring goes
+    * stale; on the transition back to real resampling (slow-motion or fast-
+    * forward engaged) re-initialise it first so it resumes from a clean
+    * state rather than convolving new input against stale samples.  The
+    * transition is rare and already an audio-discontinuity moment, so the
+    * one-off realloc there is not on the steady-state hot path.
+    *
+    * Gated on DRC not actually adjusting: with rate control active and a
+    * non-zero delta, src_ratio_curr is dithered every batch to track A/V
+    * sync and is essentially never a stable 1.0, which would otherwise
+    * toggle the bypass and thrash the resampler state.
+    *
+    * A zero delta is the exception, and it is a setting the user can reach:
+    * the 'Dynamic Audio Rate Control' menu item is audio_rate_control_delta,
+    * a float whose range starts at 0.000, and moving it to zero does not
+    * clear AUDIO_FLAG_CONTROL - that flag comes from the separate
+    * audio_rate_control bool.  At delta zero
+    * audio_driver_compute_rate_adjust() returns 1.0 + 0 * direction, i.e.
+    * exactly 1.0, so src_ratio_curr is pinned to src_ratio_orig and there is
+    * nothing to dither.  Testing the flag alone therefore sent every
+    * rate-matched user who had turned the slider down to zero through a full
+    * sinc convolution for an identity resample: measured at 10.7 us per
+    * 512-frame batch against 1.6 us for the bypass, on every flush.
+    *
+    * If the slider is moved back off zero the ratio starts moving, the
+    * bypass stops being taken, and the existing resampler_bypassed
+    * transition re-initialises the ring - the same path already used when
+    * slow-motion or fast-forward engages. */
+   if (     (   !(audio_st->flags & AUDIO_FLAG_CONTROL)
+             || audio_st->rate_control_delta == 0.0f)
+         && src_data.ratio == 1.0)
+   {
+      memcpy(audio_st->output_samples_buf, src_data.data_in,
+            src_data.input_frames * 2 * sizeof(float));
+      src_data.output_frames       = src_data.input_frames;
+      audio_st->resampler_bypassed = true;
+   }
+   else
+   {
+      if (audio_st->resampler_bypassed)
+      {
+         audio_st->resampler_bypassed = false;
+         retro_resampler_realloc(&audio_st->resampler_data,
+               &audio_st->resampler, audio_st->resampler_ident,
+               audio_st->resampler_quality, audio_st->src_ratio_orig);
+      }
+      if (audio_st->resampler_data)
+         audio_st->resampler->process(audio_st->resampler_data, &src_data);
+      else
+         src_data.output_frames = 0;
+   }
 
 #ifdef HAVE_AUDIOMIXER
    if (audio_st->flags & AUDIO_FLAG_MIXER_ACTIVE)
@@ -694,6 +1483,16 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          mixer_gain                       = audio_st->mixer_volume_gain;
 
       }
+      /* Fold any s16 voices (played while the int16 path was active, now on
+       * the float path) onto the float buffer before the float mix, so the
+       * clamp inside audio_mixer_mix covers them.  output_samples_int16 is
+       * unused until the float->s16 driver conversion further below. */
+      if (audio_mixer_has_s16_voices())
+         audio_mixer_fold_s16_voices_into_float(
+               audio_st->output_samples_buf,
+               audio_st->output_samples_int16,
+               (unsigned)src_data.output_frames,
+               mixer_gain, override);
       audio_mixer_mix(audio_st->output_samples_buf,
             src_data.output_frames, mixer_gain, override);
    }
@@ -743,15 +1542,36 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          unsigned total_samples  = output_frames * 2; /* stereo */
          float *buf              = audio_st->output_samples_buf;
 
-#if (defined(__ARM_NEON__) || defined(HAVE_NEON))
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
          if (clamp_float_neon_enabled)
          {
             float32x4_t vpos1 = vdupq_n_f32( 1.0f);
             float32x4_t vneg1 = vdupq_n_f32(-1.0f);
+            uint32x4_t  vabsm = vdupq_n_u32(0x7FFFFFFFu);
+            uint32x4_t  vinfb = vdupq_n_u32(0x7F800000u);
             for (; i + 8 <= total_samples; i += 8)
             {
                float32x4_t v0 = vld1q_f32(buf + i);
                float32x4_t v1 = vld1q_f32(buf + i + 4);
+               /* Squash NaN to silence first: vmin/vmax propagate a NaN
+                * rather than clamping it, so without this it would reach
+                * the driver untouched.
+                *
+                * The test is on the bit pattern (NaN iff the exponent is
+                * all ones and the mantissa is non-zero, i.e. the value
+                * masked of its sign exceeds the +inf encoding) rather
+                * than vceqq_f32(v, v): -Ofast (HAVE_C_A7A7) implies
+                * -ffinite-math-only, under which GCC folds the float
+                * compare to all-ones and drops the mask entirely.
+                * Integer compares are immune to that. */
+               {
+                  uint32x4_t b0 = vreinterpretq_u32_f32(v0);
+                  uint32x4_t b1 = vreinterpretq_u32_f32(v1);
+                  v0 = vreinterpretq_f32_u32(vandq_u32(b0,
+                        vcleq_u32(vandq_u32(b0, vabsm), vinfb)));
+                  v1 = vreinterpretq_f32_u32(vandq_u32(b1,
+                        vcleq_u32(vandq_u32(b1, vabsm), vinfb)));
+               }
                v0             = vminq_f32(v0, vpos1);
                v0             = vmaxq_f32(v0, vneg1);
                v1             = vminq_f32(v1, vpos1);
@@ -767,6 +1587,14 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
             for (; i + 4 <= total_samples; i += 4)
             {
                __m128 v = _mm_loadu_ps(buf + i);
+               /* Squash NaN to silence first. _mm_min_ps/_mm_max_ps
+                * return their second operand when either input is NaN,
+                * which would silently turn a NaN into full scale here.
+                * _mm_cmpord_ps(v, v) is all-zero only for NaN lanes, and
+                * unlike a plain float compare it survives -ffast-math
+                * because it lowers to cmpordps directly. Kept as an SSE1
+                * op so the SSE-without-SSE2 build still compiles. */
+               v        = _mm_and_ps(v, _mm_cmpord_ps(v, v));
                v        = _mm_min_ps(v, vpos1);
                v        = _mm_max_ps(v, vneg1);
                _mm_storeu_ps(buf + i, v);
@@ -775,8 +1603,17 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
 #endif
          for (; i < total_samples; i++)
          {
-            if (buf[i] > 1.0f)
-               buf[i] = 1.0f;
+            /* NaN fails both ordered comparisons below, so test for it
+             * explicitly. The test is done on the bit pattern rather than
+             * as (v != v) because -Ofast (HAVE_C_A7A7) implies -ffast-math,
+             * under which the compiler is entitled to fold that to false.
+             * Zero matches wav_to_s16's handling of non-finite input. */
+            uint32_t bits;
+            memcpy(&bits, &buf[i], sizeof(bits));
+            if      ((bits & 0x7FFFFFFFu) > 0x7F800000u)
+               buf[i] =  0.0f;
+            else if (buf[i] >  1.0f)
+               buf[i] =  1.0f;
             else if (buf[i] < -1.0f)
                buf[i] = -1.0f;
          }
@@ -788,10 +1625,10 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          output_frames       *= sizeof(float); /* Unit: bytes */
       else
       {
-         convert_float_to_s16(audio_st->output_samples_conv_buf,
+         convert_float_to_s16(audio_st->output_samples_int16,
                (const float*)output_data, output_frames * 2);
 
-         output_data          = audio_st->output_samples_conv_buf;
+         output_data          = audio_st->output_samples_int16;
          output_frames       *= sizeof(int16_t);  /* Unit: bytes */
       }
 
@@ -817,6 +1654,11 @@ const char *audio_driver_mixer_get_stream_name(unsigned i)
    return msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE);
 }
 
+unsigned audio_driver_mixer_get_streams_playing(void)
+{
+   return audio_driver_st.mixer_streams_playing;
+}
+
 #endif
 
 bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
@@ -838,6 +1680,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
    int16_t *out_conv_buf          = (int16_t*)memalign_alloc(64, outsamples_max * sizeof(int16_t));
    size_t audio_buf_length        = max_buffer_samples * sizeof(float);
    float *audio_buf               = (float*)memalign_alloc(64, audio_buf_length);
+   float *synth_buf               = (float*)memalign_alloc(64, audio_buf_length);
    bool verbosity_enabled         = verbosity_is_enabled();
 #ifdef HAVE_REWIND
    int16_t *rewind_buf            = NULL;
@@ -855,14 +1698,22 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
    audio_driver_clamp_init_simd();
 
    if (!out_conv_buf || !audio_buf)
+   {
+      if (synth_buf)
+         memalign_free(synth_buf);
       goto error;
+   }
 
    memset(audio_buf, 0, audio_buf_length);
 
    audio_driver_st.input_data                     = audio_buf;
+   audio_driver_st.synth_buf                      = synth_buf;
    audio_driver_st.input_data_length              = audio_buf_length;
-   audio_driver_st.output_samples_conv_buf        = out_conv_buf;
-   audio_driver_st.output_samples_conv_buf_length = outsamples_max * sizeof(int16_t);
+   /* Allocated further down, once it is known whether an int16 resampler
+    * exists; the s16 path that uses it cannot run without one. */
+   audio_driver_st.input_data_int16               = NULL;
+   audio_driver_st.output_samples_int16        = out_conv_buf;
+   audio_driver_st.output_samples_int16_length = outsamples_max * sizeof(int16_t);
    audio_driver_st.chunk_block_size               = AUDIO_CHUNK_SIZE_BLOCKING;
    audio_driver_st.chunk_nonblock_size            = AUDIO_CHUNK_SIZE_NONBLOCKING;
    audio_driver_st.chunk_size                     = AUDIO_CHUNK_SIZE_BLOCKING;
@@ -984,6 +1835,94 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
       audio_driver_st.flags &= ~AUDIO_FLAG_ACTIVE;
    }
 
+   /* Freshly (re)allocated resampler: ring is clean, not in passthrough. */
+   audio_driver_st.resampler_bypassed = false;
+
+   /* Deterministic integer (s16) path: allocate an int16 resampler
+    * mirroring the float one when the selected backend has an int16
+    * implementation.  It is used by audio_driver_flush() for int16 cores
+    * unless a MIDI synth is sounding or a float-only DSP filter is loaded;
+    * DSP (int16-capable), the mixer, non-unity gain and fast-forward speedup
+    * are all handled in the integer domain.  Otherwise the float path runs. */
+   if (audio_driver_st.resampler_data_int16 && audio_driver_st.resampler_int16_free)
+   {
+      audio_driver_st.resampler_int16_free(audio_driver_st.resampler_data_int16);
+      audio_driver_st.resampler_data_int16 = NULL;
+   }
+   audio_driver_st.resampler_data_int16  = NULL;
+   audio_driver_st.resampler_int16_process = NULL;
+   audio_driver_st.resampler_int16_free    = NULL;
+   if (     audio_driver_st.resampler
+         && audio_driver_st.resampler->short_ident)
+   {
+      const char *rs_ident = audio_driver_st.resampler->short_ident;
+      if (string_is_equal(rs_ident, "sinc"))
+      {
+         audio_driver_st.resampler_data_int16 = sinc_resampler_int16_init(
+               audio_driver_st.src_ratio_orig,
+               audio_sinc_int16_quality_map(audio_driver_st.resampler_quality));
+         audio_driver_st.resampler_int16_process = sinc_resampler_int16_process;
+         audio_driver_st.resampler_int16_free    = sinc_resampler_int16_free;
+      }
+#ifdef HAVE_NEAREST_RESAMPLER
+      else if (string_is_equal(rs_ident, "nearest"))
+      {
+         audio_driver_st.resampler_data_int16 = nearest_resampler_int16_init();
+         audio_driver_st.resampler_int16_process = nearest_resampler_int16_process;
+         audio_driver_st.resampler_int16_free    = nearest_resampler_int16_free;
+      }
+#endif
+#ifdef HAVE_CC_RESAMPLER
+      else if (string_is_equal(rs_ident, "cc"))
+      {
+         audio_driver_st.resampler_data_int16 = cc_resampler_int16_init(
+               audio_driver_st.src_ratio_orig);
+         audio_driver_st.resampler_int16_process = cc_resampler_int16_process;
+         audio_driver_st.resampler_int16_free    = cc_resampler_int16_free;
+      }
+#endif
+      if (audio_driver_st.resampler_int16_process)
+         RARCH_LOG("[Audio] %s resampler: integer s16 path %s.\n",
+               rs_ident,
+               audio_driver_st.resampler_data_int16
+                     ? "available" : "unavailable");
+   }
+
+   /* int16 scratch for the s16 path.  Same frame capacity as
+    * input_data, in int16.  Only reachable when resampler_data_int16 is
+    * non-NULL (audio_driver_mixer_use_s16 gates on it), so allocating it
+    * unconditionally at the top of this function burned a full
+    * max_buffer_samples * sizeof(int16_t) block on every configuration
+    * whose resampler has no integer implementation, or whose int16 init
+    * failed.
+    *
+    * The gate is deliberately the resampler and nothing else.  The scratch
+    * is only *touched* when a synth is sounding or a DSP filter is loaded,
+    * but both of those are runtime state that can change without an audio
+    * reinit - and audio_fastpath_s16 is CMD_EVENT_NONE, so toggling the
+    * hint does not reinit either.  Narrowing the gate to any of them would
+    * leave the s16 path live against a NULL scratch. */
+   if (audio_driver_st.resampler_data_int16)
+   {
+      audio_driver_st.input_data_int16 = (int16_t*)memalign_alloc(64,
+            max_buffer_samples * sizeof(int16_t));
+
+      if (!audio_driver_st.input_data_int16)
+      {
+         /* Drop the int16 resampler so flush falls back to the float path,
+          * which needs no scratch.  Leaving the s16 path enabled against a
+          * NULL scratch would not crash - the synth and DSP branches are
+          * both guarded - but the DSP branch would then be silently skipped
+          * and a loaded filter would stop being applied. */
+         if (audio_driver_st.resampler_int16_free)
+            audio_driver_st.resampler_int16_free(
+                  audio_driver_st.resampler_data_int16);
+         audio_driver_st.resampler_data_int16    = NULL;
+         audio_driver_st.resampler_int16_process = NULL;
+         audio_driver_st.resampler_int16_free    = NULL;
+      }
+   }
+
    audio_driver_st.data_ptr = 0;
 
    out_samples_buf = (float*)memalign_alloc(64, outsamples_max * sizeof(float));
@@ -1002,13 +1941,31 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          )
    {
       /* Audio rate control requires write_avail
-       * and buffer_size to be implemented. */
+       * and buffer_size to be implemented.
+       *
+       * The reported size must also be usable: it is the DRC setpoint's
+       * denominator (half_size in audio_driver_compute_rate_adjust), so
+       * zero yields an infinite or NaN rate_adjust. That propagates into
+       * src_ratio_curr, and the sinc drivers' fixed-point time step is
+       * (uint32_t)(phases / ratio), which collapses to 0 - leaving
+       * `while (time < phases) { ...; time += 0; }` spinning and writing
+       * past the output buffer. Several drivers can legitimately report
+       * 0 here (asio, xaudio and both libnx audren drivers return 0 on a
+       * null handle; audioio returns 0 when its ioctl fails), and oss
+       * already carries a local "return something non-zero to avoid
+       * SIGFPE" workaround for the same hazard. Check it once, centrally,
+       * and fall back to no rate control rather than making every driver
+       * defend itself. */
       if (audio_driver_st.current_audio->buffer_size)
       {
          audio_driver_st.buffer_size =
             audio_driver_st.current_audio->buffer_size(
                   audio_driver_st.context_audio_data);
-         audio_driver_st.flags |= AUDIO_FLAG_CONTROL;
+         if (audio_driver_st.buffer_size > 0)
+            audio_driver_st.flags |= AUDIO_FLAG_CONTROL;
+         else
+            RARCH_WARN("[Audio] Rate control was desired, but the driver "
+                  "reported a zero buffer size.\n");
       }
       else
          RARCH_WARN("[Audio] Rate control was desired, but driver does not support needed features.\n");
@@ -1017,6 +1974,16 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
    command_event(CMD_EVENT_DSP_FILTER_INIT, NULL);
 
    audio_driver_st.free_samples_count = 0;
+
+   /* Reset DRC rate-limit state. cached_rate_adjust defaults to 1.0
+    * (no adjustment) for the brief window before the first compute
+    * crosses audio_st->drc_threshold_int16s. drc_threshold_int16s is
+    * recomputed from the just-set input rate and av_info.timing.fps;
+    * since SET_SYSTEM_AV_INFO drives audio reinit, mid-session rate
+    * or fps changes flow through this same path. */
+   audio_driver_st.cached_rate_adjust = 1.0;
+   audio_driver_st.samples_since_drc  = 0;
+   audio_driver_update_drc_threshold(&audio_driver_st);
 
 #ifdef HAVE_AUDIOMIXER
    audio_mixer_init(settings->uints.audio_output_sample_rate);
@@ -1038,12 +2005,12 @@ void audio_driver_sample(int16_t left, int16_t right)
    uint32_t runloop_flags;
    audio_driver_state_t *audio_st  = &audio_driver_st;
    recording_state_t *recording_st = NULL;
-   if (!audio_st || !audio_st->output_samples_conv_buf)
+   if (!audio_st || !audio_st->output_samples_int16)
       return;
    if (audio_st->flags & AUDIO_FLAG_SUSPENDED)
       return;
-   audio_st->output_samples_conv_buf[audio_st->data_ptr++] = left;
-   audio_st->output_samples_conv_buf[audio_st->data_ptr++] = right;
+   audio_st->output_samples_int16[audio_st->data_ptr++] = left;
+   audio_st->output_samples_int16[audio_st->data_ptr++] = right;
 
    if (audio_st->data_ptr < audio_st->chunk_size)
       return;
@@ -1057,7 +2024,7 @@ void audio_driver_sample(int16_t left, int16_t right)
    {
       struct record_audio_data ffemu_data;
 
-      ffemu_data.data               = audio_st->output_samples_conv_buf;
+      ffemu_data.data               = audio_st->output_samples_int16;
       ffemu_data.frames             = audio_st->data_ptr / 2;
 
       recording_st->driver->push_audio(recording_st->data, &ffemu_data);
@@ -1068,8 +2035,8 @@ void audio_driver_sample(int16_t left, int16_t right)
          || !(audio_st->output_samples_buf)))
       audio_driver_flush(audio_st,
             config_get_ptr()->floats.slowmotion_ratio,
-            audio_st->output_samples_conv_buf,
-            audio_st->data_ptr,
+            audio_st->output_samples_int16,
+            audio_st->data_ptr, false,
             (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
             (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
 
@@ -1123,7 +2090,99 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
 
       if (flush_audio)
          audio_driver_flush(audio_st, slowmotion_ratio, data,
-               frames_to_write << 1,
+               frames_to_write << 1, false,
+               (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
+               (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+
+      frames_remaining -= frames_to_write;
+      data             += frames_to_write << 1;
+   } while (frames_remaining > 0);
+
+   return frames;
+}
+
+/* Float counterpart of audio_driver_sample_batch(). Used only when the
+ * core negotiated float output via
+ * RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT. 'data' is interleaved
+ * stereo float in [-1.0, 1.0]; 'frames' is the frame count (2 floats per
+ * frame). Funnels into the same audio_driver_flush() as the int16 path,
+ * but with is_float=true so the redundant int16->float conversion is
+ * skipped. Recording and reverse-audio (rewind), which are int16
+ * subsystems, are bridged here by converting only the affected chunk. */
+size_t audio_driver_sample_batch_float(const float *data, size_t frames)
+{
+   uint32_t runloop_flags;
+   bool recording_push_audio      = false;
+   bool flush_audio               = false;
+   size_t frames_remaining        = frames;
+   recording_state_t *record_st   = recording_state_get_ptr();
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   float slowmotion_ratio         = config_get_ptr()->floats.slowmotion_ratio;
+
+   if ((audio_st->flags & AUDIO_FLAG_SUSPENDED) || (frames < 1))
+      return frames;
+
+#ifdef HAVE_REWIND
+   /* While frames are being played in reverse, the int16 path swaps the
+    * core callback to audio_driver_sample_batch_rewind(). A float core
+    * keeps the cached float pointer, so replicate that routing here:
+    * convert to int16 and store into the reverse buffer. */
+   if (state_manager_frame_is_reversed())
+   {
+      size_t i;
+      size_t samples = frames << 1;
+      for (i = 0; i < samples; i++)
+      {
+         if (audio_st->rewind_ptr < 1)
+            break;
+         /* Inline saturating float->s16 to avoid an extra scratch copy.
+          * Must round the same way convert_float_to_s16() does - half
+          * away from zero - not truncate: the recording bridge lower in
+          * this same function calls that converter directly, and a
+          * truncating variant here would quantise the rewind audio with
+          * twice the error and a one-LSB dead band around silence. */
+         audio_st->rewind_buf[--audio_st->rewind_ptr] =
+               (int16_t)audio_float_to_s16_sat(data[i]);
+      }
+      return frames;
+   }
+#endif
+
+   runloop_flags                  = runloop_get_flags();
+   flush_audio                    = !((runloop_flags & RUNLOOP_FLAG_PAUSED)
+            || !(audio_st->flags & AUDIO_FLAG_ACTIVE)
+            || !(audio_st->output_samples_buf));
+   recording_push_audio           = record_st->data
+           && record_st->driver
+           && record_st->driver->push_audio;
+
+   do
+   {
+      size_t frames_to_write =
+            (frames_remaining > (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1))
+                  ? (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1)
+                  : frames_remaining;
+
+      /* The recorder consumes int16. Convert just this chunk into the
+       * int16 scratch buffer (sized for >= a full chunk) and hand that
+       * over; push_audio copies synchronously, matching how the int16
+       * single-sample path reuses output_samples_int16. */
+      if (recording_push_audio && audio_st->output_samples_int16)
+      {
+         struct record_audio_data ffemu_data;
+
+         convert_float_to_s16(audio_st->output_samples_int16,
+               data, frames_to_write << 1);
+
+         ffemu_data.data   = audio_st->output_samples_int16;
+         ffemu_data.frames = frames_to_write;
+
+         record_st->driver->push_audio(record_st->data, &ffemu_data);
+      }
+
+      if (flush_audio)
+         audio_driver_flush(audio_st, slowmotion_ratio, data,
+               frames_to_write << 1, true,
                (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
                (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
 
@@ -1198,7 +2257,22 @@ bool audio_driver_dsp_filter_init(const char *device)
 
 void audio_driver_set_buffer_size(size_t bufsize)
 {
-   audio_driver_st.buffer_size = bufsize;
+   /* Ignore zero. buffer_size is a divisor for every consumer that reads
+    * it - the DRC setpoint in audio_driver_compute_rate_adjust() and the
+    * saturation / water-mark statistics in
+    * audio_compute_buffer_statistics() - and the init-time gate on
+    * AUDIO_FLAG_CONTROL only covers the value the driver reported when it
+    * was opened. This setter is the one path that can replace it later:
+    * pulse calls it from inside write_avail() on every sample and notes
+    * there that the size "can change spuriously". Keeping the last known
+    * good size degrades to a slightly stale setpoint; adopting a zero
+    * feeds inf/NaN into the statistics overlay and forces
+    * close_to_underrun to 100%.
+    *
+    * Guarding here rather than at each consumer means anything added
+    * later inherits the invariant instead of having to rediscover it. */
+   if (bufsize > 0)
+      audio_driver_st.buffer_size = bufsize;
 }
 
 #ifdef HAVE_REWIND
@@ -1214,11 +2288,11 @@ void audio_driver_setup_rewind(void)
    {
       if (audio_st->rewind_ptr > 0)
          audio_st->rewind_buf[--audio_st->rewind_ptr] =
-            audio_st->output_samples_conv_buf[i + 1];
+            audio_st->output_samples_int16[i + 1];
 
       if (audio_st->rewind_ptr > 0)
          audio_st->rewind_buf[--audio_st->rewind_ptr] =
-            audio_st->output_samples_conv_buf[i + 0];
+            audio_st->output_samples_int16[i + 0];
    }
 
    audio_st->data_ptr = 0;
@@ -1237,11 +2311,11 @@ bool audio_driver_get_devices_list(void **data)
 #ifdef HAVE_AUDIOMIXER
 bool audio_driver_mixer_extension_supported(const char *ext)
 {
-#ifdef HAVE_STB_VORBIS
+#ifdef HAVE_RVORBIS
    if (string_is_equal_noncase("ogg", ext))
       return true;
 #endif
-#ifdef HAVE_IBXM
+#ifdef HAVE_RMODTRACKER
    if (string_is_equal_noncase("mod", ext))
       return true;
    if (string_is_equal_noncase("s3m", ext))
@@ -1249,12 +2323,28 @@ bool audio_driver_mixer_extension_supported(const char *ext)
    if (string_is_equal_noncase("xm", ext))
       return true;
 #endif
-#ifdef HAVE_DR_FLAC
+#ifdef HAVE_RFLAC
    if (string_is_equal_noncase("flac", ext))
       return true;
 #endif
-#ifdef HAVE_DR_MP3
+#ifdef HAVE_RMP3
    if (string_is_equal_noncase("mp3", ext))
+      return true;
+#endif
+#ifdef HAVE_RAAC
+#ifdef HAVE_RMP4
+   if (string_is_equal_noncase("m4a", ext))
+      return true;
+#endif
+   if (string_is_equal_noncase("aac", ext))
+      return true;
+#endif
+#ifdef HAVE_ROPUS
+   if (string_is_equal_noncase("opus", ext))
+      return true;
+#endif
+#if defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))
+   if (string_is_equal_noncase("weba", ext))
       return true;
 #endif
    if (string_is_equal_noncase("wav", ext))
@@ -1418,8 +2508,16 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
    bool looped                   = (params->state == AUDIO_STREAM_STATE_PLAYING_LOOPED);
    void *buf                     = NULL;
 
+   /* Ownership of params->buf_owner transfers on this call in every
+    * outcome: each failure return releases it. */
+   if (params->out_slot)
+      *params->out_slot = -1;
    if (params->stream_type == AUDIO_STREAM_TYPE_NONE)
+   {
+      if (params->buf_owner)
+         params->buf_owner_free(params->buf_owner);
       return false;
+   }
 
    switch (params->slot_selection_type)
    {
@@ -1436,45 +2534,88 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
       default:
          if (!audio_driver_mixer_get_free_stream_slot(
                   &free_slot, params->stream_type))
+         {
+            if (params->buf_owner)
+               params->buf_owner_free(params->buf_owner);
             return false;
+         }
          break;
    }
 
    if (params->state == AUDIO_STREAM_STATE_NONE)
+   {
+      if (params->buf_owner)
+         params->buf_owner_free(params->buf_owner);
       return false;
+   }
 
-   if (!(buf = malloc(params->bufsize)))
-      return false;
-
-   memcpy(buf, params->buf, params->bufsize);
+   if (params->buf_owner)
+      /* borrowed: the sound reads straight out of the owner's bytes,
+       * and destroy hands them back - no copy is made */
+      buf = params->buf;
+   else
+   {
+      if (!(buf = malloc(params->bufsize)))
+         return false;
+      memcpy(buf, params->buf, params->bufsize);
+   }
 
    switch (params->type)
    {
       case AUDIO_MIXER_TYPE_WAV:
-         handle = audio_mixer_load_wav(buf, (int32_t)params->bufsize,
+         handle = audio_mixer_load_wav(buf, params->bufsize,
                audio_driver_st.resampler_ident,
-               audio_driver_st.resampler_quality);
+               audio_driver_st.resampler_quality,
+               audio_driver_mixer_use_s16(
+                     audio_driver_st.stat_core_is_float));
          /* WAV is a special case - input buffer is not
           * free()'d when sound playback is complete (it is
           * converted to a PCM buffer, which is free()'d instead),
-          * so have to do it here */
-         free(buf);
+          * so release the source here */
+         if (params->buf_owner)
+            params->buf_owner_free(params->buf_owner);
+         else
+            free(buf);
          buf = NULL;
          break;
+      case AUDIO_MIXER_TYPE_WAV_STREAM:
+         /* unlike AUDIO_MIXER_TYPE_WAV above, nothing is decoded at
+          * load: the sound keeps these bytes and reads frames from
+          * them as it mixes, so the source stays owned by the sound
+          * (or by its lender) exactly as the compressed types' does */
+         handle = audio_mixer_load_wav_stream(buf,
+               params->bufsize);
+         break;
       case AUDIO_MIXER_TYPE_OGG:
-         handle = audio_mixer_load_ogg(buf, (int32_t)params->bufsize);
+         handle = audio_mixer_load_ogg(buf, params->bufsize);
          break;
       case AUDIO_MIXER_TYPE_MOD:
-         handle = audio_mixer_load_mod(buf, (int32_t)params->bufsize);
+         handle = audio_mixer_load_mod(buf, params->bufsize);
          break;
       case AUDIO_MIXER_TYPE_FLAC:
-#ifdef HAVE_DR_FLAC
-         handle = audio_mixer_load_flac(buf, (int32_t)params->bufsize);
+#ifdef HAVE_RFLAC
+         handle = audio_mixer_load_flac(buf, params->bufsize);
 #endif
          break;
       case AUDIO_MIXER_TYPE_MP3:
-#ifdef HAVE_DR_MP3
-         handle = audio_mixer_load_mp3(buf, (int32_t)params->bufsize);
+#ifdef HAVE_RMP3
+         handle = audio_mixer_load_mp3(buf, params->bufsize);
+#endif
+         break;
+      case AUDIO_MIXER_TYPE_M4A:
+#ifdef HAVE_RAAC
+         handle = audio_mixer_load_m4a(buf, params->bufsize);
+#endif
+         break;
+      case AUDIO_MIXER_TYPE_OPUS:
+#ifdef HAVE_ROPUS
+         handle = audio_mixer_load_opus(buf, params->bufsize);
+#endif
+         break;
+      case AUDIO_MIXER_TYPE_WEBA:
+#if defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))
+         handle = audio_mixer_load_weba_avail(buf, params->bufsize,
+               params->avail);
 #endif
          break;
       case AUDIO_MIXER_TYPE_NONE:
@@ -1483,9 +2624,29 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
 
    if (!handle)
    {
-      free(buf);
+      if (params->buf_owner)
+      {
+         /* WAV already released above; buf is NULL there */
+         if (buf)
+            params->buf_owner_free(params->buf_owner);
+      }
+      else
+         free(buf);
       return false;
    }
+
+#ifdef HAVE_ROPUS
+   /* Windowed Ogg-Opus supplies the last-page granule so the decoder
+    * skips its full-file end scan when it opens at play time. */
+   if (params->end_granule > 0)
+      audio_mixer_sound_set_end_granule(handle, params->end_granule);
+#endif
+   /* NOT under HAVE_ROPUS: the resident bound applies to every
+    * windowed arm, and a build without Opus silently dropped it -
+    * the decoder then opened against the whole file's length with
+    * only the head committed. */
+   if (params->avail)
+      audio_mixer_sound_set_avail(handle, params->avail);
 
    switch (params->state)
    {
@@ -1494,13 +2655,24 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
          /* fall-through */
       case AUDIO_STREAM_STATE_PLAYING_LOOPED:
       case AUDIO_STREAM_STATE_PLAYING:
-         voice = audio_mixer_play(handle, looped, params->volume,
-               audio_driver_st.resampler_ident,
-               audio_driver_st.resampler_quality, stop_cb);
+         if (audio_driver_mixer_use_s16(audio_driver_st.stat_core_is_float))
+            voice = audio_mixer_play_s16(handle, looped,
+                  GAIN_TO_Q16(params->volume),
+                  audio_driver_st.resampler_quality, stop_cb);
+         else
+            voice = audio_mixer_play(handle, looped, params->volume,
+                  audio_driver_st.resampler_ident,
+                  audio_driver_st.resampler_quality, stop_cb);
          break;
       default:
          break;
    }
+
+   if (params->buf_owner && buf)
+      /* the sound holds the borrowed bytes for its lifetime; destroy
+       * hands the owner back */
+      audio_mixer_sound_set_data_owner(handle,
+            params->buf_owner, params->buf_owner_free);
 
    audio_driver_st.flags |= AUDIO_FLAG_MIXER_ACTIVE;
 
@@ -1520,7 +2692,34 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
        || params->state == AUDIO_STREAM_STATE_PLAYING_SEQUENTIAL)
       audio_driver_st.mixer_streams_playing++;
 
+   if (params->out_slot)
+      *params->out_slot = (int)free_slot;
+
    return true;
+}
+
+int64_t audio_driver_mixer_stream_byte_tell(unsigned i)
+{
+   audio_mixer_voice_t *voice;
+   if (i >= AUDIO_MIXER_MAX_SYSTEM_STREAMS)
+      return -1;
+   if (audio_driver_st.mixer_streams[i].state == AUDIO_STREAM_STATE_NONE)
+      return -1;
+   if (!(voice = audio_driver_st.mixer_streams[i].voice))
+      return -1;
+   return (int64_t)audio_mixer_voice_buffer_tell(voice);
+}
+
+void audio_driver_mixer_stream_set_avail(unsigned i, size_t avail)
+{
+   audio_mixer_voice_t *voice;
+   if (i >= AUDIO_MIXER_MAX_SYSTEM_STREAMS)
+      return;
+   if (audio_driver_st.mixer_streams[i].state == AUDIO_STREAM_STATE_NONE)
+      return;
+   if (!(voice = audio_driver_st.mixer_streams[i].voice))
+      return;
+   audio_mixer_voice_set_avail(voice, avail);
 }
 
 enum audio_mixer_state audio_driver_mixer_get_stream_state(unsigned i)
@@ -1540,12 +2739,20 @@ static void audio_driver_mixer_play_stream_internal(
    switch (audio_driver_st.mixer_streams[i].state)
    {
       case AUDIO_STREAM_STATE_STOPPED:
-         audio_driver_st.mixer_streams[i].voice =
-            audio_mixer_play(audio_driver_st.mixer_streams[i].handle,
-               (type == AUDIO_STREAM_STATE_PLAYING_LOOPED) ? true : false,
-               1.0f, audio_driver_st.resampler_ident,
-               audio_driver_st.resampler_quality,
-               audio_driver_st.mixer_streams[i].stop_cb);
+         if (audio_driver_mixer_use_s16(audio_driver_st.stat_core_is_float))
+            audio_driver_st.mixer_streams[i].voice =
+               audio_mixer_play_s16(audio_driver_st.mixer_streams[i].handle,
+                  (type == AUDIO_STREAM_STATE_PLAYING_LOOPED) ? true : false,
+                  AUDIO_MIXER_GAIN_UNITY,
+                  audio_driver_st.resampler_quality,
+                  audio_driver_st.mixer_streams[i].stop_cb);
+         else
+            audio_driver_st.mixer_streams[i].voice =
+               audio_mixer_play(audio_driver_st.mixer_streams[i].handle,
+                  (type == AUDIO_STREAM_STATE_PLAYING_LOOPED) ? true : false,
+                  1.0f, audio_driver_st.resampler_ident,
+                  audio_driver_st.resampler_quality,
+                  audio_driver_st.mixer_streams[i].stop_cb);
          audio_driver_st.mixer_streams[i].state = (enum audio_mixer_state)type;
          audio_driver_st.mixer_streams_playing++;
          break;
@@ -1985,7 +3192,7 @@ void audio_driver_frame_is_reverse(void)
          audio_driver_flush(audio_st,
                config_get_ptr()->floats.slowmotion_ratio,
                audio_st->rewind_buf  + audio_st->rewind_ptr,
-               audio_st->rewind_size - audio_st->rewind_ptr,
+               audio_st->rewind_size - audio_st->rewind_ptr, false,
                (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
                (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
 }
@@ -2153,7 +3360,7 @@ void audio_driver_menu_sample(void)
          audio_driver_flush(audio_st,
                slowmotion_ratio,
                samples_buf,
-               1024,
+               1024, false,
                (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
                (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
       sample_count -= 1024;
@@ -2173,7 +3380,7 @@ void audio_driver_menu_sample(void)
    }
 
    if (check_flush)
-      audio_driver_flush(audio_st, slowmotion_ratio, samples_buf, sample_count,
+      audio_driver_flush(audio_st, slowmotion_ratio, samples_buf, sample_count, false,
             (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
             (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
 }
@@ -2344,8 +3551,14 @@ static void mic_driver_microphone_handle_free(retro_microphone_t *microphone, bo
    if (microphone->resampler && microphone->resampler->free && microphone->resampler_data)
       microphone->resampler->free(microphone->resampler_data);
 
-   microphone->resampler      = NULL;
-   microphone->resampler_data = NULL;
+   if (microphone->resampler_data_int16 && microphone->resampler_int16_free)
+      microphone->resampler_int16_free(microphone->resampler_data_int16);
+
+   microphone->resampler                = NULL;
+   microphone->resampler_data           = NULL;
+   microphone->resampler_data_int16     = NULL;
+   microphone->resampler_int16_process  = NULL;
+   microphone->resampler_int16_free     = NULL;
 
    /* If the mic driver is being reset and the microphone was already valid... */
    if ((microphone->flags & MICROPHONE_FLAG_ACTIVE) && is_reset)
@@ -2358,12 +3571,70 @@ static void mic_driver_microphone_handle_free(retro_microphone_t *microphone, bo
    /* Do NOT free the microphone handle itself! It's allocated statically! */
 }
 
+/* The staging buffers the mic read pipeline flushes through. Only
+ * allocated once a core actually opens a microphone: with mic
+ * support enabled by default, allocating them at driver init cost
+ * every session over 800KB that all but a handful ever used.
+ * Freed and nulled by deinit, so a later open reallocates. */
+static bool mic_driver_allocate_frames(microphone_driver_state_t *mic_st)
+{
+   size_t max_frames = AUDIO_CHUNK_SIZE_NONBLOCKING * AUDIO_MAX_RATIO;
+
+   if (mic_st->input_frames)
+      return true;
+
+   mic_st->input_frames_length = max_frames * sizeof(float);
+   mic_st->input_frames = (float*)memalign_alloc(64, mic_st->input_frames_length);
+   if (!mic_st->input_frames)
+      return false;
+
+   mic_st->converted_input_frames_length = max_frames * sizeof(float);
+   mic_st->converted_input_frames = (float*)memalign_alloc(64, mic_st->converted_input_frames_length);
+   if (!mic_st->converted_input_frames)
+      return false;
+
+   /* Need room for dual-mono frames */
+   mic_st->dual_mono_frames_length = max_frames * sizeof(float) * 2;
+   mic_st->dual_mono_frames = (float*)memalign_alloc(64, mic_st->dual_mono_frames_length);
+   if (!mic_st->dual_mono_frames)
+      return false;
+
+   /* Interleaved stereo, for the integer flush path. */
+   mic_st->dual_mono_frames_int16_length = max_frames * sizeof(int16_t) * 2;
+   mic_st->dual_mono_frames_int16 = (int16_t*)memalign_alloc(64,
+         mic_st->dual_mono_frames_int16_length);
+   if (!mic_st->dual_mono_frames_int16)
+      return false;
+
+   mic_st->resampled_frames_int16_length = max_frames * sizeof(int16_t) * 2;
+   mic_st->resampled_frames_int16 = (int16_t*)memalign_alloc(64,
+         mic_st->resampled_frames_int16_length);
+   if (!mic_st->resampled_frames_int16)
+      return false;
+
+   mic_st->resampled_frames_length = max_frames * sizeof(float) * 2;
+   mic_st->resampled_frames = (float*) memalign_alloc(64, mic_st->resampled_frames_length);
+   if (!mic_st->resampled_frames)
+      return false;
+
+   mic_st->resampled_mono_frames_length = max_frames * sizeof(float);
+   mic_st->resampled_mono_frames = (float*) memalign_alloc(64, mic_st->resampled_mono_frames_length);
+   if (!mic_st->resampled_mono_frames)
+      return false;
+
+   mic_st->final_frames_length = max_frames * sizeof(int16_t);
+   mic_st->final_frames = (int16_t*) memalign_alloc(64, mic_st->final_frames_length);
+   if (!mic_st->final_frames)
+      return false;
+
+   return true;
+}
+
 bool microphone_driver_init_internal(void *settings_data)
 {
    settings_t *settings   = (settings_t*)settings_data;
    microphone_driver_state_t *mic_st = &mic_driver_st;
    bool verbosity_enabled = verbosity_is_enabled();
-   size_t max_frames   = AUDIO_CHUNK_SIZE_NONBLOCKING * AUDIO_MAX_RATIO;
 
    /* If the user has mic support turned off... */
    if (!settings->bools.microphone_enable)
@@ -2385,37 +3656,6 @@ bool microphone_driver_init_internal(void *settings_data)
       RARCH_ERR("[Microphone] Failed to initialize microphone driver. Will continue without mic input.\n");
       goto error;
    }
-
-   mic_st->input_frames_length = max_frames * sizeof(float);
-   mic_st->input_frames = (float*)memalign_alloc(64, mic_st->input_frames_length);
-   if (!mic_st->input_frames)
-      goto error;
-
-   mic_st->converted_input_frames_length = max_frames * sizeof(float);
-   mic_st->converted_input_frames = (float*)memalign_alloc(64, mic_st->converted_input_frames_length);
-   if (!mic_st->converted_input_frames)
-      goto error;
-
-   /* Need room for dual-mono frames */
-   mic_st->dual_mono_frames_length = max_frames * sizeof(float) * 2;
-   mic_st->dual_mono_frames = (float*)memalign_alloc(64, mic_st->dual_mono_frames_length);
-   if (!mic_st->dual_mono_frames)
-      goto error;
-
-   mic_st->resampled_frames_length = max_frames * sizeof(float) * 2;
-   mic_st->resampled_frames = (float*) memalign_alloc(64, mic_st->resampled_frames_length);
-   if (!mic_st->resampled_frames)
-      goto error;
-
-   mic_st->resampled_mono_frames_length = max_frames * sizeof(float);
-   mic_st->resampled_mono_frames = (float*) memalign_alloc(64, mic_st->resampled_mono_frames_length);
-   if (!mic_st->resampled_mono_frames)
-      goto error;
-
-   mic_st->final_frames_length = max_frames * sizeof(int16_t);
-   mic_st->final_frames = (int16_t*) memalign_alloc(64, mic_st->final_frames_length);
-   if (!mic_st->final_frames)
-      goto error;
 
    if (!mic_st->driver || !mic_st->driver->init)
       goto error;
@@ -2466,6 +3706,9 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
    if (!microphone || !mic_driver || !(mic_st->flags & MICROPHONE_DRIVER_FLAG_ACTIVE))
       return false;
 
+   if (!mic_driver_allocate_frames(mic_st))
+      goto error;
+
    microphone->outgoing_samples = fifo_new(max_samples * sizeof(int16_t));
    if (!microphone->outgoing_samples)
       goto error;
@@ -2501,6 +3744,55 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
    {
       RARCH_ERR("[Microphone] Failed to initialize resampler \"%s\".\n", mic_st->resampler_ident);
       goto error;
+   }
+
+   /* The libretro microphone interface hands the core int16 unconditionally,
+    * so when the device also delivers int16 there is no reason for the flush
+    * to detour through float: build the deterministic integer counterpart of
+    * the resampler just chosen and let microphone_driver_flush() use it.
+    * Float devices, and resamplers with no integer implementation, leave
+    * these NULL and keep the float path. */
+   microphone->resampler_data_int16    = NULL;
+   microphone->resampler_int16_process = NULL;
+   microphone->resampler_int16_free    = NULL;
+   if (     !(microphone->flags & MICROPHONE_FLAG_USE_FLOAT)
+         &&   microphone->resampler
+         &&   microphone->resampler->short_ident)
+   {
+      const char *rs_ident = microphone->resampler->short_ident;
+      if (string_is_equal(rs_ident, "sinc"))
+      {
+         microphone->resampler_data_int16 = sinc_resampler_int16_init(
+               microphone->orig_ratio,
+               audio_sinc_int16_quality_map(mic_st->resampler_quality));
+         microphone->resampler_int16_process = sinc_resampler_int16_process;
+         microphone->resampler_int16_free    = sinc_resampler_int16_free;
+      }
+#ifdef HAVE_NEAREST_RESAMPLER
+      else if (string_is_equal(rs_ident, "nearest"))
+      {
+         microphone->resampler_data_int16 = nearest_resampler_int16_init();
+         microphone->resampler_int16_process = nearest_resampler_int16_process;
+         microphone->resampler_int16_free    = nearest_resampler_int16_free;
+      }
+#endif
+#ifdef HAVE_CC_RESAMPLER
+      else if (string_is_equal(rs_ident, "cc"))
+      {
+         microphone->resampler_data_int16 = cc_resampler_int16_init(
+               microphone->orig_ratio);
+         microphone->resampler_int16_process = cc_resampler_int16_process;
+         microphone->resampler_int16_free    = cc_resampler_int16_free;
+      }
+#endif
+      if (!microphone->resampler_data_int16)
+      {
+         microphone->resampler_int16_process = NULL;
+         microphone->resampler_int16_free    = NULL;
+      }
+      RARCH_LOG("[Microphone] Resample path: %s\n",
+            microphone->resampler_data_int16
+                  ? "integer s16 (no float round-trip)" : "float");
    }
 
    microphone->flags &= ~MICROPHONE_FLAG_PENDING;
@@ -2635,6 +3927,13 @@ static size_t microphone_driver_flush(
    if (bytes_read <= 0)
       return 0;
 
+   /* A driver must not report more than it was asked for.  Nothing else
+    * validates this, and every buffer below is sized from the request, so
+    * an over-report would run the dual-mono up-channel and the resampler
+    * off the end of their allocations. */
+   if ((size_t)bytes_read > bytes_to_read)
+      bytes_read = (int)bytes_to_read;
+
    resampler_data.input_frames = bytes_read / sample_size;
    /* This is in frames, not samples or bytes;
     * we're up-channeling the audio to stereo,
@@ -2668,6 +3967,54 @@ static size_t microphone_driver_flush(
    }
    /* Couldn't take the fast path, so let's resample the mic input */
 
+   /* Deterministic integer path: the device gave us int16 and the selected
+    * resampler has an integer implementation, so the whole flush stays in
+    * the integer domain. Structurally identical to the float path below --
+    * duplicate mono into interleaved stereo, resample, take the left
+    * channel -- but without the s16->float->s16 round-trip, which is pure
+    * requantisation on a signal that starts and ends as int16. */
+   if (     !(microphone->flags & MICROPHONE_FLAG_USE_FLOAT)
+         &&   microphone->resampler_data_int16
+         &&   microphone->resampler_int16_process)
+   {
+      struct resampler_data_int16 s16;
+      const int16_t *src = (const int16_t*)mic_st->input_frames;
+      int16_t       *dst = mic_st->dual_mono_frames_int16;
+      size_t         n;
+
+      for (n = 0; n < resampler_data.input_frames; n++)
+      {
+         dst[(n << 1)    ] = src[n];
+         dst[(n << 1) + 1] = src[n];
+      }
+
+      s16.data_in       = dst;
+      s16.data_out      = mic_st->resampled_frames_int16;
+      s16.input_frames  = resampler_data.input_frames;
+      s16.output_frames = 0;
+      /* Same unbounded-output contract as the game path: the driver emits
+       * until its input runs out, with no reference to the destination
+       * size. */
+      s16.ratio         = audio_driver_bound_ratio(resampler_data.ratio,
+            resampler_data.input_frames,
+            MIN(mic_st->resampled_frames_int16_length
+                     / (2 * sizeof(int16_t)),
+                mic_st->final_frames_length / sizeof(int16_t)));
+      microphone->resampler_int16_process(
+            microphone->resampler_data_int16, &s16);
+
+      /* Left channel only; both carry the same signal. */
+      for (n = 0; n < s16.output_frames; n++)
+         mic_st->final_frames[n] = mic_st->resampled_frames_int16[n << 1];
+
+      frames_to_enqueue = MIN(
+            FIFO_WRITE_AVAIL(microphone->outgoing_samples) / sizeof(int16_t),
+            s16.output_frames);
+      fifo_write(microphone->outgoing_samples, mic_st->final_frames,
+            frames_to_enqueue * sizeof(int16_t));
+      return frames_to_enqueue;
+   }
+
    /* First we need to format the input for the resampler. */
    /* If this mic provides floating-point samples... */
    if (microphone->flags & MICROPHONE_FLAG_USE_FLOAT)
@@ -2681,7 +4028,15 @@ static size_t microphone_driver_flush(
       convert_to_dual_mono_float(mic_st->dual_mono_frames, mic_st->converted_input_frames, resampler_data.input_frames);
    }
 
-   /* Now we resample the mic data. */
+   /* Now we resample the mic data.  Bound the ratio first: the output is
+    * narrowed to mono and then to int16 through three separate buffers, so
+    * take the smallest capacity of the three. */
+   resampler_data.ratio = audio_driver_bound_ratio(resampler_data.ratio,
+         resampler_data.input_frames,
+         MIN(MIN(mic_st->resampled_frames_length / (2 * sizeof(float)),
+                 mic_st->resampled_mono_frames_length / sizeof(float)),
+             mic_st->final_frames_length / sizeof(int16_t)));
+
    microphone->resampler->process(microphone->resampler_data, &resampler_data);
 
    /* Next, we convert the resampled data back to mono... */
@@ -2927,6 +4282,16 @@ bool microphone_driver_deinit(bool is_reset)
       memalign_free(mic_st->dual_mono_frames);
    mic_st->dual_mono_frames        = NULL;
    mic_st->dual_mono_frames_length = 0;
+
+   if (mic_st->dual_mono_frames_int16)
+      memalign_free(mic_st->dual_mono_frames_int16);
+   mic_st->dual_mono_frames_int16        = NULL;
+   mic_st->dual_mono_frames_int16_length = 0;
+
+   if (mic_st->resampled_frames_int16)
+      memalign_free(mic_st->resampled_frames_int16);
+   mic_st->resampled_frames_int16        = NULL;
+   mic_st->resampled_frames_int16_length = 0;
 
    if (mic_st->resampled_frames)
       memalign_free(mic_st->resampled_frames);

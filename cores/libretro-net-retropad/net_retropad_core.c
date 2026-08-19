@@ -29,6 +29,7 @@
 #include <string/stdstring.h>
 #include <streams/file_stream.h>
 #include <formats/rjson.h>
+#include <formats/rjson_stream.h>
 
 #ifndef SOCKET_ERROR
 #define SOCKET_ERROR -1
@@ -235,7 +236,10 @@ typedef struct
    bool detected;
 } input_test_step_t;
 
-static input_test_step_t input_test_steps[MAX_TEST_STEPS];
+/* Allocated when the test driver or core actually starts; a static
+ * array here is load-resident forever on platforms without demand
+ * paging, for a feature almost no session activates. */
+static input_test_step_t *input_test_steps;
 
 static unsigned current_frame         = 0;
 static unsigned next_teststep_frame   = 0;
@@ -337,31 +341,31 @@ static bool input_test_file_read(const char* file_path)
 {
    bool success            = false;
    ITifJSONContext context = {0};
-   RFILE *file             = NULL;
+   uint8_t *file_buf       = NULL;
+   int64_t file_len        = 0;
    rjson_t* parser;
 
    /* Sanity check */
-   if (  (!file_path || !*file_path)
-       || !path_is_valid(file_path)
-      )
+   if (!file_path || !*file_path)
       return false;
 
-   /* Attempt to open test input file */
-   file = filestream_open(
-         file_path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
-
-   if (!file)
+   /* Read the whole file in one operation: it is tiny and always
+    * parsed in full, so a single open/size/read/close beats a
+    * pre-open stat plus the chunked callback path (which itself
+    * sizes the stream with an extra fstat).  The stat below runs
+    * only to classify a failure. */
+   if (!filestream_read_file(file_path,
+         (void**)&file_buf, &file_len))
    {
-      NETRETROPAD_CORE_PREFIX(log_cb)(RETRO_LOG_ERROR,
-            "[Remote RetroPad] Failed to open test input file: \"%s\".\n",
-            file_path);
+      if (path_is_valid(file_path))
+         NETRETROPAD_CORE_PREFIX(log_cb)(RETRO_LOG_ERROR,
+               "[Remote RetroPad] Failed to open test input file: \"%s\".\n",
+               file_path);
       return false;
    }
 
    /* Initialise JSON parser */
-   if (!(parser = rjson_open_rfile(file)))
+   if (!(parser = rjson_open_buffer(file_buf, (size_t)file_len)))
    {
       NETRETROPAD_CORE_PREFIX(log_cb)(RETRO_LOG_ERROR,
             "[Remote RetroPad] Failed to create JSON parser.\n");
@@ -407,8 +411,8 @@ end:
    if (context.message)
       free(context.message);
 
-   /* Close log file */
-   filestream_close(file);
+   /* Release file contents */
+   free(file_buf);
 
    if (last_test_step >= MAX_TEST_STEPS)
    {
@@ -569,6 +573,10 @@ static void flip_screen(void)
 
 void NETRETROPAD_CORE_PREFIX(retro_init)(void)
 {
+   if (!input_test_steps)
+      input_test_steps = (input_test_step_t*)
+            calloc(MAX_TEST_STEPS, sizeof(*input_test_steps));
+
    unsigned i;
 
    dump_state_blocked = false;
@@ -590,6 +598,10 @@ void NETRETROPAD_CORE_PREFIX(retro_init)(void)
 
 void NETRETROPAD_CORE_PREFIX(retro_deinit)(void)
 {
+   if (input_test_steps)
+      free(input_test_steps);
+   input_test_steps = NULL;
+
    unsigned i;
 
    if (frame_buf)

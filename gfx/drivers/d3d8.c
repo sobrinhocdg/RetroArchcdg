@@ -409,9 +409,6 @@ static void d3d8_set_vertices(
       unsigned pass,
       unsigned vert_width, unsigned vert_height, uint64_t frame_count)
 {
-   unsigned width  = d3d->vp.full_width;
-   unsigned height = d3d->vp.full_height;
-
    if (chain->last_width != vert_width || chain->last_height != vert_height)
    {
       Vertex vert[4];
@@ -1167,22 +1164,45 @@ typedef struct
    unsigned                      scratch_capacity; /* in Vertex count */
 } d3d8_font_t;
 
-static void d3d8_font_upload_atlas(d3d8_font_t *font)
+/* Convert and lock only the given atlas rectangle; 'full' forces the
+ * whole surface (required right after the texture is recreated, when
+ * it has no previous contents). Managed pool textures track locked
+ * sub-rects natively, so only that region is transferred. */
+static void d3d8_font_upload_atlas(d3d8_font_t *font,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1, bool full)
 {
    D3DLOCKED_RECT lr;
+   RECT rect;
    unsigned i, j;
 
    if (!font->texture)
       return;
 
-   if (FAILED(IDirect3DTexture8_LockRect(font->texture, 0, &lr, NULL, 0)))
+   if (     full
+         || x1 <= x0 || y1 <= y0
+         || x1 > (unsigned)font->atlas->width
+         || y1 > (unsigned)font->atlas->height)
+   {
+      x0 = 0;
+      y0 = 0;
+      x1 = font->atlas->width;
+      y1 = font->atlas->height;
+   }
+   rect.left   = (LONG)x0;
+   rect.top    = (LONG)y0;
+   rect.right  = (LONG)x1;
+   rect.bottom = (LONG)y1;
+
+   if (FAILED(IDirect3DTexture8_LockRect(font->texture, 0, &lr, &rect, 0)))
       return;
 
-   for (j = 0; j < font->atlas->height; j++)
+   /* lr.pBits addresses the top-left of the locked rect */
+   for (j = 0; j < y1 - y0; j++)
    {
       uint32_t      *dst = (uint32_t*)((uint8_t*)lr.pBits + j * lr.Pitch);
-      const uint8_t *src = font->atlas->buffer + j * font->atlas->width;
-      for (i = 0; i < font->atlas->width; i++)
+      const uint8_t *src = font->atlas->buffer
+            + (size_t)(y0 + j) * font->atlas->width + x0;
+      for (i = 0; i < x1 - x0; i++)
          dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
    }
 
@@ -1201,7 +1221,7 @@ static void *d3d8_font_init(void *data,
 
    if (!font_renderer_create_default(
             &font->font_driver, &font->font_data,
-            font_path, font_size))
+            font_path, font_size, FONT_ATLAS_FORMAT_A8))
    {
       free(font);
       return NULL;
@@ -1221,7 +1241,7 @@ static void *d3d8_font_init(void *data,
          D3DPOOL_MANAGED, 0, 0, 0, NULL, NULL, false);
 
    if (font->texture)
-      d3d8_font_upload_atlas(font);
+      d3d8_font_upload_atlas(font, 0, 0, 0, 0, true);
 
    font->atlas->dirty = false;
    return font;
@@ -1498,7 +1518,7 @@ static void d3d8_font_render_line(
 
 static void d3d8_font_render_msg(
       void *userdata, void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *params)
 {
    float x, y, scale, drop_mod, drop_alpha;
@@ -1619,12 +1639,15 @@ static void d3d8_font_render_msg(
     * have been emitted since the last frame. */
    if (font->atlas->dirty)
    {
+      bool respecified = false;
+
       if (   font->atlas->width  != font->tex_width
           || font->atlas->height != font->tex_height)
       {
          if (font->texture)
             IDirect3DTexture8_Release(font->texture);
 
+         respecified      = true;
          font->tex_width  = font->atlas->width;
          font->tex_height = font->atlas->height;
          font->texture    = (LPDIRECT3DTEXTURE8)d3d8_texture_new(d3d->dev,
@@ -1633,7 +1656,9 @@ static void d3d8_font_render_msg(
                D3DPOOL_MANAGED, 0, 0, 0, NULL, NULL, false);
       }
 
-      d3d8_font_upload_atlas(font);
+      d3d8_font_upload_atlas(font,
+            font->atlas->dirty_x0, font->atlas->dirty_y0,
+            font->atlas->dirty_x1, font->atlas->dirty_y1, respecified);
       font->atlas->dirty = false;
    }
 
@@ -1717,34 +1742,6 @@ static bool d3d8_font_get_line_metrics(
    }
    return false;
 }
-
-font_renderer_t d3d8_font = {
-   d3d8_font_init,
-   d3d8_font_free,
-   d3d8_font_render_msg,
-   "d3d8",
-   d3d8_font_get_glyph,
-   NULL, /* bind_block */
-   NULL, /* flush */
-   d3d8_font_get_message_width,
-   d3d8_font_get_line_metrics
-};
-
-gfx_display_ctx_driver_t gfx_display_ctx_d3d8 = {
-   gfx_display_d3d8_draw,
-   gfx_display_d3d8_draw_pipeline,
-   gfx_display_d3d8_blend_begin,
-   gfx_display_d3d8_blend_end,
-   gfx_display_d3d8_get_default_mvp,
-   gfx_display_d3d8_get_default_vertices,
-   gfx_display_d3d8_get_default_tex_coords,
-   FONT_DRIVER_RENDER_D3D8_API,
-   GFX_VIDEO_DRIVER_DIRECT3D8,
-   "d3d8",
-   false,
-   gfx_display_d3d8_scissor_begin,
-   gfx_display_d3d8_scissor_end
-};
 
 /*
  * VIDEO DRIVER
@@ -1890,7 +1887,6 @@ static void d3d8_deinitialize(d3d8_video_t *d3d)
    if (!d3d)
       return;
    chain                     = (d3d8_renderchain_t*)d3d->renderchain_data;
-   font_driver_free_osd();
 
    if (chain)
    {
@@ -2239,9 +2235,7 @@ static void d3d8_set_viewport(void *data,
 static bool d3d8_initialize(d3d8_video_t *d3d, const video_info_t *info)
 {
    struct LinkInfo link_info;
-   unsigned i           = 0;
    bool ret             = true;
-   settings_t *settings = config_get_ptr();
 
    if (!d3d)
       return false;
@@ -2292,10 +2286,6 @@ static bool d3d8_initialize(d3d8_video_t *d3d, const video_info_t *info)
    d3d8_set_viewport(d3d,
 	   d3d->vp.full_width, d3d->vp.full_height, false, true);
 
-   font_driver_init_osd(d3d, info,
-         false,
-         info->is_threaded,
-         FONT_DRIVER_RENDER_D3D8_API);
 
    d3d->menu_display.offset = 0;
    d3d->menu_display.size   = 1024;
@@ -2453,13 +2443,13 @@ static void d3d8_apply_state_changes(void *data)
       d3d->should_resize = true;
 }
 
-static void d3d8_set_osd_msg(void *data, const char *msg,
+static void d3d8_set_osd_msg(void *data, const char *msg, size_t msg_len,
       const struct font_params *params, void *font)
 {
    d3d8_video_t          *d3d = (d3d8_video_t*)data;
 
    IDirect3DDevice8_BeginScene(d3d->dev);
-   font_driver_render_msg(d3d, msg, params, font);
+   font_driver_render_msg(d3d, msg, msg_len, params, font);
    IDirect3DDevice8_EndScene(d3d->dev);
 }
 
@@ -2916,7 +2906,7 @@ static bool d3d8_frame(void *data, const void *frame,
    else if (statistics_show)
    {
       if (osd_params)
-         font_driver_render_msg(d3d, stat_text,
+         font_driver_render_msg(d3d, stat_text, video_info->stat_text_len,
                (const struct font_params*)osd_params, NULL);
    }
 #endif
@@ -2976,7 +2966,7 @@ static bool d3d8_frame(void *data, const void *frame,
       /* d3d8_font_render_msg wraps its own BeginScene/EndScene
        * around each DrawPrimitiveUP, matching the per-draw scene
        * convention used by gfx_display_d3d8_draw. */
-      font_driver_render_msg(d3d, msg, NULL, NULL);
+      font_driver_render_msg(d3d, msg, strlen(msg), NULL, NULL);
    }
 
    video_driver_update_title(NULL);
@@ -3208,6 +3198,80 @@ static uint32_t d3d8_get_flags(void *data)
    return flags;
 }
 
+/* --- GPU-native BCn compressed-texture upload --- */
+/* Direct3D 8 samples DXT1/DXT3/DXT5 == BC1/BC2/BC3. */
+static D3DFORMAT d3d8_bc_to_d3dfmt(enum texture_gpu_format fmt)
+{
+   switch (fmt)
+   {
+      case TEXTURE_GPU_FORMAT_BC1: return D3DFMT_DXT1;
+      case TEXTURE_GPU_FORMAT_BC2: return D3DFMT_DXT3;
+      case TEXTURE_GPU_FORMAT_BC3: return D3DFMT_DXT5;
+      default:                     break;
+   }
+   return D3DFMT_UNKNOWN;
+}
+
+static bool d3d8_supports_texture_format(void *data,
+      enum texture_gpu_format fmt)
+{
+   d3d8_video_t *d3d = (d3d8_video_t*)data;
+   D3DFORMAT     f   = d3d8_bc_to_d3dfmt(fmt);
+   if (!d3d || !d3d->d3d8 || f == D3DFMT_UNKNOWN)
+      return false;
+   return SUCCEEDED(IDirect3D8_CheckDeviceFormat(d3d->d3d8,
+         D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8,
+         0, D3DRTYPE_TEXTURE, f));
+}
+
+static uintptr_t d3d8_load_texture_compressed(void *data,
+      const struct texture_compressed *tc, bool threaded,
+      enum texture_filter_type filter_type)
+{
+   d3d8_video_t      *d3d   = (d3d8_video_t*)data;
+   LPDIRECT3DTEXTURE8 tex   = NULL;
+   D3DFORMAT          f;
+   unsigned           i;
+   unsigned           block_bytes;
+
+   /* Regular texture loads on this driver marshal to the video thread;
+    * the compressed path does not yet, so under threading decline here
+    * and let the CPU-decode fallback go through the marshalled path. */
+   if (threaded)
+      return 0;
+   (void)filter_type;
+
+   if (!d3d || !d3d->dev || !tc || tc->num_mips == 0)
+      return 0;
+   if ((f = d3d8_bc_to_d3dfmt(tc->format)) == D3DFMT_UNKNOWN)
+      return 0;
+   block_bytes = (tc->format == TEXTURE_GPU_FORMAT_BC1) ? 8 : 16;
+
+   if (FAILED(IDirect3DDevice8_CreateTexture(d3d->dev,
+               tc->mips[0].width, tc->mips[0].height, tc->num_mips,
+               0, f, D3DPOOL_MANAGED, &tex)))
+      return 0;
+
+   for (i = 0; i < tc->num_mips; i++)
+   {
+      D3DLOCKED_RECT lr;
+      if (SUCCEEDED(IDirect3DTexture8_LockRect(tex, i, &lr, NULL, 0)))
+      {
+         unsigned       blocks_w  = (tc->mips[i].width  + 3) >> 2;
+         unsigned       blocks_h  = (tc->mips[i].height + 3) >> 2;
+         unsigned       row_bytes = blocks_w * block_bytes;
+         const uint8_t *src       = (const uint8_t*)tc->mips[i].data;
+         uint8_t       *dst       = (uint8_t*)lr.pBits;
+         unsigned       r;
+         for (r = 0; r < blocks_h; r++)
+            memcpy(dst + r * lr.Pitch, src + r * row_bytes, row_bytes);
+         IDirect3DTexture8_UnlockRect(tex, i);
+      }
+   }
+
+   return (uintptr_t)tex;
+}
+
 static const video_poke_interface_t d3d_poke_interface = {
    d3d8_get_flags,
    d3d8_load_texture,
@@ -3239,7 +3303,9 @@ static const video_poke_interface_t d3d_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   d3d8_supports_texture_format,
+   d3d8_load_texture_compressed
 };
 
 static void d3d8_get_poke_interface(void *data,
@@ -3272,6 +3338,18 @@ static bool d3d8_gfx_widgets_enabled(void *data)
 }
 #endif
 
+static font_renderer_t d3d8_font = {
+   d3d8_font_init,
+   d3d8_font_free,
+   d3d8_font_render_msg,
+   "d3d8",
+   d3d8_font_get_glyph,
+   NULL, /* bind_block */
+   NULL, /* flush */
+   d3d8_font_get_message_width,
+   d3d8_font_get_line_metrics
+};
+
 video_driver_t video_d3d8 = {
    d3d8_init,
    d3d8_frame,
@@ -3300,6 +3378,26 @@ video_driver_t video_d3d8 = {
    NULL, /* shader_load_begin */
    NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   d3d8_gfx_widgets_enabled
+   d3d8_gfx_widgets_enabled,
 #endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+   &d3d8_font
 };
+
+gfx_display_ctx_driver_t gfx_display_ctx_d3d8 = {
+   gfx_display_d3d8_draw,
+   gfx_display_d3d8_draw_pipeline,
+   gfx_display_d3d8_blend_begin,
+   gfx_display_d3d8_blend_end,
+   gfx_display_d3d8_get_default_mvp,
+   gfx_display_d3d8_get_default_vertices,
+   gfx_display_d3d8_get_default_tex_coords,
+   &d3d8_font,
+   GFX_VIDEO_DRIVER_DIRECT3D8,
+   "d3d8",
+   false,
+   gfx_display_d3d8_scissor_begin,
+   gfx_display_d3d8_scissor_end
+};
+

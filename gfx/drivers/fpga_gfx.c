@@ -135,6 +135,9 @@ static void *fpga_init(const video_info_t *video,
 {
    fpga_t *fpga                         = (fpga_t*)calloc(1, sizeof(*fpga));
 
+   if (!fpga)
+      return NULL;
+
    *input                               = NULL;
    *input_data                          = NULL;
 
@@ -152,11 +155,6 @@ static void *fpga_init(const video_info_t *video,
    fpga_create(fpga);
 
    return fpga;
-
-error:
-   if (fpga)
-      free(fpga);
-   return NULL;
 }
 
 static bool fpga_frame(void *data, const void *frame,
@@ -335,7 +333,7 @@ static void fpga_set_texture_frame(void *data,
 }
 
 /* TODO/FIXME - implement */
-static void fpga_set_osd_msg(void *data, const char *msg,
+static void fpga_set_osd_msg(void *data, const char *msg, size_t msg_len,
       const struct font_params *params, void *font) { }
 static void fpga_get_video_output_size(void *data,
       unsigned *width, unsigned *height, char *desc, size_t desc_len) { }

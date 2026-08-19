@@ -273,7 +273,6 @@ struct overlay
 
    unsigned load_images_size;
    unsigned id;
-   unsigned pos_increment;
 
    size_t size;
    size_t pos;
@@ -326,6 +325,7 @@ struct overlay
    char name[64];
 
    uint8_t flags;
+    bool viewport_override_logged;
 };
 
 typedef struct input_overlay_state

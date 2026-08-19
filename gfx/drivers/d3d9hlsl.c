@@ -1256,8 +1256,15 @@ static void gfx_display_d3d9_hlsl_draw_pipeline(
          return;
    }
 
-   /* Update time uniform - mirrors d3d10 ubo_values.time increment */
+   /* Update time uniform - mirrors d3d10 ubo_values.time increment.
+    * Wrap at 65536 to keep fp32 increments precise. 0.01 stays
+    * exactly representable up to t ~ 167772 (where 0.5*ulp first
+    * exceeds 0.01), so 65536 has wide margin and wraps roughly
+    * every 30 h of cumulative menu time, making the discontinuity
+    * effectively unobservable. */
    t += 0.01f;
+   if (t > 65536.0f)
+      t -= 65536.0f;
 
    {
       hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
@@ -1360,22 +1367,6 @@ static void gfx_display_d3d9_hlsl_scissor_end(void *data,
    IDirect3DDevice9_SetScissorRect(d3d9->dev, &rect);
 }
 
-gfx_display_ctx_driver_t gfx_display_ctx_d3d9_hlsl = {
-   gfx_display_d3d9_hlsl_draw,
-   gfx_display_d3d9_hlsl_draw_pipeline,
-   gfx_display_d3d9_hlsl_blend_begin,
-   gfx_display_d3d9_hlsl_blend_end,
-   NULL,                                     /* get_default_mvp        */
-   NULL,                                     /* get_default_vertices   */
-   NULL,                                     /* get_default_tex_coords */
-   FONT_DRIVER_RENDER_D3D9_API,
-   GFX_VIDEO_DRIVER_DIRECT3D9_HLSL,
-   "d3d9_hlsl",
-   true,
-   gfx_display_d3d9_hlsl_scissor_begin,
-   gfx_display_d3d9_hlsl_scissor_end
-};
-
 /*
  * FONT DRIVER
  */
@@ -1406,7 +1397,7 @@ static void *d3d9_font_init(void *data,
 
    if (!font_renderer_create_default(
             &font->font_driver, &font->font_data,
-            font_path, font_size))
+            font_path, font_size, FONT_ATLAS_FORMAT_A8))
    {
       free(font);
       return NULL;
@@ -1574,7 +1565,7 @@ static INLINE Vertex *d3d9_font_get_scratch(
 
 static void d3d9_font_render_msg(
       void *userdata, void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *params)
 {
    float x, y, scale, drop_mod, drop_alpha;
@@ -1673,9 +1664,12 @@ static void d3d9_font_render_msg(
       /* If the atlas dimensions changed (grew), we must recreate
        * the texture to match, otherwise glyphs added after init
        * will have wrong UVs or missing data. */
+      bool respecified = false;
+
       if (   font->atlas->width  != font->tex_width
           || font->atlas->height != font->tex_height)
       {
+         respecified      = true;
          if (font->texture)
             IDirect3DTexture9_Release(font->texture);
 
@@ -1693,15 +1687,41 @@ static void d3d9_font_render_msg(
       {
          unsigned i, j;
          D3DLOCKED_RECT lr;
+         RECT rect;
+         unsigned x0 = font->atlas->dirty_x0;
+         unsigned y0 = font->atlas->dirty_y0;
+         unsigned x1 = font->atlas->dirty_x1;
+         unsigned y1 = font->atlas->dirty_y1;
+
+         /* A recreated texture has no previous contents, so the whole
+          * atlas must be converted; otherwise only the dirty
+          * rectangle tracked by the font renderers needs it. Managed
+          * pool textures track locked sub-rects natively. */
+         if (     respecified
+               || x1 <= x0 || y1 <= y0
+               || x1 > (unsigned)font->atlas->width
+               || y1 > (unsigned)font->atlas->height)
+         {
+            x0 = 0;
+            y0 = 0;
+            x1 = font->atlas->width;
+            y1 = font->atlas->height;
+         }
+         rect.left   = (LONG)x0;
+         rect.top    = (LONG)y0;
+         rect.right  = (LONG)x1;
+         rect.bottom = (LONG)y1;
 
          if (SUCCEEDED(IDirect3DTexture9_LockRect(
-                     font->texture, 0, &lr, NULL, 0)))
+                     font->texture, 0, &lr, &rect, 0)))
          {
-            for (j = 0; j < font->atlas->height; j++)
+            /* lr.pBits addresses the top-left of the locked rect */
+            for (j = 0; j < y1 - y0; j++)
             {
                uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits + j * lr.Pitch);
-               const uint8_t  *src = font->atlas->buffer + j * font->atlas->width;
-               for (i = 0; i < font->atlas->width; i++)
+               const uint8_t  *src = font->atlas->buffer
+                     + (size_t)(y0 + j) * font->atlas->width + x0;
+               for (i = 0; i < x1 - x0; i++)
                   dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
             }
             IDirect3DTexture9_UnlockRect(font->texture, 0);
@@ -1967,18 +1987,6 @@ static bool d3d9_font_get_line_metrics(
    return false;
 }
 
-font_renderer_t d3d9_font = {
-   d3d9_font_init,
-   d3d9_font_free,
-   d3d9_font_render_msg,
-   "d3d9_hlsl",
-   d3d9_font_get_glyph,
-   NULL, /* bind_block */
-   NULL, /* flush */
-   d3d9_font_get_message_width,
-   d3d9_font_get_line_metrics
-};
-
 /*
  * VIDEO DRIVER
  */
@@ -2114,6 +2122,10 @@ static bool hlsl_d3d9_renderchain_init_shader_fvf(
                (const D3DVERTEXELEMENT9*)decl, (IDirect3DVertexDeclaration9**)&pass->vertex_decl)));
 }
 
+#ifdef DEBUG
+/* HLSL CTAB (constant table) bytecode dumper.
+ * Logs the contents of the CTAB embedded in compiled HLSL bytecode.
+ * Only active in debug builds; provided for shader bring-up and diagnostics. */
 static void d3d9_hlsl_ctab_dump(const DWORD *bytecode, size_t bytecode_dwords,
       const char *label)
 {
@@ -2162,6 +2174,7 @@ static void d3d9_hlsl_ctab_dump(const DWORD *bytecode, size_t bytecode_dwords,
       pos++;
    }
 }
+#endif
 static bool d3d9_hlsl_load_program_from_file_ex(
       LPDIRECT3DDEVICE9 dev,
       struct shader_pass *pass,
@@ -2392,10 +2405,16 @@ static void d3d9_hlsl_renderchain_render_pass(
             (float)vp_height };
          float frame_cnt;
 
-         frame_cnt = (float)chain->chain.frame_count;
          if (pass->info.pass->frame_count_mod)
             frame_cnt = (float)(chain->chain.frame_count
                   % pass->info.pass->frame_count_mod);
+         else
+            /* SM2/SM3 has no uint registers, so frame_count must be
+             * bound as a float. fp32 mantissa is 23 bits, so values
+             * above 2^24 cannot be represented exactly. Mask to 24
+             * bits when the shader pass has not declared its own
+             * modulo, to keep the cast bit-exact in long sessions. */
+            frame_cnt = (float)(chain->chain.frame_count & 0xFFFFFFu);
 
          if (pd->ps_map.video_size >= 0
                && pd->ps_map.video_size == pd->ps_map.texture_size)
@@ -4045,19 +4064,9 @@ static char *d3d9_hlsl_decompose_struct_samplers(const char *source)
       /* Remove sampler member lines from sampler-containing structs.
        * Look for lines containing 'sampler' followed by ';' */
       {
-         bool skip_sampler_line = false;
-         if (strncmp(p, "sampler", 7) == 0 || (p > source && p[-1] != '\n'
-               && strstr(p, "sampler") == p))
-         {
-            /* Actually, let's detect sampler lines more carefully:
-             * at the start of a line (after whitespace), check if we see
-             * 'sampler2D' followed by '_texture' and ';' */
-         }
-
          /* Simpler approach: detect 'sampler2D _texture;' or 'sampler2D _texture ;'
           * as a standalone line (with optional leading whitespace) */
          {
-            const char *line_start = p;
             /* Check if we're at line start */
             if (p == source || p[-1] == '\n')
             {
@@ -5331,12 +5340,6 @@ static bool d3d9_hlsl_compile_cg_compat(
    D3DBlob error_blob = NULL;
    HRESULT hr;
 
-   /* D3D_SHADER_MACRO compatible: { Name, Definition }, null-terminated */
-   struct { const char *n; const char *d; } cg_defines[] = {
-      { "CG", "1" },
-      { NULL, NULL }
-   };
-
    if (!out_blob)
       return false;
 
@@ -5678,17 +5681,17 @@ static char *d3d9_hlsl_init_vs_output_members(const char *source)
 static char *d3d9_hlsl_convert_macro_loops(const char *source)
 {
    /* Find #define candidates: single-param function-like macros */
-   const char *p;
    char macro_name[128];
    char macro_param[64];
    const char *macro_body_start = NULL;
    size_t macro_body_len = 0;
-   size_t macro_name_len = 0;
-   size_t macro_param_len = 0;
+#ifdef DEBUG
+   size_t macro_name_len          = 0;
+   size_t macro_param_len         = 0;
+#endif
    const char *macro_define_start = NULL;
-   const char *macro_define_end = NULL;
-
-   p = source;
+   const char *macro_define_end   = NULL;
+   const char *p = source;
    while (*p)
    {
       /* Look for #define at start of line */
@@ -5701,7 +5704,8 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
             const char *nm = dir + 6;
             const char *nm_end, *pp, *pp_end, *body, *body_end;
 
-            while (*nm == ' ' || *nm == '\t') nm++;
+            while (*nm == ' ' || *nm == '\t')
+               nm++;
             nm_end = nm;
             while (d3d9_hlsl_is_ident_char(*nm_end)) nm_end++;
 
@@ -5709,14 +5713,16 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
             if (*nm_end == '(' && nm_end > nm)
             {
                pp = nm_end + 1;
-               while (*pp == ' ' || *pp == '\t') pp++;
+               while (*pp == ' ' || *pp == '\t')
+                  pp++;
                pp_end = pp;
                while (d3d9_hlsl_is_ident_char(*pp_end)) pp_end++;
                if (pp_end > pp && *pp_end == ')')
                {
                   /* Found #define NAME(PARAM) — get the body */
                   body = pp_end + 1;
-                  while (*body == ' ' || *body == '\t') body++;
+                  while (*body == ' ' || *body == '\t')
+                     body++;
 
                   /* Find end of body (handle line continuations) */
                   body_end = body;
@@ -5725,7 +5731,10 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                      if (*body_end == '\n')
                      {
                         if (body_end > body && body_end[-1] == '\\')
-                        { body_end++; continue; }
+                        {
+                           body_end++;
+                           continue;
+                        }
                         break;
                      }
                      body_end++;
@@ -5741,7 +5750,10 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                         if (strncmp(scan, pp, pl) == 0
                               && (scan == body || !d3d9_hlsl_is_ident_char(scan[-1]))
                               && !d3d9_hlsl_is_ident_char(scan[pl]))
-                        { found = true; break; }
+                        {
+                           found = true;
+                           break;
+                        }
                         scan++;
                      }
 
@@ -5750,9 +5762,9 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                      {
                         /* Now search for consecutive invocations:
                          * NAME(0) NAME(1) ... NAME(N) */
-                        int max_seq = -1;
+                        int max_seq           = -1;
                         const char *seq_start = NULL, *seq_end_ptr = NULL;
-                        const char *s = source;
+                        const char *s         = source;
 
                         while (*s)
                         {
@@ -5761,7 +5773,6 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                                  && s[(size_t)(nm_end - nm)] == '(')
                            {
                               /* Check if this starts a consecutive run from 0 */
-                              const char *call = s;
                               const char *after_name = s + (size_t)(nm_end - nm);
                               /* Parse the argument */
                               if (after_name[0] == '(' && after_name[1] == '0'
@@ -5810,28 +5821,33 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                         if (max_seq >= 4 && seq_start && seq_end_ptr)
                         {
                            /* Build the replacement loop */
-                           size_t src_len_full = strlen(source);
-                           size_t body_l = (size_t)(body_end - body);
-                           char *out;
                            size_t cap, opos;
-                           size_t nml = (size_t)(nm_end - nm);
+                           size_t src_len_full = strlen(source);
+                           size_t body_l       = (size_t)(body_end - body);
+                           char *out;
+                           size_t nml          = (size_t)(nm_end - nm);
 
                            memcpy(macro_name, nm, nml);
-                           macro_name[nml] = '\0';
-                           macro_name_len = nml;
+                           macro_name[nml]     = '\0';
+#ifdef DEBUG
+                           macro_name_len      = nml;
+#endif
                            memcpy(macro_param, pp, (size_t)(pp_end - pp));
                            macro_param[(size_t)(pp_end - pp)] = '\0';
-                           macro_param_len = (size_t)(pp_end - pp);
-                           macro_body_start = body;
-                           macro_body_len = body_l;
-                           macro_define_start = p;
-                           macro_define_end = body_end;
+#ifdef DEBUG
+                           macro_param_len     = (size_t)(pp_end - pp);
+#endif
+                           macro_body_start    = body;
+                           macro_body_len      = body_l;
+                           macro_define_start  = p;
+                           macro_define_end    = body_end;
                            if (*macro_define_end == '\n')
                               macro_define_end++;
 
                            cap = src_len_full + body_l + 256;
                            out = (char*)malloc(cap);
-                           if (!out) return NULL;
+                           if (!out)
+                              return NULL;
                            opos = 0;
 
                            /* Copy everything before the #define, commenting it out */
@@ -5844,7 +5860,7 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                            /* Comment out the #define line */
                            {
                               const char *dl = "/* ";
-                              size_t dll = 3;
+                              size_t dll     = 3;
                               size_t def_len = (size_t)(macro_define_end - macro_define_start);
                               /* Strip any trailing newline from the define for the comment */
                               size_t comment_len = def_len;
@@ -5912,7 +5928,10 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                                     char *tmp;
                                     cap *= 2;
                                     if (!(tmp = (char*)realloc(out, cap)))
-                                    { free(out); return NULL; }
+                                    {
+                                       free(out);
+                                       return NULL;
+                                    }
                                     out = tmp;
                                  }
                                  out[opos++] = *bp_src++;
@@ -5927,7 +5946,10 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                                  char *tmp;
                                  cap *= 2;
                                  if (!(tmp = (char*)realloc(out, cap)))
-                                 { free(out); return NULL; }
+                                 {
+                                    free(out);
+                                    return NULL;
+                                 }
                                  out = tmp;
                               }
                               memcpy(out + opos, cl, 3); opos += 3;
@@ -5941,7 +5963,10 @@ static char *d3d9_hlsl_convert_macro_loops(const char *source)
                                  char *tmp;
                                  cap *= 2;
                                  if (!(tmp = (char*)realloc(out, cap)))
-                                 { free(out); return NULL; }
+                                 {
+                                    free(out);
+                                    return NULL;
+                                 }
                                  out = tmp;
                               }
                               memcpy(out + opos, seq_end_ptr, tail);
@@ -6022,7 +6047,6 @@ static bool d3d9_hlsl_load_program_from_file_ex(
       char *p = resolved;
       while ((p = strstr(p, "#pragma parameter")) != NULL)
       {
-         const char *line_start = p;
          const char *pp = p + 17; /* skip "#pragma parameter" */
          const char *name_start, *name_end;
          size_t name_len;
@@ -6553,7 +6577,6 @@ static uint32_t d3d9_hlsl_get_flags(void *data)
 
 static void d3d9_hlsl_deinitialize(d3d9_video_t *d3d)
 {
-   font_driver_free_osd();
 
    hlsl_d3d9_renderchain_free(d3d->renderchain_data);
 
@@ -6940,7 +6963,7 @@ static void d3d9_hlsl_set_viewport(void *data,
 }
 
 static void d3d9_hlsl_set_osd_msg(void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *params, void *font)
 {
    d3d9_video_t          *d3d = (d3d9_video_t*)data;
@@ -6948,7 +6971,7 @@ static void d3d9_hlsl_set_osd_msg(void *data,
 
    d3d9_set_font_rect(d3d, params);
    IDirect3DDevice9_BeginScene(dev);
-   font_driver_render_msg(d3d, msg, params, font);
+   font_driver_render_msg(d3d, msg, msg_len, params, font);
    IDirect3DDevice9_EndScene(dev);
 }
 
@@ -6994,10 +7017,6 @@ static bool d3d9_hlsl_initialize(
    d3d9_hlsl_set_viewport(d3d,
       d3d->vp.full_width, d3d->vp.full_height, false, true);
 
-   font_driver_init_osd(d3d, info,
-         false,
-         info->is_threaded,
-         FONT_DRIVER_RENDER_D3D9_API);
 
    {
       static const D3DVERTEXELEMENT9 VertexElements[4] = {
@@ -7759,7 +7778,7 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
       {
          IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
          IDirect3DDevice9_BeginScene(d3d->dev);
-         font_driver_render_msg(d3d, stat_text,
+         font_driver_render_msg(d3d, stat_text, video_info->stat_text_len,
                (const struct font_params*)osd_params, NULL);
          IDirect3DDevice9_EndScene(d3d->dev);
       }
@@ -7824,7 +7843,7 @@ static bool d3d9_hlsl_frame(void *data, const void *frame,
    {
       IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
       IDirect3DDevice9_BeginScene(d3d->dev);
-      font_driver_render_msg(d3d, msg, NULL, NULL);
+      font_driver_render_msg(d3d, msg, strlen(msg), NULL, NULL);
       IDirect3DDevice9_EndScene(d3d->dev);
    }
 
@@ -8136,7 +8155,9 @@ static const video_poke_interface_t d3d9_hlsl_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   d3d9_supports_texture_format,
+   d3d9_load_texture_compressed
 };
 
 static void d3d9_hlsl_get_poke_interface(void *data,
@@ -8332,6 +8353,18 @@ static bool d3d9_hlsl_has_windowed(void *data)
 #endif
 }
 
+static font_renderer_t d3d9_hlsl_font = {
+   d3d9_font_init,
+   d3d9_font_free,
+   d3d9_font_render_msg,
+   "d3d9_hlsl",
+   d3d9_font_get_glyph,
+   NULL, /* bind_block */
+   NULL, /* flush */
+   d3d9_font_get_message_width,
+   d3d9_font_get_line_metrics
+};
+
 video_driver_t video_d3d9_hlsl = {
    d3d9_hlsl_init,
    d3d9_hlsl_frame,
@@ -8360,6 +8393,25 @@ video_driver_t video_d3d9_hlsl = {
    NULL, /* shader_load_begin */
    NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   d3d9_hlsl_gfx_widgets_enabled
+   d3d9_hlsl_gfx_widgets_enabled,
 #endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+   &d3d9_hlsl_font
+};
+
+gfx_display_ctx_driver_t gfx_display_ctx_d3d9_hlsl = {
+   gfx_display_d3d9_hlsl_draw,
+   gfx_display_d3d9_hlsl_draw_pipeline,
+   gfx_display_d3d9_hlsl_blend_begin,
+   gfx_display_d3d9_hlsl_blend_end,
+   NULL,                                     /* get_default_mvp        */
+   NULL,                                     /* get_default_vertices   */
+   NULL,                                     /* get_default_tex_coords */
+   &d3d9_hlsl_font,
+   GFX_VIDEO_DRIVER_DIRECT3D9_HLSL,
+   "d3d9_hlsl",
+   true,
+   gfx_display_d3d9_hlsl_scissor_begin,
+   gfx_display_d3d9_hlsl_scissor_end
 };

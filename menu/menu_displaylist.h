@@ -130,6 +130,7 @@ enum menu_displaylist_ctl_state
    DISPLAYLIST_LAKKA,
    DISPLAYLIST_CORES_DETECTED,
    DISPLAYLIST_SAVESTATE_LIST,
+   DISPLAYLIST_STATE_SLOT_RUN,
    DISPLAYLIST_CORE_OPTIONS,
    DISPLAYLIST_CORE_OPTION_OVERRIDE_LIST,
    DISPLAYLIST_CORE_INFO,
@@ -263,6 +264,7 @@ enum menu_displaylist_ctl_state
    DISPLAYLIST_ACCOUNTS_YOUTUBE_LIST,
    DISPLAYLIST_ACCOUNTS_TWITCH_LIST,
    DISPLAYLIST_ACCOUNTS_FACEBOOK_LIST,
+   DISPLAYLIST_ACCOUNTS_KICK_LIST,
    DISPLAYLIST_BROWSE_URL_LIST,
    DISPLAYLIST_BROWSE_URL_START,
    DISPLAYLIST_LOAD_CONTENT_LIST,
@@ -286,7 +288,6 @@ enum menu_displaylist_ctl_state
    DISPLAYLIST_ARCHIVE_ACTION_DETECT_CORE,
    DISPLAYLIST_CORE_CONTENT,
    DISPLAYLIST_CORE_CONTENT_DIRS,
-   DISPLAYLIST_CORE_CONTENT_DIRS_SUBDIR,
    DISPLAYLIST_CORE_SYSTEM_FILES,
 #if defined(HAVE_LIBNX)
    DISPLAYLIST_SWITCH_CPU_PROFILE,
@@ -364,6 +365,10 @@ typedef struct menu_displaylist_info
 bool menu_displaylist_process(menu_displaylist_info_t *info);
 
 void menu_displaylist_info_free(menu_displaylist_info_t *info);
+
+#if defined(RETROARCH_VALIDATION_DUMPS)
+void menu_displaylist_validation_dump(rarch_setting_t *list_settings);
+#endif
 
 unsigned menu_displaylist_build_list(
       file_list_t *list,

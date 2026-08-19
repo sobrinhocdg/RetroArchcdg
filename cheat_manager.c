@@ -260,10 +260,21 @@ bool cheat_manager_save(
    return ret;
 }
 
+bool cheat_manager_working_code_ensure(void)
+{
+   cheat_manager_t *cheat_st = &cheat_manager_state;
+   if (!cheat_st->working_code)
+      cheat_st->working_code = (char*)calloc(1, CHEAT_CODE_SCRATCH_SIZE);
+   return cheat_st->working_code != NULL;
+}
+
 bool cheat_manager_copy_idx_to_working(unsigned idx)
 {
    cheat_manager_t *cheat_st   = &cheat_manager_state;
    if (!cheat_st->cheats || (cheat_st->size < idx + 1))
+      return false;
+
+   if (!cheat_manager_working_code_ensure())
       return false;
 
    memcpy(&cheat_st->working_cheat,
@@ -343,7 +354,8 @@ bool cheat_manager_copy_working_to_idx(unsigned idx)
    if (cheat_st->cheats[idx].code)
       free(cheat_st->cheats[idx].code);
 
-   cheat_st->cheats[idx].code = strdup(cheat_st->working_code);
+   cheat_st->cheats[idx].code = strdup(
+         cheat_st->working_code ? cheat_st->working_code : "");
 
    return true;
 }
@@ -610,9 +622,12 @@ bool cheat_manager_realloc(unsigned new_size, unsigned default_handler)
          cheat_st->cheats[i].desc = NULL;
       }
 
-      val = (struct item_cheat*)
-            realloc(cheat_st->cheats,
-            new_size * sizeof(struct item_cheat));
+      if (new_size != 0)
+      {
+         val = (struct item_cheat*)
+               realloc(cheat_st->cheats,
+               new_size * sizeof(struct item_cheat));
+      }
 
       /* realloc-to-tmp: on OOM 'val' is NULL, the original
        * cheat_st->cheats is still valid.  Pre-patch did
@@ -1264,6 +1279,154 @@ int cheat_manager_search_exact(rarch_setting_t *setting, size_t idx, bool wrapar
    return cheat_manager_search(CHEAT_SEARCH_TYPE_EXACT);
 }
 
+static void cheat_manager_search_input_cb_common(
+      const char *line,
+      unsigned *target,
+      enum cheat_search_type search_type)
+{
+   char *end             = NULL;
+   unsigned long value   = 0;
+   unsigned max_value    = 0;
+
+   if (!line || !*line)
+   {
+#ifdef HAVE_MENU
+      menu_input_dialog_end();
+#endif
+      return;
+   }
+
+   errno = 0;
+   value = strtoul(line, &end, 0);
+
+   if (errno || end == line)
+   {
+#ifdef HAVE_MENU
+      menu_input_dialog_end();
+#endif
+      return;
+   }
+
+   max_value = cheat_manager_get_state_search_size(
+         cheat_manager_state.search_bit_size);
+
+   if (value > max_value)
+      value = max_value;
+
+   *target = (unsigned)value;
+
+#ifdef HAVE_MENU
+   menu_input_dialog_end();
+#endif
+
+   cheat_manager_search(search_type);
+}
+
+static void cheat_manager_search_exact_input_cb(void *userdata,
+      const char *line)
+{
+   cheat_manager_search_input_cb_common(
+         line,
+         &cheat_manager_state.search_exact_value,
+         CHEAT_SEARCH_TYPE_EXACT);
+}
+
+static void cheat_manager_search_eqplus_input_cb(void *userdata,
+      const char *line)
+{
+   cheat_manager_search_input_cb_common(
+         line,
+         &cheat_manager_state.search_eqplus_value,
+         CHEAT_SEARCH_TYPE_EQPLUS);
+}
+
+static void cheat_manager_search_eqminus_input_cb(void *userdata,
+      const char *line)
+{
+   cheat_manager_search_input_cb_common(
+         line,
+         &cheat_manager_state.search_eqminus_value,
+         CHEAT_SEARCH_TYPE_EQMINUS);
+}
+
+static int cheat_manager_search_input_start(
+      rarch_setting_t *setting,
+      size_t idx,
+      bool wraparound,
+      unsigned current_value,
+      enum msg_hash_enums label_value,
+      enum msg_hash_enums label,
+      input_keyboard_line_complete_t cb)
+{
+#ifdef HAVE_MENU
+   char value_buf[32];
+   menu_input_ctx_line_t line;
+
+   memset(&line, 0, sizeof(line));
+
+   snprintf(value_buf, sizeof(value_buf), "%u", current_value);
+
+   line.label         = msg_hash_to_str(label_value);
+   line.label_setting = value_buf;
+   line.type          = label;
+   line.idx           = (unsigned)idx;
+   line.cb            = cb;
+
+   if (menu_input_dialog_start(&line))
+      return 0;
+#endif
+
+   return -1;
+}
+
+int cheat_manager_search_exact_input(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   if (cheat_manager_search_input_start(
+            setting,
+            idx,
+            wraparound,
+            cheat_manager_state.search_exact_value,
+            MENU_ENUM_LABEL_VALUE_CHEAT_SEARCH_EXACT,
+            MENU_ENUM_LABEL_CHEAT_SEARCH_EXACT,
+            cheat_manager_search_exact_input_cb) == 0)
+      return 0;
+
+   return cheat_manager_search_exact(setting, idx, wraparound);
+}
+
+int cheat_manager_search_eqplus_input(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   if (cheat_manager_search_input_start(
+            setting,
+            idx,
+            wraparound,
+            cheat_manager_state.search_eqplus_value,
+            MENU_ENUM_LABEL_VALUE_CHEAT_SEARCH_EQPLUS,
+            MENU_ENUM_LABEL_CHEAT_SEARCH_EQPLUS,
+            cheat_manager_search_eqplus_input_cb) == 0)
+      return 0;
+
+   return cheat_manager_search_eqplus(setting, idx, wraparound);
+}
+
+int cheat_manager_search_eqminus_input(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   if (cheat_manager_search_input_start(
+            setting,
+            idx,
+            wraparound,
+            cheat_manager_state.search_eqminus_value,
+            MENU_ENUM_LABEL_VALUE_CHEAT_SEARCH_EQMINUS,
+            MENU_ENUM_LABEL_CHEAT_SEARCH_EQMINUS,
+            cheat_manager_search_eqminus_input_cb) == 0)
+      return 0;
+
+   return cheat_manager_search_eqminus(setting, idx, wraparound);
+}
+
 int cheat_manager_search_lt(rarch_setting_t *setting, size_t idx, bool wraparound)
 {
    return cheat_manager_search(CHEAT_SEARCH_TYPE_LT);
@@ -1419,8 +1582,8 @@ int cheat_manager_add_matches(const char *path,
    runloop_msg_queue_push(msg, _len, 1, 180, true, NULL, MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
 
 #ifdef HAVE_MENU
-   menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
+   menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                    |  MENU_ST_FLAG_PREVENT_POPULATE;
 #endif
    return 0;
 }
@@ -1912,8 +2075,8 @@ int cheat_manager_delete_match(rarch_setting_t *setting, size_t idx, bool wrapar
    cheat_manager_match_action(CHEAT_MATCH_ACTION_TYPE_DELETE,
          cheat_st->match_idx, NULL, NULL, NULL, NULL);
 #ifdef HAVE_MENU
-   menu_st->flags                 |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
+   menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                    |  MENU_ST_FLAG_PREVENT_POPULATE;
 #endif
    return 0;
 }

@@ -91,7 +91,7 @@ static void *sixel_font_init(void *data,
 
    if (!font_renderer_create_default(
             &font->font_driver,
-            &font->font_data, font_path, font_size))
+            &font->font_data, font_path, font_size, FONT_ATLAS_FORMAT_A8))
       return NULL;
 
    return font;
@@ -117,20 +117,8 @@ static const struct font_glyph *sixel_font_get_glyph(
 static void sixel_font_render_msg(
       void *userdata,
       void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *_params) { }
-
-font_renderer_t sixel_font = {
-   sixel_font_init,
-   sixel_font_free,
-   sixel_font_render_msg,
-   "sixel",
-   sixel_font_get_glyph,
-   NULL,                       /* bind_block */
-   NULL,                       /* flush */
-   sixel_font_get_message_width,
-   NULL                        /* get_line_metrics */
-};
 
 /*
  * VIDEO DRIVER
@@ -270,7 +258,6 @@ static void *sixel_gfx_init(const video_info_t *video,
    void *ctx_data                       = NULL;
    const char *scale_str                = NULL;
    settings_t *settings                 = config_get_ptr();
-   bool video_font_enable               = settings->bools.video_font_enable;
    sixel_t *sixel                       = (sixel_t*)calloc(1, sizeof(*sixel));
 
    if (!sixel)
@@ -310,12 +297,6 @@ static void *sixel_gfx_init(const video_info_t *video,
       *input_data = NULL;
    }
 
-   if (video_font_enable)
-      font_driver_init_osd(sixel,
-            video,
-            false,
-            video->is_threaded,
-            FONT_DRIVER_RENDER_SIXEL);
 
    return sixel;
 }
@@ -495,7 +476,7 @@ static bool sixel_gfx_frame(void *data, const void *frame,
    }
 
    if (msg)
-      font_driver_render_msg(sixel, msg, NULL, NULL);
+      font_driver_render_msg(sixel, msg, strlen(msg), NULL, NULL);
 
    return true;
 }
@@ -536,7 +517,6 @@ static void sixel_gfx_free(void *data)
       sixel_temp_buf = NULL;
    }
 
-   font_driver_free_osd();
 
    if (sixel)
       free(sixel);
@@ -646,6 +626,19 @@ bool sixel_has_menu_frame(void)
    return (sixel_menu_frame != NULL);
 }
 
+static font_renderer_t sixel_font = {
+   sixel_font_init,
+   sixel_font_free,
+   sixel_font_render_msg,
+   "sixel",
+   sixel_font_get_glyph,
+   NULL,                       /* bind_block */
+   NULL,                       /* flush */
+   sixel_font_get_message_width,
+   NULL                        /* get_line_metrics */
+};
+
+
 video_driver_t video_sixel = {
    sixel_gfx_init,
    sixel_gfx_frame,
@@ -670,6 +663,9 @@ video_driver_t video_sixel = {
    NULL, /* shader_load_begin */
    NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   NULL  /* gfx_widgets_enabled */
+   NULL  /* gfx_widgets_enabled */,
 #endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+   &sixel_font
 };

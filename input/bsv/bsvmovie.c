@@ -41,6 +41,9 @@
 #ifdef HAVE_ZSTD
 #include <zstd.h>
 #endif
+#ifdef HAVE_RZSTD
+#include <encodings/rzstd.h>
+#endif
 
 #define BSV_IFRAME_START_TOKEN 0x00
 /* after START:
@@ -600,7 +603,7 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
             break;
          }
 #endif
-#ifdef HAVE_ZSTD
+#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
       case REPLAY_CHECKPOINT2_COMPRESSION_ZSTD:
          {
             size_t uncompressed_size_big;
@@ -611,6 +614,15 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
                calling the function that takes the compressed frames as
                an input?  */
             encoded_data          = (uint8_t*)calloc(encoded_size, sizeof(uint8_t));
+#ifdef HAVE_RZSTD
+            if (rzstd_decode(encoded_data, encoded_size,
+                     compressed_data, compressed_encoded_size,
+                     &uncompressed_size_big) != RZSTD_PROCESS_END)
+               {
+                  ret = false;
+                  goto exit;
+               }
+#else
             uncompressed_size_big = ZSTD_decompress(encoded_data, encoded_size,
                   compressed_data, compressed_encoded_size);
             if (ZSTD_isError(uncompressed_size_big))
@@ -618,6 +630,7 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
                   ret = false;
                   goto exit;
                }
+#endif
             break;
          }
 #endif
@@ -732,9 +745,21 @@ int64_t bsv_movie_write_checkpoint(bsv_movie_t *handle, uint8_t compression, uin
          break;
       }
 #endif
-#ifdef HAVE_ZSTD
+#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
       case REPLAY_CHECKPOINT2_COMPRESSION_ZSTD:
       {
+#ifdef HAVE_RZSTD
+         size_t compressed_encoded_size_zstd = rzstd_compress_bound(encoded_size);
+         compressed_encoded_data = (uint8_t*)calloc(compressed_encoded_size_zstd, sizeof(uint8_t));
+         owns_compressed_encoded = true;
+         if (rzstd_encode(compressed_encoded_data, compressed_encoded_size_zstd,
+                  encoded_data, encoded_size, 3,
+                  &compressed_encoded_size_zstd) != RZSTD_PROCESS_END)
+         {
+            ret = -1;
+            goto exit;
+         }
+#else
          size_t compressed_encoded_size_zstd = ZSTD_compressBound(encoded_size);
          compressed_encoded_data = (uint8_t*)calloc(compressed_encoded_size_zstd, sizeof(uint8_t));
          owns_compressed_encoded = true;
@@ -744,6 +769,7 @@ int64_t bsv_movie_write_checkpoint(bsv_movie_t *handle, uint8_t compression, uin
             ret = -1;
             goto exit;
          }
+#endif
          /* Have to cast after checking the error flags, not before */
          compressed_encoded_size = (uint32_t)compressed_encoded_size_zstd;
          break;
@@ -1035,6 +1061,7 @@ void bsv_movie_next_frame(input_driver_state_t *input_st)
       size_t last_pos        = handle->frame_pos[(MAX(handle->frame_counter,2)-2) & handle->frame_mask];
       size_t cur_pos         = intfstream_tell(handle->file);
       uint32_t back_distance = swap_if_big32((uint32_t)(cur_pos-last_pos));
+      intfstream_seek(handle->file, 0, SEEK_CUR);
       /* write backref */
       intfstream_write(handle->file, &back_distance, sizeof(uint32_t));
       /* write key events, frame is over */
@@ -1173,6 +1200,7 @@ bool replay_get_serialized_data(void* buffer)
       buf                     = ((uint8_t *)buffer) + sizeof(uint32_t);
       intfstream_rewind(handle->file);
       read_amt                = intfstream_read(handle->file, buf, file_end);
+      intfstream_seek(handle->file, file_end, SEEK_SET);
       if (handle->frame_counter > UINT32_MAX) {
          RARCH_ERR("[Replay] Frame counter too big to fit in 32 bits\n");
          return false;
@@ -1568,7 +1596,7 @@ int64_t bsv_movie_write_deduped_state(bsv_movie_t *movie, uint8_t *state,
    size_t superblock_count     = state_size / superblock_byte_size + (state_size % superblock_byte_size != 0);
    uint32_t *superblock_buf    = (uint32_t*)calloc(superblock_size, sizeof(uint32_t));
    uint8_t *padded_block       = NULL;
-   intfstream_t *out_stream    = intfstream_open_writable_memory(output,
+   intfstream_t *out_stream    = intfstream_open_memory(output,
          RETRO_VFS_FILE_ACCESS_READ_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE,
          output_capacity);
    bool can_compare_saves = movie->cur_save_valid && movie->last_save
@@ -1640,7 +1668,7 @@ int64_t bsv_movie_write_deduped_state(bsv_movie_t *movie, uint8_t *state,
             rmsgpack_write_int(out_stream, BSV_IFRAME_NEW_BLOCK_TOKEN);
             rmsgpack_write_int(out_stream, found_block.index);
             /* Cast is fine, a single block can't be super big */
-            rmsgpack_write_bin(out_stream, state+block_start, (uint32_t)block_byte_size);
+            rmsgpack_write_bin(out_stream, (uint8_t*)uint32s_index_get(movie->blocks, found_block.index), block_byte_size);
          }
          else
             reused_blocks++;

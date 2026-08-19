@@ -631,7 +631,7 @@ static void task_netplay_crc_scan_callback(retro_task_t *task,
                   command_event(CMD_EVENT_NETPLAY_INIT_DIRECT_DEFERRED,
                      data->hostname);
 
-               task_push_load_subsystem_with_core(NULL,
+               task_push_load_subsystem_with_core(NULL, NULL,
                   &content_info, CORE_TYPE_PLAIN, NULL, NULL);
             }
             else
@@ -822,7 +822,7 @@ bool task_push_netplay_crc_scan(uint32_t crc, const char *content,
          settings->paths.path_content_history, attr);
    }
 
-   data->current.crc = content_get_crc();
+   data->current.crc = netplay_content_crc();
 
    pbasename  = path_get(RARCH_PATH_BASENAME);
    if (pbasename && *pbasename)

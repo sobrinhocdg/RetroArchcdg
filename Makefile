@@ -121,7 +121,7 @@ ifneq ($(CXX_BUILD), 1)
    CFLAGS += -D_GNU_SOURCE
 endif
 
-DEF_FLAGS += $(INCLUDE_DIRS) -Ideps -Ideps/stb
+DEF_FLAGS += $(INCLUDE_DIRS) -Ideps
 
 CFLAGS += $(DEF_FLAGS)
 CXXFLAGS += $(DEF_FLAGS) -D__STDC_CONSTANT_MACROS
@@ -207,7 +207,7 @@ endif
 $(MOC_SRC):
 	@$(if $(Q), $(shell echo echo MOC $<),)
 	$(eval MOC_TMP := $(patsubst %.h,%_moc.cpp,$@))
-	$(Q)QT_SELECT=$(QT_VERSION) $(MOC) -o $(MOC_TMP) $<
+	$(Q)QT_SELECT=$(QT_VERSION) $(MOC) $(DEFINES) -o $(MOC_TMP) $<
 
 $(foreach x,$(join $(addsuffix :,$(MOC_SRC)),$(MOC_HEADERS)),$(eval $x))
 

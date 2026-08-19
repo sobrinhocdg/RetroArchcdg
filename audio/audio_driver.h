@@ -39,6 +39,7 @@
 #include <audio/audio_mixer.h>
 #endif
 #include <audio/audio_resampler.h>
+#include <audio/sinc_resampler_int16.h>
 
 #include "audio_defines.h"
 
@@ -73,6 +74,28 @@ typedef struct audio_mixer_stream_params
    enum audio_mixer_stream_type stream_type;
    enum audio_mixer_type type;
    enum audio_mixer_state state;
+   /* Optional ownership transfer: when buf_owner is non-NULL,
+    * add_stream borrows 'buf' from it instead of copying, and
+    * buf_owner_free(buf_owner) runs when the stream's sound is
+    * destroyed - or immediately on any failure path, or after the
+    * conversion for WAV.  Ownership transfers on the call in every
+    * outcome; 'buf' must stay valid inside the owner until release.
+    * Callers with no owned object set both to NULL and keep today's
+    * copy semantics. */
+   void *buf_owner;
+   void (*buf_owner_free)(void *owner);
+   /* Optional: receives the slot index the stream landed in (or -1 on
+    * failure).  NULL when the caller does not need it. */
+   int *out_slot;
+   /* Optional (windowed Ogg-Opus only): the stream's last-page granule,
+    * found by the feeder from a bounded tail peek so the decoder need
+    * not scan the whole file for it.  0 means not supplied - the
+    * decoder does its normal full end-granule scan. */
+   int64_t end_granule;
+   /* Windowed sources: bytes resident from the start of buf when the
+    * stream is added, bounding the decoder's container header parse.
+    * 0 means the whole buffer is there. */
+   size_t avail;
 } audio_mixer_stream_params_t;
 #endif
 
@@ -115,19 +138,44 @@ typedef struct audio_driver
    /**
     * Temporarily pauses the audio driver.
     *
+    * Reports the resulting state, not the work done: a driver that is
+    * already stopped returns \c true, because it is stopped. Whether
+    * the hardware offers a pause primitive is an implementation detail
+    * - a driver with none simply stops consuming samples - so it must
+    * not leak into the return value or into \c alive.
+    *
     * @param data Opaque handle to the audio driver context
     * that was returned by \c init.
-    * @return \c true if the audio driver was successfully paused,
-    * \c false if there was an error.
+    * @return \c true if the audio driver is now paused,
+    * \c false if it could not be.
     **/
    bool (*stop)(void *data);
 
    /**
     * Resumes audio driver from the paused state.
+    *
+    * Reports the resulting state, as \c stop does: a driver that is
+    * already running returns \c true.
+    *
+    * Returning \c false is not a soft failure. audio_driver_start()
+    * clears AUDIO_FLAG_ACTIVE on it, which disables audio for the rest
+    * of the session, so it is reserved for a stream that genuinely
+    * cannot be resumed. A driver that can recover by other means -
+    * reinitialising the stream, falling back to a restart when a pause
+    * primitive it advertised turns out not to work - should do that and
+    * return \c true.
     **/
    bool (*start)(void *data, bool is_shutdown);
 
-   /* Is the audio driver currently running? */
+   /**
+    * Is the audio driver currently running?
+    *
+    * Must agree with the last successful \c stop or \c start. Drivers
+    * that track this with a flag have to maintain it on every path
+    * through both, including the ones where the hardware call was
+    * skipped; a flag updated only inside the branch that talks to the
+    * hardware leaves \c alive reporting the opposite of the truth.
+    **/
    bool (*alive)(void *data);
 
    /* Should we care about blocking in audio thread? Fast forwarding.
@@ -206,17 +254,30 @@ typedef struct
 #endif
 
    /**
-    * A scratch buffer for processed audio output to be converted to 16-bit,
-    * so that it can be sent to the driver.
+    * The driver's int16 output staging buffer. Holds the final 16-bit samples
+    * that are sent to the audio driver and to recording, from whichever source
+    * produced them: the float->s16 conversion of the float resampler's output,
+    * the integer s16 resampler writing here directly, or the single-sample
+    * callback. Only the float path performs an int16 conversion into it; the
+    * other producers write s16 directly.
     */
-   int16_t *output_samples_conv_buf;
-   size_t output_samples_conv_buf_length;
+   int16_t *output_samples_int16;
+   size_t output_samples_int16_length;
 #ifdef HAVE_DSP_FILTER
    retro_dsp_filter_t *dsp;
 #endif
    const retro_resampler_t *resampler;
 
    void *resampler_data;
+
+   /* Optional deterministic integer (s16) resampler, used by the s16 path
+    * in audio_driver_flush() when the selected resampler has an int16
+    * implementation ("sinc", "nearest", "CC") and no float-domain stage is
+    * active.  NULL otherwise.  The process/free entry points are selected
+    * alongside the handle so the s16 path is backend-agnostic. */
+   void *resampler_data_int16;
+   void (*resampler_int16_process)(void *, struct resampler_data_int16 *);
+   void (*resampler_int16_free)(void *);
 
    /**
     * The current audio driver.
@@ -229,6 +290,12 @@ typedef struct
     * Scratch buffer for preparing data for the resampler
     */
    float *input_data;
+   float *synth_buf;
+   /* int16 scratch for the s16 path: running a fully-int16 DSP chain
+    * and/or summing an in-process synth without an int16<->float round-trip.
+    * Allocated only when an int16 resampler exists, since that path cannot
+    * run without one; NULL otherwise. */
+   int16_t *input_data_int16;
    size_t input_data_length;
 #ifdef HAVE_AUDIOMIXER
    struct audio_mixer_stream mixer_streams[AUDIO_MIXER_MAX_SYSTEM_STREAMS];
@@ -273,6 +340,47 @@ typedef struct
    retro_time_t last_flush_time;
    /* Exponential moving average */
    retro_time_t avg_flush_delta;
+
+   /* Rate-limit state for the DRC compute.
+    *
+    * The DRC ratio is updated approximately once per game-frame's worth
+    * of submitted samples rather than once per audio_driver_sample_batch
+    * call. Cores that submit a single batch per retro_run see DRC fire
+    * once per frame as before. Cores that submit N sub-frame batches
+    * per retro_run see DRC fire approximately once per frame (when the
+    * cumulative samples cross the threshold) instead of N times per
+    * frame. This:
+    *   - removes (N-1) per-call audio->write_avail calls (a syscall on
+    *     ALSA/WASAPI/Pulse/PipeWire backends; cheap on CoreAudio)
+    *   - stabilises the resampler ratio (the DRC was designed around
+    *     a once-per-frame time constant; per-batch updates sample
+    *     write_avail at sub-frame phase, adding noise to the loop)
+    *
+    * drc_threshold_int16s is recomputed by audio_driver_update_drc_threshold
+    * from the current input sample rate and av_info.timing.fps whenever
+    * audio_driver_init_internal runs (which is also where the input
+    * rate gets set, and where SET_SYSTEM_AV_INFO drives reinit). This
+    * keeps the "one frame's worth" target accurate at any output sample
+    * rate (48 kHz, 96 kHz, 192 kHz, ...) and any content fps. */
+   double   cached_rate_adjust;        /* last computed factor; default 1.0 */
+   size_t   samples_since_drc;         /* int16 samples submitted since last update */
+   size_t   drc_threshold_int16s;      /* one frame's worth of stereo int16 at the current rate */
+
+   /* Last-flush sample-format diagnostics for the on-screen statistics
+    * overlay. stat_core_is_float records whether the core delivered float
+    * (audio_driver_sample_batch_float) or int16 (audio_driver_sample_batch)
+    * samples; stat_frontend_is_float records whether the frontend processed
+    * that audio through the float resampler path (true) or an integer path
+    * (false: either the write_raw raw-int16 fast path or the deterministic
+    * s16 resampler path). */
+   bool     stat_core_is_float;
+   bool     stat_frontend_is_float;
+
+   /* Unity passthrough state: set when the float path skipped the
+    * resampler because the ratio was exactly 1.0 (see audio_driver_flush).
+    * Used to re-initialise the resampler on the transition back to actual
+    * resampling so it does not resume from a stale ring buffer. */
+   bool     resampler_bypassed;
 } audio_driver_state_t;
 
 bool audio_driver_enable_callback(void);
@@ -308,6 +416,16 @@ audio_mixer_stream_t *audio_driver_mixer_get_stream(unsigned i);
 
 bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params);
 
+/* Compressed-byte read position of the stream in 'slot' (its
+ * decoder's offset within the source buffer), or -1 when the slot
+ * holds no live stream.  The windowed-source feeder's polling
+ * input. */
+int64_t audio_driver_mixer_stream_byte_tell(unsigned i);
+
+/* Raise a windowed stream's resident prefix as its feeder slides the
+ * window forward.  The mirror of audio_driver_mixer_stream_byte_tell. */
+void audio_driver_mixer_stream_set_avail(unsigned i, size_t avail);
+
 void audio_driver_mixer_play_stream(unsigned i);
 
 void audio_driver_mixer_play_menu_sound(unsigned i);
@@ -331,6 +449,8 @@ void audio_driver_mixer_remove_stream(unsigned i);
 enum audio_mixer_state audio_driver_mixer_get_stream_state(unsigned i);
 
 const char *audio_driver_mixer_get_stream_name(unsigned i);
+
+unsigned audio_driver_mixer_get_streams_playing(void);
 
 void audio_driver_load_system_sounds(void);
 
@@ -380,6 +500,17 @@ void audio_driver_sample(int16_t left, int16_t right);
  **/
 size_t audio_driver_sample_batch(const int16_t *data, size_t frames);
 
+/**
+ * audio_driver_sample_batch_float:
+ *
+ * Float counterpart of audio_driver_sample_batch(), handed to a core via
+ * RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT. Samples are interleaved
+ * stereo float normalized to [-1.0, 1.0].
+ *
+ * @return Number of frames processed.
+ **/
+size_t audio_driver_sample_batch_float(const float *data, size_t frames);
+
 #ifdef HAVE_REWIND
 /**
  * audio_driver_sample_rewind:
@@ -423,6 +554,7 @@ extern audio_driver_t audio_openal;
 extern audio_driver_t audio_opensl;
 extern audio_driver_t audio_jack;
 extern audio_driver_t audio_sdl;
+extern audio_driver_t audio_sdl3;
 extern audio_driver_t audio_xa;
 extern audio_driver_t audio_pulse;
 extern audio_driver_t audio_pipewire;
@@ -453,6 +585,18 @@ extern audio_driver_t audio_rwebaudio;
 extern audio_driver_t audio_audioworklet;
 
 audio_driver_state_t *audio_state_get_ptr(void);
+
+/**
+ * audio_driver_update_drc_threshold:
+ *
+ * Recompute drc_threshold_int16s for the current sample rate / fps.
+ * Called from audio_driver_init_internal whenever audio is initialized
+ * or reinitialised (which covers SET_SYSTEM_AV_INFO and output-rate
+ * setting changes), and from refresh-rate change paths in retroarch.c
+ * that update audio_driver_state_t::input without driving a full audio
+ * reinit.
+ **/
+void audio_driver_update_drc_threshold(audio_driver_state_t *audio_st);
 
 const char *audio_driver_get_ident(void);
 

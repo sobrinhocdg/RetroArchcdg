@@ -42,16 +42,28 @@ import android.view.accessibility.AccessibilityManager;
 import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.Surface;
+import android.graphics.Point;
+import android.view.Display;
 import android.view.WindowManager;
+import android.view.KeyEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.app.UiModeManager;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Environment;
 import android.os.PowerManager;
 import android.os.CombinedVibration;
 import android.os.Vibrator;
 import android.os.VibrationEffect;
 import android.os.VibratorManager;
 import android.util.Log;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.widget.EditText;
+import android.widget.TextView;
 
 
 import java.io.File;
@@ -139,7 +151,18 @@ public class RetroActivityCommon extends NativeActivity
     cleanupSymlinks();
     updateSymlinks();
 
-    registerReceiver(mUsbPermissionReceiver, new IntentFilter(ACTION_USB_PERMISSION));
+    if (Build.VERSION.SDK_INT >= 33) {
+      registerReceiver(
+        mUsbPermissionReceiver,
+        new IntentFilter(ACTION_USB_PERMISSION),
+        4 /* Context.RECEIVER_NOT_EXPORTED */
+      );
+    } else {
+      registerReceiver(
+        mUsbPermissionReceiver,
+        new IntentFilter(ACTION_USB_PERMISSION)
+      );
+    }
     ((InputManager) getSystemService(Context.INPUT_SERVICE))
             .registerInputDeviceListener(this, null);
     PlayCoreManager.getInstance().onCreate(this);
@@ -159,6 +182,39 @@ public class RetroActivityCommon extends NativeActivity
   @Override
   public void onActivityResult(int requestCode, int resultCode, Intent intent)
   {
+    if (requestCode == 124)
+    {
+      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+      {
+        if (android.os.Environment.isExternalStorageManager())
+        {
+          Intent restartIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+          if (restartIntent != null)
+          {
+            restartIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(restartIntent);
+          }
+          finish();
+        }
+        else
+        {
+          try
+          {
+            Intent permIntent = new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+            permIntent.addCategory("android.intent.category.DEFAULT");
+            permIntent.setData(Uri.parse(String.format("package:%s", getPackageName())));
+            startActivityForResult(permIntent, 124);
+          }
+          catch (Exception e)
+          {
+            Intent permIntent = new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+            startActivityForResult(permIntent, 124);
+          }
+        }
+      }
+      return;
+    }
+
     if (intent == null)
       return;
 
@@ -812,6 +868,302 @@ public class RetroActivityCommon extends NativeActivity
     return (int)percent;
   }
 
+  /**
+   * The refresh rate the screen is actually running at, in Hz, or 0
+   * if it cannot be determined.
+   *
+   * Three tiers, because the way to reach the Display changed twice
+   * and this ships back to API 16:
+   *
+   *  - API 30+ : Activity.getDisplay().  getDefaultDisplay() is
+   *              deprecated from here, and on a non-visual context it
+   *              can hand back something that reports nothing useful.
+   *  - API 23+ : the display's current Display.Mode, which is the
+   *              exact rate of the mode in effect rather than a
+   *              rounded nominal figure.
+   *  - below   : Display.getRefreshRate(), present since API 1.
+   *
+   * Read live rather than cached: the rate changes underneath us when
+   * the system switches mode, which is precisely what a user checking
+   * this setting wants to see.
+   */
+  /**
+   * The display modes the screen supports, packed for JNI as
+   * {id, width, height, millihertz} per mode.
+   *
+   * Mode enumeration is API 23: Display.getSupportedModes() and
+   * Display.Mode both arrived in Marshmallow, and nothing before it
+   * exposes more than the size currently in effect.  So on older
+   * devices - Lollipop, KitKat, and the API 16 floor the jelly-bean
+   * tree still builds against - this reports a single mode
+   * describing the current state, which is all the platform knows.
+   * That keeps the caller's shape identical everywhere: there is
+   * always at least one mode, and exactly one of them is current.
+   *
+   * Refresh rate is carried as millihertz because the caller's
+   * config carries an integer rate alongside the float one, and
+   * 59.94 must not become 59 on the way through.
+   *
+   * Returns null when nothing can be determined.
+   */
+  @SuppressWarnings("deprecation")
+  public int[] getDisplayModes()
+  {
+    try
+    {
+      Display display = getActiveDisplay();
+
+      if (display == null)
+        return null;
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+      {
+        Display.Mode[] modes = display.getSupportedModes();
+
+        if (modes != null && modes.length > 0)
+        {
+          int[] packed = new int[modes.length * 4];
+
+          for (int i = 0; i < modes.length; i++)
+          {
+            packed[i * 4]     = modes[i].getModeId();
+            packed[i * 4 + 1] = modes[i].getPhysicalWidth();
+            packed[i * 4 + 2] = modes[i].getPhysicalHeight();
+            packed[i * 4 + 3] = Math.round(modes[i].getRefreshRate() * 1000.0f);
+          }
+
+          return packed;
+        }
+      }
+
+      /* Pre-Marshmallow, or a display that reports no modes: describe
+       * the one state we can see. */
+      {
+        Point size = new Point();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1)
+          display.getRealSize(size);
+        else
+          display.getSize(size);
+
+        if (size.x <= 0 || size.y <= 0)
+          return null;
+
+        return new int[] {
+          0, size.x, size.y,
+          Math.round(display.getRefreshRate() * 1000.0f)
+        };
+      }
+    }
+    catch (Exception e)
+    {
+      Log.w("RetroActivityCommon", "getDisplayModes failed: " + e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * The mode id currently in effect, or 0 when it cannot be
+   * determined - which is also the id reported for the synthesised
+   * single mode on pre-Marshmallow devices, so the two agree.
+   */
+  public int getCurrentDisplayModeId()
+  {
+    try
+    {
+      Display display = getActiveDisplay();
+
+      if (display == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+        return 0;
+
+      Display.Mode mode = display.getMode();
+      return (mode != null) ? mode.getModeId() : 0;
+    }
+    catch (Exception e)
+    {
+      Log.w("RetroActivityCommon",
+            "getCurrentDisplayModeId failed: " + e.getMessage());
+      return 0;
+    }
+  }
+
+  /**
+   * Asks the system for a display mode by id.  Returns false when
+   * the request cannot be made, which on anything before API 23
+   * means always: preferredDisplayModeId arrived with the mode API
+   * itself, and there is no older way to ask.
+   *
+   * A request, not a guarantee - the system may keep the current
+   * mode.  getCurrentDisplayModeId() is what says whether it took.
+   */
+  public boolean setDisplayModeId(final int modeId)
+  {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+      return false;
+
+    try
+    {
+      /* Window attributes are the UI thread's to touch. */
+      runOnUiThread(new Runnable() {
+        @Override
+        public void run()
+        {
+          try
+          {
+            WindowManager.LayoutParams params = getWindow().getAttributes();
+
+            params.preferredDisplayModeId     = modeId;
+
+            /* Clearing the rate preference is what makes the mode
+             * request effective.
+             *
+             * preferredRefreshRate is a SEPARATE request, and the two
+             * contradict each other: a rate preference of 60 makes
+             * the framework vote
+             *   APP_REQUEST_REFRESH_RATE_RANGE [60, 60]
+             *                     disableRefreshRateSwitching=true
+             * which pins the display at 60 no matter which mode id
+             * was asked for.  Selecting a 120 Hz mode then changed
+             * nothing, because the app was still asking not to leave
+             * 60.  The mode id names a rate already, so a rate
+             * preference alongside it is redundant as well as
+             * conflicting. */
+            params.preferredRefreshRate       = 0.0f;
+
+            getWindow().setAttributes(params);
+
+            /* Remember it, so onResume() does not re-pin the rate and
+             * undo this the next time the app comes forward. */
+            explicitDisplayModeId             = modeId;
+
+            Log.i("RetroActivityCommon",
+                  "preferredDisplayModeId set to " + modeId
+                  + " (rate preference cleared); display now reports"
+                  + " mode " + getCurrentDisplayModeId());
+          }
+          catch (Exception e)
+          {
+            Log.w("RetroActivityCommon",
+                  "setDisplayModeId failed: " + e.getMessage());
+          }
+        }
+      });
+      return true;
+    }
+    catch (Exception e)
+    {
+      Log.w("RetroActivityCommon",
+            "setDisplayModeId failed: " + e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * Re-assert a chosen display mode when the activity comes back to
+   * the foreground.
+   *
+   * The window is torn down when the app goes to the background, and
+   * the mode chosen for it does not survive - which is why a 120 Hz
+   * selection came back as 60 on returning from the Android UI.
+   * Nothing was overriding it; it had simply gone with the window.
+   */
+  protected void reapplyDisplayMode()
+  {
+    if (explicitDisplayModeId == 0)
+      return;
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+      return;
+
+    try
+    {
+      WindowManager.LayoutParams params = getWindow().getAttributes();
+
+      if (params.preferredDisplayModeId == explicitDisplayModeId
+            && params.preferredRefreshRate == 0.0f)
+        return;
+
+      params.preferredDisplayModeId = explicitDisplayModeId;
+      params.preferredRefreshRate   = 0.0f;
+      getWindow().setAttributes(params);
+
+      Log.i("RetroActivityCommon",
+            "Re-applied display mode " + explicitDisplayModeId
+            + " on resume; display reports mode "
+            + getCurrentDisplayModeId());
+    }
+    catch (Exception e)
+    {
+      Log.w("RetroActivityCommon",
+            "reapplyDisplayMode failed: " + e.getMessage());
+    }
+  }
+
+  /**
+   * Non-zero once a display mode has been chosen explicitly, which
+   * means the refresh rate preference must not be re-applied: doing
+   * so re-pins the rate and undoes the selection.
+   */
+  protected int explicitDisplayModeId = 0;
+
+  /**
+   * True when a display mode has been chosen explicitly, so a caller
+   * knows not to express a competing rate preference.
+   */
+  public boolean hasExplicitDisplayMode()
+  {
+    return explicitDisplayModeId != 0;
+  }
+
+  /**
+   * The Display this activity is on.  getDefaultDisplay() is
+   * deprecated from API 30, and on a non-visual context it can hand
+   * back something that reports nothing useful, so prefer the
+   * activity's own display where it exists.
+   */
+  @SuppressWarnings("deprecation")
+  private Display getActiveDisplay()
+  {
+    Display display = null;
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+      display = getDisplay();
+
+    if (display == null)
+    {
+      WindowManager wm = (WindowManager)getSystemService(Context.WINDOW_SERVICE);
+      if (wm != null)
+        display = wm.getDefaultDisplay();
+    }
+
+    return display;
+  }
+
+  @SuppressWarnings("deprecation")
+  public float getRefreshRate()
+  {
+    try
+    {
+      Display display = getActiveDisplay();
+
+      if (display == null)
+        return 0.0f;
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+      {
+        Display.Mode mode = display.getMode();
+        if (mode != null)
+          return mode.getRefreshRate();
+      }
+
+      return display.getRefreshRate();
+    }
+    catch (Exception e)
+    {
+      Log.w("RetroActivityCommon", "getRefreshRate failed: " + e.getMessage());
+      return 0.0f;
+    }
+  }
+
   public int getPowerstate()
   {
     IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
@@ -894,7 +1246,16 @@ public class RetroActivityCommon extends NativeActivity
    * @return the list of available cores
    */
   public String[] getAvailableCores() {
-    int id = getResources().getIdentifier("module_names_" + Build.CPU_ABI.replace('-', '_'), "array", getPackageName());
+    int id = getResources().getIdentifier(
+      "module_names_" + Build.CPU_ABI.replace('-', '_'),
+      "array",
+      getPackageName()
+    );
+
+    if (id == 0) {
+      Log.w("RetroActivity", "No dynamic feature core list found for ABI: " + Build.CPU_ABI);
+      return new String[0];
+    }
 
     String[] returnVal = getResources().getStringArray(id);
     Log.i("RetroActivity", "getAvailableCores: " + Arrays.toString(returnVal));
@@ -960,7 +1321,116 @@ public class RetroActivityCommon extends NativeActivity
     PlayCoreManager.getInstance().deleteCore(coreName);
   }
 
+  /////////////// System (IME) keyboard ///////////////
 
+  /* A near-invisible EditText that proxies the system soft keyboard for the
+   * menu's text entry, so users get clipboard paste and password managers
+   * (which the built-in on-screen keyboard cannot offer). Committed/pasted
+   * text is forwarded to native via onSystemKeyboardInput(). */
+  private EditText keyboardEditText;
+  private boolean  keyboardActive;
+  private boolean  keyboardSuppressWatcher;
+
+  /**
+   * Raises the native system keyboard for menu text entry.
+   *
+   * Called from native code (the menu on-screen keyboard path). Runs the
+   * UI work on the UI thread.
+   *
+   * @param label       Hint shown in the keyboard field, or null.
+   * @param initialText Text to pre-fill the field with, or null.
+   */
+  public void showKeyboard(final String label, final String initialText) {
+    runOnUiThread(new Runnable() {
+      @Override public void run() {
+        if (keyboardEditText == null) {
+          keyboardEditText = new EditText(RetroActivityCommon.this) {
+            @Override public boolean onKeyPreIme(int keyCode, KeyEvent event) {
+              /* BACK while the keyboard is up = dismiss without confirming. */
+              if (keyCode == KeyEvent.KEYCODE_BACK
+                    && event.getAction() == KeyEvent.ACTION_UP
+                    && keyboardActive) {
+                hideKeyboard();
+                onSystemKeyboardInput(null, true);
+                return true;
+              }
+              return super.onKeyPreIme(keyCode, event);
+            }
+          };
+          keyboardEditText.setSingleLine(true);
+          keyboardEditText.setImeOptions(EditorInfo.IME_ACTION_DONE
+                | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+          keyboardEditText.setAlpha(0.0f);
+
+          keyboardEditText.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) {
+              if (keyboardActive && !keyboardSuppressWatcher)
+                onSystemKeyboardInput(s.toString(), false);
+            }
+          });
+
+          keyboardEditText.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+              if (actionId == EditorInfo.IME_ACTION_DONE
+                    || actionId == EditorInfo.IME_ACTION_GO
+                    || actionId == EditorInfo.IME_ACTION_SEARCH
+                    || actionId == EditorInfo.IME_ACTION_NEXT
+                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                String text = v.getText().toString();
+                hideKeyboard();
+                onSystemKeyboardInput(text, true);
+                return true;
+              }
+              return false;
+            }
+          });
+
+          addContentView(keyboardEditText, new ViewGroup.LayoutParams(1, 1));
+        }
+
+        keyboardActive = true;
+        keyboardSuppressWatcher = true;
+        keyboardEditText.setText(initialText != null ? initialText : "");
+        keyboardEditText.setSelection(keyboardEditText.getText().length());
+        keyboardSuppressWatcher = false;
+        if (label != null)
+          keyboardEditText.setHint(label);
+        keyboardEditText.setVisibility(View.VISIBLE);
+        keyboardEditText.setFocusable(true);
+        keyboardEditText.setFocusableInTouchMode(true);
+        keyboardEditText.requestFocus();
+
+        InputMethodManager imm = (InputMethodManager)
+              getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null)
+          imm.showSoftInput(keyboardEditText, InputMethodManager.SHOW_FORCED);
+      }
+    });
+  }
+
+  /**
+   * Dismisses the system keyboard.
+   *
+   * Called from native code and after the user confirms or cancels.
+   */
+  public void hideKeyboard() {
+    runOnUiThread(new Runnable() {
+      @Override public void run() {
+        if (keyboardEditText == null)
+          return;
+        keyboardActive = false;
+        InputMethodManager imm = (InputMethodManager)
+              getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null)
+          imm.hideSoftInputFromWindow(keyboardEditText.getWindowToken(), 0);
+        keyboardEditText.clearFocus();
+        keyboardEditText.setVisibility(View.GONE);
+      }
+    });
+  }
 
   /////////////// JNI methods ///////////////
 
@@ -989,6 +1459,14 @@ public class RetroActivityCommon extends NativeActivity
    * Called when the user grants access to a Storage Access Framework tree.
    */
   public native void safTreeAdded(String tree);
+
+  /**
+   * Forwards system-keyboard text to native menu input.
+   *
+   * @param text     Current text, or null to cancel (keyboard dismissed).
+   * @param finished true when the user confirmed (Done/Enter) or cancelled.
+   */
+  public native void onSystemKeyboardInput(String text, boolean finished);
 
 
 

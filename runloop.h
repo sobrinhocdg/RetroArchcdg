@@ -125,9 +125,19 @@ enum runloop_flags
    RUNLOOP_FLAG_PAUSED                            = (1 << 27),
    RUNLOOP_FLAG_IDLE                              = (1 << 28),
    RUNLOOP_FLAG_FOCUSED                           = (1 << 29),
-   RUNLOOP_FLAG_FORCE_NONBLOCK                    = (1 << 30),
-   RUNLOOP_FLAG_IS_INITED                         = (1 << 31)
+   RUNLOOP_FLAG_FORCE_NONBLOCK                    = (1 << 30)
+   /* (1 << 31) was RUNLOOP_FLAG_IS_INITED.  Moved out of this word into
+    * an atomic behind the runloop_is_inited_* accessors: it is the only
+    * bit here read off the main thread (the AppIntents entity query runs
+    * on a GCD worker), and the main thread's non-atomic read-modify-
+    * writes of this word would race that read.  Bit left reserved. */
 };
+
+/* Whether retroarch_main_init() has completed.  Written on the main
+ * thread, readable from any thread. */
+void runloop_is_inited_set(void);
+void runloop_is_inited_clear(void);
+bool runloop_is_inited(void);
 
 /* Contains the current retro_fastforwarding_override
  * parameters along with any pending updates triggered
@@ -173,6 +183,25 @@ struct runloop
    retro_time_t frame_limit_last_time;
    retro_usec_t frame_time_last;                /* int64_t alignment */
 
+   /* Per-frame scalar state. Kept adjacent to the timing block above so the
+    * whole set the frame loop evaluates every iteration lands in the first
+    * cache lines of the struct, rather than ~348 lines further in behind the
+    * content/system/subsystem blocks. Declaration order only; every access is
+    * by member name. */
+   fastmotion_overrides_t fastmotion_override;  /* float alignment */
+
+   enum rarch_core_type current_core_type;
+   enum rarch_core_type explicit_current_core_type;
+   enum poll_type_override_t core_poll_type_override;
+#if defined(HAVE_RUNAHEAD)
+   enum rarch_core_type last_core_type;
+#endif
+
+   uint32_t flags;
+   int16_t entry_state_slot;
+   uint8_t pending_disk_control_insert;
+   int8_t run_frames_and_pause;
+
    struct retro_core_t        current_core;     /* uint64_t alignment */
 #if defined(HAVE_RUNAHEAD)
    uint64_t runahead_last_frame_count;          /* uint64_t alignment */
@@ -183,7 +212,13 @@ struct runloop
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
    char    *secondary_library_path;
 #endif
-   my_list *runahead_save_state_list;
+   /* Embedded directly: was previously a my_list wrapper holding a
+    * single retro_ctx_serialize_info_t* in data[0].  The list machinery
+    * was overkill for one pointer — two extra mallocs at init (the
+    * my_list struct + its 16-slot data array), one extra indirection
+    * per access, and a constructor/destructor function-pointer pair
+    * for what amounts to alloc/free of a data buffer. */
+   retro_ctx_serialize_info_t runahead_savestate_info;
    my_list *input_state_list;
    preempt_t *preempt_data;
 #endif
@@ -253,22 +288,7 @@ struct runloop
    unsigned perf_ptr_libretro;
    unsigned subsystem_current_count;
    unsigned video_swap_interval_auto;
-   int16_t entry_state_slot;
-
-   fastmotion_overrides_t fastmotion_override; /* float alignment */
-
    retro_bits_t has_set_libretro_device;        /* uint32_t alignment */
-
-   enum rarch_core_type current_core_type;
-   enum rarch_core_type explicit_current_core_type;
-   enum poll_type_override_t core_poll_type_override;
-#if defined(HAVE_RUNAHEAD)
-   enum rarch_core_type last_core_type;
-#endif
-
-   uint32_t flags;
-   uint8_t pending_disk_control_insert;
-   int8_t run_frames_and_pause;
 
    char runtime_content_path_basename[PATH_MAX_LENGTH];
 #ifdef HAVE_SCREENSHOTS
@@ -303,6 +323,23 @@ struct runloop
 
    bool perfcnt_enable;
    bool paused_hotkey;
+
+   /* True from the moment closing content starts tearing the core
+    * down until the teardown is finished.
+    *
+    * Set and cleared around the existing synchronous teardown, so at
+    * present nothing can observe it as true: the main thread is
+    * inside that teardown for its whole duration and no frame runs.
+    * It is introduced separately, and deliberately inert, because
+    * the work that makes it observable - returning to the frame loop
+    * instead of blocking - is a lifecycle change, and this is the
+    * piece everything else will key off.
+    *
+    * A plain bool rather than a RUNLOOP_FLAG bit: bits 0-30 of that
+    * word are taken and bit 31 was deliberately vacated to avoid a
+    * cross-thread race, so reusing it would undo that reasoning for
+    * no gain. This is main-thread only. */
+   bool content_closing;
 };
 
 typedef struct runloop runloop_state_t;
@@ -406,7 +443,20 @@ void runloop_task_msg_queue_push(
       unsigned prio, unsigned duration,
       bool flush);
 
-bool secondary_core_ensure_exists(void *data, settings_t *settings);
+/* Status of the asynchronous secondary-core binary copy. Only
+ * RUNAHEAD_COPY_READY means the secondary instance exists and its
+ * function pointers are safe to call; PENDING means the copy task
+ * is still running (callers should skip quietly and retry later,
+ * NOT tear the secondary state down). */
+enum runahead_copy_status
+{
+   RUNAHEAD_COPY_UNAVAILABLE = 0,
+   RUNAHEAD_COPY_PENDING,
+   RUNAHEAD_COPY_READY
+};
+
+enum runahead_copy_status secondary_core_ensure_exists(void *data,
+      settings_t *settings);
 
 void runloop_log_counters(
       struct retro_perf_counter **counters, unsigned num);
@@ -455,6 +505,15 @@ bool runloop_init_libretro_symbols(
       void *_lib_handle_p);
 
 runloop_state_t *runloop_state_get_ptr(void);
+
+/**
+ * runloop_is_content_closing:
+ *
+ * True while content is being closed, i.e. while the core is being
+ * torn down.  Currently only ever true inside the synchronous
+ * teardown, where nothing else runs to ask.
+ */
+bool runloop_is_content_closing(void);
 
 RETRO_END_DECLS
 

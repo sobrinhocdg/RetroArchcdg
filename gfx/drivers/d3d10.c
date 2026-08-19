@@ -800,6 +800,13 @@ static void gfx_display_d3d10_draw_pipeline(gfx_display_ctx_draw_t* draw,
          D3D10_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
    d3d10->ubo_values.time += 0.01f;
+   /* Wrap at 65536 to keep fp32 increments precise. 0.01 stays
+    * exactly representable up to t ~ 167772 (where 0.5*ulp first
+    * exceeds 0.01), so 65536 has wide margin and wraps roughly
+    * every 30 h of cumulative menu time, making the discontinuity
+    * effectively unobservable. */
+   if (d3d10->ubo_values.time > 65536.0f)
+      d3d10->ubo_values.time -= 65536.0f;
 
    {
       void *mapped_ubo              = NULL;
@@ -845,22 +852,6 @@ void gfx_display_d3d10_scissor_end(void *data,
    d3d10->device->lpVtbl->RSSetScissorRects(d3d10->device, 1, &rect);
 }
 
-gfx_display_ctx_driver_t gfx_display_ctx_d3d10 = {
-   gfx_display_d3d10_draw,
-   gfx_display_d3d10_draw_pipeline,
-   gfx_display_d3d10_blend_begin,
-   gfx_display_d3d10_blend_end,
-   NULL,                                     /* get_default_mvp        */
-   NULL,                                     /* get_default_vertices   */
-   NULL,                                     /* get_default_tex_coords */
-   FONT_DRIVER_RENDER_D3D10_API,
-   GFX_VIDEO_DRIVER_DIRECT3D10,
-   "d3d10",
-   true,
-   gfx_display_d3d10_scissor_begin,
-   gfx_display_d3d10_scissor_end
-};
-
 /*
  * FONT DRIVER
  */
@@ -875,7 +866,7 @@ static void *d3d10_font_init(void* data, const char* font_path,
       return NULL;
 
    if (!font_renderer_create_default(
-             &font->font_driver, &font->font_data, font_path, font_size))
+             &font->font_driver, &font->font_data, font_path, font_size, FONT_ATLAS_FORMAT_A8))
    {
       free(font);
       return NULL;
@@ -953,10 +944,49 @@ static int d3d10_font_get_message_width(void* data,
    return delta_x * scale;
 }
 
+/* Update only the atlas dirty rectangle of the A8 font texture:
+ * map the staging texture preserving its contents, copy the changed
+ * rows, and issue a boxed CopySubresourceRegion for just that area.
+ * The generic d3d10_update_texture() re-uploads the whole surface. */
+static void d3d10_font_update_atlas_region(
+      D3D10Device ctx, d3d10_font_t *font,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+   unsigned y;
+   D3D10_MAPPED_TEXTURE2D mapped;
+   D3D10_BOX box;
+
+   if (     x1 <= x0 || y1 <= y0
+         || x1 > (unsigned)font->atlas->width
+         || y1 > (unsigned)font->atlas->height)
+      return;
+
+   if (FAILED(font->texture.staging->lpVtbl->Map(
+         font->texture.staging, 0, D3D10_MAP_WRITE, 0, &mapped)))
+      return;
+
+   for (y = y0; y < y1; y++)
+      memcpy((uint8_t*)mapped.pData + y * mapped.RowPitch + x0,
+             font->atlas->buffer + (size_t)y * font->atlas->width + x0,
+             x1 - x0);
+
+   font->texture.staging->lpVtbl->Unmap(font->texture.staging, 0);
+
+   box.left   = x0;
+   box.top    = y0;
+   box.front  = 0;
+   box.right  = x1;
+   box.bottom = y1;
+   box.back   = 1;
+   ctx->lpVtbl->CopySubresourceRegion(
+         ctx, (D3D10Resource)font->texture.handle, 0, x0, y0, 0,
+         (D3D10Resource)font->texture.staging, 0, &box);
+}
+
 static void d3d10_font_render_msg(
       void *userdata,
       void* data,
-      const char* msg,
+      const char* msg, size_t msg_len,
       const struct font_params *params)
 {
    float line_height;
@@ -1064,7 +1094,7 @@ static void d3d10_font_render_msg(
    }
 
    /* Single VBO map for all geometry (drop shadow + main text) */
-   if (d3d10->sprites.offset + strlen(msg) * (has_drop ? 2 : 1)
+   if (d3d10->sprites.offset + msg_len * (has_drop ? 2 : 1)
          > (unsigned)d3d10->sprites.capacity)
       d3d10->sprites.offset = 0;
 
@@ -1237,10 +1267,9 @@ static void d3d10_font_render_msg(
    if (font->atlas->dirty)
    {
       if (font->texture.staging)
-         d3d10_update_texture(
-               d3d10->device,
-               font->atlas->width, font->atlas->height, font->atlas->width,
-               DXGI_FORMAT_A8_UNORM, font->atlas->buffer, &font->texture);
+         d3d10_font_update_atlas_region(d3d10->device, font,
+               font->atlas->dirty_x0, font->atlas->dirty_y0,
+               font->atlas->dirty_x1, font->atlas->dirty_y1);
       font->atlas->dirty = false;
    }
 
@@ -1276,18 +1305,6 @@ static bool d3d10_font_get_line_metrics(void* data,
    }
    return false;
 }
-
-font_renderer_t d3d10_font = {
-   d3d10_font_init,
-   d3d10_font_free,
-   d3d10_font_render_msg,
-   "d3d10",
-   d3d10_font_get_glyph,
-   NULL, /* bind_block */
-   NULL, /* flush */
-   d3d10_font_get_message_width,
-   d3d10_font_get_line_metrics
-};
 
 /*
  * VIDEO DRIVER
@@ -2215,7 +2232,6 @@ static void d3d10_gfx_free(void* data)
    Release(d3d10->adapter); 
 #endif
 
-   font_driver_free_osd();
 
 #if 0
    video_st_flags = video_st->flags;
@@ -2654,12 +2670,6 @@ static void *d3d10_gfx_init(const video_info_t* video,
 
    d3d10->device->lpVtbl->RSSetState(d3d10->device, d3d10->state);
 
-   if (video->font_enable)
-      font_driver_init_osd(d3d10,
-            video,
-            false,
-            video->is_threaded,
-            FONT_DRIVER_RENDER_D3D10_API);
 
 
 #if 0
@@ -3330,7 +3340,7 @@ static bool d3d10_gfx_frame(
                   context, 0, 1, (D3D10Buffer* const)&d3d10->sprites.vbo,
                   &stride, &offset);
             font_driver_render_msg(d3d10,
-                  stat_text,
+                  stat_text, video_info->stat_text_len,
                   (const struct font_params*)osd_params, NULL);
          }
       }
@@ -3384,7 +3394,7 @@ static bool d3d10_gfx_frame(
             d3d10->device, 0, 1,
             (D3D10Buffer* const)&d3d10->sprites.vbo,
             &stride, &offset);
-      font_driver_render_msg(d3d10, msg, NULL, NULL);
+      font_driver_render_msg(d3d10, msg, strlen(msg), NULL, NULL);
    }
    d3d10->flags &= ~D3D10_ST_FLAG_SPRITES_ENABLE;
 
@@ -3601,7 +3611,7 @@ static void d3d10_gfx_apply_state_changes(void* data)
 }
 
 static void d3d10_gfx_set_osd_msg(
-      void* data, const char *msg,
+      void* data, const char *msg, size_t msg_len,
       const struct font_params *params, void* font)
 {
    d3d10_video_t* d3d10 = (d3d10_video_t*)data;
@@ -3609,7 +3619,7 @@ static void d3d10_gfx_set_osd_msg(
    if (d3d10)
    {
       if (d3d10->flags & D3D10_ST_FLAG_SPRITES_ENABLE)
-         font_driver_render_msg(d3d10, msg, params, font);
+         font_driver_render_msg(d3d10, msg, msg_len, params, font);
    }
 }
 
@@ -3784,6 +3794,106 @@ static uint32_t d3d10_get_flags(void *data)
    return flags;
 }
 
+/* --- GPU-native BCn compressed-texture upload (PoC) --- */
+static DXGI_FORMAT d3d10_dxgi_from_gpu_format(enum texture_gpu_format fmt)
+{
+   switch (fmt)
+   {
+      case TEXTURE_GPU_FORMAT_BC1: return DXGI_FORMAT_BC1_UNORM;
+      case TEXTURE_GPU_FORMAT_BC2: return DXGI_FORMAT_BC2_UNORM;
+      case TEXTURE_GPU_FORMAT_BC3: return DXGI_FORMAT_BC3_UNORM;
+      /* BC7/BPTC is a Direct3D 11 format; 10.1 has no BC7, so it is not
+       * advertised here and BC7 assets take the CPU-decode fallback. */
+      default:                     break;
+   }
+   return DXGI_FORMAT_UNKNOWN;
+}
+
+static bool d3d10_gfx_supports_texture_format(void* data,
+      enum texture_gpu_format fmt)
+{
+   UINT        support = 0;
+   d3d10_video_t* v = (d3d10_video_t*)data;
+   DXGI_FORMAT dxgi    = d3d10_dxgi_from_gpu_format(fmt);
+   if (!v || !v->device || dxgi == DXGI_FORMAT_UNKNOWN)
+      return false;
+   if (FAILED(v->device->lpVtbl->CheckFormatSupport(
+         v->device, dxgi, &support)))
+      return false;
+   return (support & D3D10_FORMAT_SUPPORT_TEXTURE2D) != 0;
+}
+
+static uintptr_t d3d10_gfx_load_texture_compressed(void* video_data,
+      const struct texture_compressed* tc, bool threaded,
+      enum texture_filter_type filter_type)
+{
+   D3D10_SUBRESOURCE_DATA subres[IMAGE_MAX_MIPS];
+   d3d10_video_t* v = (d3d10_video_t*)video_data;
+   d3d10_texture_t* texture = NULL;
+   DXGI_FORMAT dxgi        = DXGI_FORMAT_UNKNOWN;
+   unsigned    block_bytes = 16;
+   unsigned    i;
+
+   (void)threaded;
+   if (!v || !v->device || !tc || tc->num_mips == 0)
+      return 0;
+   dxgi = d3d10_dxgi_from_gpu_format(tc->format);
+   if (dxgi == DXGI_FORMAT_UNKNOWN)
+      return 0;
+   if (tc->format == TEXTURE_GPU_FORMAT_BC1)
+      block_bytes = 8;
+
+   if (!(texture = (d3d10_texture_t*)calloc(1, sizeof(*texture))))
+      return 0;
+
+   if (     filter_type == TEXTURE_FILTER_NEAREST
+         || filter_type == TEXTURE_FILTER_MIPMAP_NEAREST)
+      texture->sampler = v->samplers[RARCH_FILTER_NEAREST][RARCH_WRAP_EDGE];
+   else
+      texture->sampler = v->samplers[RARCH_FILTER_LINEAR][RARCH_WRAP_EDGE];
+
+   for (i = 0; i < tc->num_mips; i++)
+   {
+      unsigned blocks_w          = (tc->mips[i].width + 3u) >> 2;
+      subres[i].pSysMem          = tc->mips[i].data;
+      subres[i].SysMemPitch      = blocks_w * block_bytes;
+      subres[i].SysMemSlicePitch = (UINT)tc->mips[i].size;
+   }
+
+   texture->desc.Width            = tc->mips[0].width;
+   texture->desc.Height           = tc->mips[0].height;
+   texture->desc.MipLevels        = tc->num_mips;
+   texture->desc.ArraySize        = 1;
+   texture->desc.Format           = dxgi;
+   texture->desc.SampleDesc.Count = 1;
+   texture->desc.Usage            = D3D10_USAGE_IMMUTABLE;
+   texture->desc.BindFlags        = D3D10_BIND_SHADER_RESOURCE;
+
+   if (FAILED(v->device->lpVtbl->CreateTexture2D(
+         v->device, &texture->desc, subres, &texture->handle)))
+   {
+      free(texture);
+      return 0;
+   }
+
+   {
+      D3D10_SHADER_RESOURCE_VIEW_DESC view_desc;
+      memset(&view_desc, 0, sizeof(view_desc));
+      view_desc.Format                    = dxgi;
+      view_desc.ViewDimension             = D3D_SRV_DIMENSION_TEXTURE2D;
+      view_desc.Texture2D.MostDetailedMip = 0;
+      view_desc.Texture2D.MipLevels       = tc->num_mips;
+      v->device->lpVtbl->CreateShaderResourceView(v->device,
+            (D3D10Resource)texture->handle, &view_desc, &texture->view);
+   }
+
+   texture->size_data.x = (float)tc->mips[0].width;
+   texture->size_data.y = (float)tc->mips[0].height;
+   texture->size_data.z = 1.0f / (float)tc->mips[0].width;
+   texture->size_data.w = 1.0f / (float)tc->mips[0].height;
+   return (uintptr_t)texture;
+}
+
 static const video_poke_interface_t d3d10_poke_interface = {
    d3d10_get_flags,
    d3d10_gfx_load_texture,
@@ -3825,7 +3935,9 @@ static const video_poke_interface_t d3d10_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   d3d10_gfx_supports_texture_format,
+   d3d10_gfx_load_texture_compressed
 };
 
 static void d3d10_gfx_get_poke_interface(void* data, const video_poke_interface_t** iface)
@@ -3840,6 +3952,18 @@ static bool d3d10_gfx_widgets_enabled(void *data)
    return true;
 }
 #endif
+
+static font_renderer_t d3d10_font = {
+   d3d10_font_init,
+   d3d10_font_free,
+   d3d10_font_render_msg,
+   "d3d10",
+   d3d10_font_get_glyph,
+   NULL, /* bind_block */
+   NULL, /* flush */
+   d3d10_font_get_message_width,
+   d3d10_font_get_line_metrics
+};
 
 video_driver_t video_d3d10 = {
    d3d10_gfx_init,
@@ -3865,6 +3989,25 @@ video_driver_t video_d3d10 = {
    d3d10_shader_load_begin,
    d3d10_shader_load_step,
 #if defined(HAVE_GFX_WIDGETS)
-   d3d10_gfx_widgets_enabled
+   d3d10_gfx_widgets_enabled,
 #endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+   &d3d10_font
+};
+
+gfx_display_ctx_driver_t gfx_display_ctx_d3d10 = {
+   gfx_display_d3d10_draw,
+   gfx_display_d3d10_draw_pipeline,
+   gfx_display_d3d10_blend_begin,
+   gfx_display_d3d10_blend_end,
+   NULL,                                     /* get_default_mvp        */
+   NULL,                                     /* get_default_vertices   */
+   NULL,                                     /* get_default_tex_coords */
+   &d3d10_font,
+   GFX_VIDEO_DRIVER_DIRECT3D10,
+   "d3d10",
+   true,
+   gfx_display_d3d10_scissor_begin,
+   gfx_display_d3d10_scissor_end
 };

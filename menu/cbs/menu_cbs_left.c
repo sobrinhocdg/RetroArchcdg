@@ -248,16 +248,19 @@ static int action_left_mainmenu(unsigned type, const char *label,
       bool wraparound)
 {
 #ifdef HAVE_XMB
-   struct menu_state    *menu_st       = menu_state_get_ptr();
+   settings_t *settings                = config_get_ptr();
+   struct menu_state *menu_st          = menu_state_get_ptr();
    const menu_ctx_driver_t *driver_ctx = menu_st->driver_ctx;
-   size_t _len                         = (driver_ctx && driver_ctx->list_get_size) ? driver_ctx->list_get_size(menu_st->userdata, MENU_LIST_PLAIN) : 0;
    const char *menu_ident              = (driver_ctx && driver_ctx->ident) ? driver_ctx->ident : NULL;
+   size_t _len                         = (driver_ctx && driver_ctx->list_get_size)
+         ? driver_ctx->list_get_size(menu_st->userdata, MENU_LIST_PLAIN)
+         : 0;
    /* Tab switching functionality only applies
     * to XMB */
    if (  (_len == 1)
+       && settings->bools.menu_xmb_show_horizontal_list
        && string_is_equal(menu_ident, "xmb"))
    {
-      settings_t            *settings  = config_get_ptr();
       bool menu_nav_wraparound_enable  = settings->bools.menu_navigation_wraparound_enable;
       size_t selection                 = (driver_ctx && driver_ctx->list_get_selection) ? driver_ctx->list_get_selection(menu_st->userdata) : 0;
       if ((selection != 0) || menu_nav_wraparound_enable)
@@ -1154,15 +1157,24 @@ static int bind_left_generic(unsigned type, const char *label,
 }
 
 static int menu_cbs_init_bind_left_compare_label(menu_file_list_cbs_t *cbs,
-      const char *label, size_t lbl_len, const char *menu_label, size_t menu_lbl_len)
+      const char *label, size_t label_len, const char *menu_lbl, size_t menu_lbl_len)
 {
-   if (string_is_equal(menu_label, MENU_ENUM_LABEL_PLAYLISTS_TAB_STR))
+   if (string_is_equal(menu_lbl, MENU_ENUM_LABEL_PLAYLISTS_TAB_STR))
    {
       BIND_ACTION_LEFT(cbs, action_left_mainmenu);
       return 0;
    }
 
-   if (string_starts_with_size(label, "rdb_entry", STRLEN_CONST("rdb_entry")) || string_starts_with_size(label, "content_info", STRLEN_CONST("content_info")))
+   if (     string_is_equal(menu_lbl, MENU_ENUM_LABEL_DEFERRED_CORE_INFORMATION_LIST_STR)
+         || string_is_equal(menu_lbl, MENU_ENUM_LABEL_DEFERRED_CORE_OPTION_OVERRIDE_LIST_STR)
+         || string_is_equal(menu_lbl, MENU_ENUM_LABEL_DEFERRED_REMAP_FILE_MANAGER_LIST_STR)
+         || string_is_equal(menu_lbl, MENU_ENUM_LABEL_CORE_INPUT_REMAPPING_OPTIONS_STR)
+      )
+   {
+      BIND_ACTION_LEFT(cbs, action_left_scroll);
+   }
+   else if (string_starts_with_size(label, MENU_ENUM_LABEL_RDB_ENTRY_STR, STRLEN_CONST(MENU_ENUM_LABEL_RDB_ENTRY_STR))
+         || string_starts_with_size(label, MENU_ENUM_LABEL_CONTENT_INFO_STR, STRLEN_CONST(MENU_ENUM_LABEL_CONTENT_INFO_STR)))
    {
       BIND_ACTION_LEFT(cbs, action_left_scroll);
    }
@@ -1212,12 +1224,9 @@ static int menu_cbs_init_bind_left_compare_label(menu_file_list_cbs_t *cbs,
             case MENU_ENUM_LABEL_NO_CORES_AVAILABLE:
             case MENU_ENUM_LABEL_EXPLORE_INITIALISING_LIST:
                if (
-                        string_ends_with_size(menu_label, "_tab",
-                           menu_lbl_len,
-                           STRLEN_CONST("_tab")
-                           )
-                     || string_is_equal(menu_label, MENU_ENUM_LABEL_MAIN_MENU_STR)
-                     || string_is_equal(menu_label, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
+                        string_ends_with_size(menu_lbl, "_tab", menu_lbl_len, STRLEN_CONST("_tab"))
+                     || string_is_equal(menu_lbl, MENU_ENUM_LABEL_MAIN_MENU_STR)
+                     || string_is_equal(menu_lbl, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
                   )
                {
                   BIND_ACTION_LEFT(cbs, action_left_mainmenu);
@@ -1293,7 +1302,7 @@ static int menu_cbs_init_bind_left_compare_label(menu_file_list_cbs_t *cbs,
 }
 
 static int menu_cbs_init_bind_left_compare_type(menu_file_list_cbs_t *cbs,
-      unsigned type, const char *menu_label, size_t menu_lbl_len)
+      unsigned type, const char *menu_lbl, size_t menu_lbl_len)
 {
 #ifdef HAVE_CHEATS
    if (type >= MENU_SETTINGS_CHEAT_BEGIN
@@ -1380,10 +1389,8 @@ static int menu_cbs_init_bind_left_compare_type(menu_file_list_cbs_t *cbs,
          case FILE_TYPE_VIDEO_FONT:
          case MENU_SETTING_GROUP:
          case MENU_SETTINGS_CORE_INFO_NONE:
-            if (
-                  string_ends_with_size(menu_label, "_tab",
-                     menu_lbl_len, STRLEN_CONST("_tab"))
-                  || string_is_equal(menu_label, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
+            if (     string_ends_with_size(menu_lbl, "_tab", menu_lbl_len, STRLEN_CONST("_tab"))
+                  || string_is_equal(menu_lbl, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
                )
             {
                BIND_ACTION_LEFT(cbs, action_left_mainmenu);
@@ -1394,6 +1401,7 @@ static int menu_cbs_init_bind_left_compare_type(menu_file_list_cbs_t *cbs,
          case MENU_SETTING_ACTION_CLOSE_HORIZONTAL:
          case MENU_SETTING_ACTION_DELETE_ENTRY:
          case MENU_SETTING_ACTION_CORE_OPTIONS:
+         case MENU_SETTING_ACTION_CORE_OPTION_OVERRIDE_LIST:
          case MENU_SETTING_ACTION_CORE_DISK_OPTIONS:
          case MENU_SETTING_ACTION_SCREENSHOT:
          case MENU_SETTING_ACTION_FAVORITES_DIR:
@@ -1431,9 +1439,9 @@ static int menu_cbs_init_bind_left_compare_type(menu_file_list_cbs_t *cbs,
 
 int menu_cbs_init_bind_left(menu_file_list_cbs_t *cbs,
       const char *path,
-      const char *label, size_t lbl_len,
+      const char *label, size_t label_len,
       unsigned type, size_t idx,
-      const char *menu_label, size_t menu_lbl_len)
+      const char *menu_lbl, size_t menu_lbl_len)
 {
    if (!cbs)
       return -1;
@@ -1442,11 +1450,9 @@ int menu_cbs_init_bind_left(menu_file_list_cbs_t *cbs,
 
    if (type == MENU_SETTING_NO_ITEM)
    {
-      if (
-               string_ends_with_size(menu_label, "_tab",
-                  menu_lbl_len, STRLEN_CONST("_tab"))
-            || string_is_equal(menu_label, MENU_ENUM_LABEL_MAIN_MENU_STR)
-            || string_is_equal(menu_label, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
+      if (     string_ends_with_size(menu_lbl, "_tab", menu_lbl_len, STRLEN_CONST("_tab"))
+            || string_is_equal(menu_lbl, MENU_ENUM_LABEL_MAIN_MENU_STR)
+            || string_is_equal(menu_lbl, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR)
          )
       {
             BIND_ACTION_LEFT(cbs, action_left_mainmenu);
@@ -1456,21 +1462,17 @@ int menu_cbs_init_bind_left(menu_file_list_cbs_t *cbs,
 
    if (cbs->setting)
    {
-      const char *parent_group   = cbs->setting->parent_group;
-
-      if (string_is_equal(parent_group,
-               MENU_ENUM_LABEL_MAIN_MENU_STR)
-               && (cbs->setting->type == ST_GROUP))
+      if (cbs->setting->free_flags & SD_FREE_FLAG_MAIN_MENU_GROUP)
       {
          BIND_ACTION_LEFT(cbs, action_left_mainmenu);
          return 0;
       }
    }
 
-   if (menu_cbs_init_bind_left_compare_label(cbs, label, lbl_len, menu_label, menu_lbl_len) == 0)
+   if (menu_cbs_init_bind_left_compare_label(cbs, label, label_len, menu_lbl, menu_lbl_len) == 0)
       return 0;
 
-   if (menu_cbs_init_bind_left_compare_type(cbs, type, menu_label, menu_lbl_len) == 0)
+   if (menu_cbs_init_bind_left_compare_type(cbs, type, menu_lbl, menu_lbl_len) == 0)
       return 0;
 
    return -1;

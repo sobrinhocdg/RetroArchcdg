@@ -89,7 +89,7 @@
 
 #define DEFAULT_TOUCH_SCALE 1
 
-#if defined(RARCH_MOBILE) || defined(HAVE_LIBNX) || defined(__WINRT__) || defined(EMSCRIPTEN) || defined (VITA)
+#if defined(RARCH_MOBILE) || defined(HAVE_LIBNX) || defined(__WINRT__) || defined(__EMSCRIPTEN__) || defined (VITA)
 #define DEFAULT_POINTER_ENABLE true
 #else
 #define DEFAULT_POINTER_ENABLE false
@@ -164,6 +164,9 @@
 #define DEFAULT_MATERIALUI_THUMBNAIL_BACKGROUND_ENABLE true
 #define DEFAULT_MENU_THUMBNAIL_BACKGROUND_ENABLE false
 
+/* Play the audio track of animated WebM thumbnails (menu preview). */
+#define DEFAULT_MENU_THUMBNAIL_PREVIEW_AUDIO false
+
 #define DEFAULT_SCREEN_BRIGHTNESS 100
 
 #define DEFAULT_CRT_SWITCH_RESOLUTION CRT_SWITCH_NONE
@@ -188,6 +191,10 @@
 
 #define DEFAULT_ACCESSIBILITY_NARRATOR_SPEECH_SPEED 5
 
+/* espeak is the default narrator engine so existing setups are
+ * unaffected. The enum lives in configuration.h. */
+#define DEFAULT_ACCESSIBILITY_NARRATOR_ENGINE ACCESSIBILITY_NARRATOR_ENGINE_ESPEAK
+
 #define DEFAULT_DRIVER_SWITCH_ENABLE true
 
 #define DEFAULT_USER_LANGUAGE 0
@@ -200,7 +207,7 @@
 #define DEFAULT_BLUETOOTH_ERTM false
 #endif
 
-#if (defined(_WIN32) && !defined(_XBOX)) || (defined(__linux) && !defined(ANDROID) && !defined(HAVE_LAKKA)) || (defined(__MACH__) && !defined(IOS)) || defined(EMSCRIPTEN)
+#if (defined(_WIN32) && !defined(_XBOX)) || (defined(__linux) && !defined(ANDROID) && !defined(HAVE_LAKKA)) || (defined(__MACH__) && !defined(IOS)) || defined(__EMSCRIPTEN__)
 #define DEFAULT_MOUSE_ENABLE true
 #else
 #define DEFAULT_MOUSE_ENABLE false
@@ -396,6 +403,13 @@
 /* GL specific */
 #define DEFAULT_ADAPTIVE_VSYNC false
 
+/* Hands SPIR-V shaders straight to the driver through GL_ARB_gl_spirv
+ * rather than cross compiling them to GLSL. Off by default: the win is
+ * on a cold driver shader cache, and at least one implementation caches
+ * the cross compiled path far more effectively than the SPIR-V one, so
+ * this is opt-in until there is per-driver data to key off. */
+#define DEFAULT_VIDEO_GL_DIRECT_SPIRV false
+
 /* Attempts to hard-synchronize CPU and GPU.
  * Can reduce latency at cost of performance. */
 #define DEFAULT_HARD_SYNC false
@@ -415,6 +429,34 @@
 #define DEFAULT_FRAME_DELAY 0
 #define MAXIMUM_FRAME_DELAY 99
 #define DEFAULT_FRAME_DELAY_AUTO false
+
+/* When true, the frame-time ring buffer that backs the "Estimated
+ * Screen Refresh Rate" diagnostic + the AUTO-apply menu action is
+ * sampled only when the runloop is in a "clean" steady state
+ * (content running, not paused, not in fast-forward, not in
+ * menu-with-paused-libretro, frame time within a sanity envelope
+ * around the expected period).
+ *
+ * Disabled by default to preserve the existing measurement
+ * behaviour and the reset toggles that depend on it.  When
+ * enabled, the deviation in the diagnostic readout becomes a real
+ * signal again (the polluting samples from sleep / menu / save /
+ * load never enter the buffer in the first place), at the cost
+ * of slower convergence after content load. */
+#define DEFAULT_FRAME_TIME_SAMPLE_GATED false
+
+/* When true, drains the 'Estimated Screen Refresh Rate' sample
+ * buffer after fast-forward, save state, or load state -- events
+ * whose timing doesn't reflect normal frame cadence and would
+ * skew the deviation measurement.  Best-effort cleanup for users
+ * who haven't enabled DEFAULT_FRAME_TIME_SAMPLE_GATED (which
+ * prevents the contamination at the source).
+ *
+ * Replaces three separate per-event reset toggles
+ * (frame_time_counter_reset_after_{fastforwarding,load_state,
+ * save_state}).  Defaults to false to match the prior aggregate
+ * behaviour (all three off). */
+#define DEFAULT_FRAME_TIME_COUNTER_AUTO_RESET false
 
 /* Duplicates frames for the purposes of running Shaders at a higher framerate
  * than content framerate. Requires running screen at multiple of 60hz, and
@@ -514,11 +556,20 @@
 /* HDR output mode: 0 = off, 1 = HDR10, 2 = scRGB */
 #define DEFAULT_VIDEO_HDR_MODE 0
 
+/* Swapchain bit depth when HDR is off: 0 = auto (8), 1 = force 8, 2 = force 10.
+ * Only meaningful in SDR; HDR dictates its own swapchain format. */
+#define DEFAULT_VIDEO_SWAPCHAIN_BIT_DEPTH 0
+
 /* Brightness of the SDR menu/overlay when composited into the HDR backbuffer */
 #define DEFAULT_MENU_HDR_BRIGHTNESS_NITS 200.0f
 
 /* The number of nits that paper white is at */
 #define DEFAULT_VIDEO_HDR_PAPER_WHITE_NITS 200.0f
+
+/* Peak luminance of the display, in nits. 1000 is the HDR10 reference peak and
+ * roughly what mid-range HDR panels reach, so it is a safe default for a value
+ * the frontend cannot query - no platform exposes it portably. */
+#define DEFAULT_VIDEO_HDR_MAX_NITS 1000.0f
 
 /* Should we expand the colour gamut when using hdr */
 #define DEFAULT_VIDEO_HDR_EXPAND_GAMUT 0
@@ -608,8 +659,6 @@
 
 #define DEFAULT_OVERLAY_SHOW_MOUSE_CURSOR false
 
-#define DEFAULT_DISPLAY_KEYBOARD_OVERLAY false
-
 #ifdef HAKCHI
 #define DEFAULT_INPUT_OVERLAY_OPACITY 0.5f
 #else
@@ -688,6 +737,7 @@
 #define DEFAULT_OZONE_HEADER_ICON 1
 #define DEFAULT_OZONE_HEADER_SEPARATOR 1
 #define DEFAULT_OZONE_COLLAPSE_SIDEBAR false
+#define DEFAULT_OZONE_SHOW_SIDEBAR true
 #define DEFAULT_OZONE_SCROLL_CONTENT_METADATA false
 #define DEFAULT_OZONE_THUMBNAIL_SCALE_FACTOR 1.0f
 #define DEFAULT_OZONE_FONT_SCALE 0
@@ -750,7 +800,6 @@
 #define DEFAULT_QUICK_MENU_SHOW_LATENCY true
 #define DEFAULT_QUICK_MENU_SHOW_REWIND true
 #define DEFAULT_QUICK_MENU_SHOW_OVERLAYS true
-#define DEFAULT_QUICK_MENU_SHOW_VIDEO_LAYOUT false
 #define DEFAULT_QUICK_MENU_SHOW_CHEATS true
 #define DEFAULT_QUICK_MENU_SHOW_SHADERS true
 #define DEFAULT_QUICK_MENU_SHOW_INFORMATION true
@@ -779,7 +828,18 @@
 #define DEFAULT_MENU_SHOW_INFORMATION true
 #define DEFAULT_MENU_SHOW_CONFIGURATIONS true
 #define DEFAULT_MENU_SHOW_HELP true
+#if defined(ANDROID)
+/* Android's navigation model expects the user to leave via Home or the
+ * task switcher rather than an in-app control, and the Android TV
+ * guidelines state outright that an exit item should not appear in the
+ * menu. Default the entry off; the toggle stays available under
+ * Settings -> User Interface -> Menu Item Visibility for anyone who
+ * wants it back, and existing configs that already set the key are
+ * left untouched. */
+#define DEFAULT_MENU_SHOW_QUIT false
+#else
 #define DEFAULT_MENU_SHOW_QUIT true
+#endif
 #define DEFAULT_MENU_SHOW_RESTART true
 #define DEFAULT_MENU_SHOW_REBOOT true
 #define DEFAULT_MENU_SHOW_SHUTDOWN true
@@ -787,12 +847,14 @@
 #define DEFAULT_MENU_SHOW_CORE_MANAGER_STEAM true
 #endif
 #define DEFAULT_MENU_SHOW_SUBLABELS true
+#define DEFAULT_MENU_SHOW_CONFIRM true
 #define DEFAULT_MENU_DYNAMIC_WALLPAPER_ENABLE true
 #define DEFAULT_MENU_SCROLL_FAST false
 #define DEFAULT_MENU_SCROLL_DELAY 256
 
 #define DEFAULT_KIOSK_MODE_ENABLE false
 #define DEFAULT_MENU_HORIZONTAL_ANIMATION true
+#define DEFAULT_MENU_SHOW_FULL_PATHS true
 
 #define DEFAULT_MENU_TICKER_TYPE (TICKER_TYPE_LOOP)
 #define DEFAULT_MENU_TICKER_SPEED 2.0f
@@ -835,15 +897,17 @@
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
 #define DEFAULT_CONTENT_SHOW_VIDEO true
 #endif
-#if defined(HAVE_NETWORKING)
-#if defined(_3DS)
-#define DEFAULT_CONTENT_SHOW_NETPLAY false
-#else
-#define DEFAULT_CONTENT_SHOW_NETPLAY true
-#endif
-#endif
 
 #define DEFAULT_MENU_CONTENT_SHOW_ADD_ENTRY MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB
+
+/* Share 'Import Content' values */
+#if defined(HAVE_NETWORKING)
+#if defined(_3DS)
+#define DEFAULT_CONTENT_SHOW_NETPLAY MENU_ADD_CONTENT_ENTRY_DISPLAY_HIDDEN
+#else
+#define DEFAULT_CONTENT_SHOW_NETPLAY MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB
+#endif
+#endif
 
 #define DEFAULT_CONTENT_SHOW_PLAYLISTS true
 #define DEFAULT_CONTENT_SHOW_PLAYLIST_TABS true
@@ -853,10 +917,15 @@
 #endif
 #define DEFAULT_MENU_CONTENT_SHOW_CONTENTLESS_CORES MENU_CONTENTLESS_CORES_DISPLAY_SINGLE_PURPOSE
 
-#ifdef HAVE_XMB
+/* Shared with the Ozone driver. */
+#if defined(HAVE_XMB) || defined(HAVE_OZONE)
 #define DEFAULT_XMB_ANIMATION                      0
+#endif
+#ifdef HAVE_XMB
 #define DEFAULT_XMB_VERTICAL_FADE_FACTOR           100
+#define DEFAULT_XMB_SHOW_HORIZONTAL_LIST           true
 #define DEFAULT_XMB_SHOW_TITLE_HEADER              true
+#define DEFAULT_XMB_ENTRY_ICONS                    true
 #define DEFAULT_XMB_SWITCH_ICONS                   true
 #define DEFAULT_XMB_CURRENT_MENU_ICON              1
 #define DEFAULT_XMB_TITLE_MARGIN                   3
@@ -887,7 +956,7 @@
 #define DEFAULT_MENU_FOOTER_OPACITY 1.000f
 #define DEFAULT_MENU_HEADER_OPACITY 1.000f
 
-#if (defined(HAVE_OPENGLES2) && !defined(EMSCRIPTEN)) || (defined(__MACH__)  && defined(MAC_OS_X_VERSION_MAX_ALLOWED) && (MAC_OS_X_VERSION_MAX_ALLOWED < 101200))
+#if (defined(HAVE_OPENGLES2) && !defined(__EMSCRIPTEN__)) || (defined(__MACH__)  && defined(MAC_OS_X_VERSION_MAX_ALLOWED) && (MAC_OS_X_VERSION_MAX_ALLOWED < 101200))
 #define DEFAULT_MENU_SHADER_PIPELINE 1
 #else
 #define DEFAULT_MENU_SHADER_PIPELINE 2
@@ -900,6 +969,12 @@
 
 #define DEFAULT_RGUI_INLINE_THUMBNAILS false
 #define DEFAULT_RGUI_SWAP_THUMBNAILS false
+
+/* Dithering trades banding for a fine pattern, which is the better
+ * bargain at normal menu scales.  It is magnified by the menu's
+ * nearest-neighbour upscale though, so users running a large scale
+ * factor may prefer it off. */
+#define DEFAULT_RGUI_THUMBNAIL_DITHER true
 #define DEFAULT_RGUI_THUMBNAIL_DOWNSCALER RGUI_THUMB_SCALE_POINT
 #define DEFAULT_RGUI_THUMBNAIL_DELAY 0
 #define DEFAULT_RGUI_INTERNAL_UPSCALE_LEVEL RGUI_UPSCALE_NONE
@@ -919,9 +994,6 @@
 #else
 #define DEFAULT_BLOCK_CONFIG_READ false
 #endif
-
-/* TODO/FIXME - this setting is thread-unsafe right now and can corrupt the stack - default to off */
-#define DEFAULT_AUTOMATICALLY_ADD_CONTENT_TO_PLAYLIST false
 
 #define DEFAULT_GAME_SPECIFIC_OPTIONS true
 #define DEFAULT_AUTO_OVERRIDES_ENABLE true
@@ -1018,7 +1090,7 @@
 
 /* Color of the message.
  * RGB hex value. */
-#define DEFAULT_MESSAGE_COLOR 0xffff00
+#define DEFAULT_MESSAGE_COLOR 0xffffff
 
 #define DEFAULT_MESSAGE_BGCOLOR_ENABLE false
 #define DEFAULT_MESSAGE_BGCOLOR_RED 0
@@ -1196,7 +1268,7 @@
 #elif defined(_3DS) || defined(RETROFW)
 #define DEFAULT_OUTPUT_RATE 32730
 #define DEFAULT_INPUT_RATE  32730
-#elif defined(EMSCRIPTEN)
+#elif defined(__EMSCRIPTEN__)
 #define DEFAULT_OUTPUT_RATE 44100
 #define DEFAULT_INPUT_RATE  44100
 #else
@@ -1209,7 +1281,7 @@
 
 /* Desired audio latency in milliseconds. Might not be honored
  * if driver can't provide given latency. */
-#if defined(ANDROID) || defined(RETROFW) || defined(MIYOO) || (defined(EMSCRIPTEN) && defined(HAVE_AL))
+#if defined(ANDROID) || defined(RETROFW) || defined(MIYOO) || (defined(__EMSCRIPTEN__) && defined(HAVE_AL))
 /* For most Android devices, 64ms is way too low. */
 #define DEFAULT_OUT_LATENCY 128
 #define DEFAULT_IN_LATENCY 128
@@ -1259,6 +1331,16 @@
 #define DEFAULT_AUDIO_FASTFORWARD_MUTE false
 /* Speed up audio to match fast forward speed up. */
 #define DEFAULT_AUDIO_FASTFORWARD_SPEEDUP false
+/* When a core outputs 16-bit integer audio, the deterministic
+ * fixed-point (int16) resampler variant of the selected backend
+ * (sinc, nearest, or CC) can be preferred over the float one for any
+ * needed resampling, avoiding the s16<->float round-trip
+ * (bit-reproducible). Opt-in; the float path remains the default. */
+#define DEFAULT_AUDIO_FASTPATH_S16 false
+/* Requested output sample format for negotiable audio drivers:
+ * AUDIO_FORMAT_NEGOTIATION_INT16 (0) or AUDIO_FORMAT_NEGOTIATION_FLOAT (1).
+ * Float by default, matching RetroArch's historical driver behaviour. */
+#define DEFAULT_AUDIO_FORMAT_NEGOTIATION AUDIO_FORMAT_NEGOTIATION_FLOAT
 /* Automatically mute audio when rewind is enabled. */
 #define DEFAULT_AUDIO_REWIND_MUTE false
 
@@ -1288,6 +1370,9 @@
 
 /* Includes displaying the current memory usage/total with FPS/Frames. */
 #define DEFAULT_MEMORY_SHOW false
+
+/* Displays the current time in the preferred format. */
+#define DEFAULT_TIME_SHOW TIME_SHOW_OFF
 
 /* Enables displaying various timing statistics. */
 #define DEFAULT_STATISTICS_SHOW false
@@ -1366,10 +1451,6 @@
 /* Require connections only in slave mode */
 #define DEFAULT_NETPLAY_REQUIRE_SLAVES false
 
-/* When being client over netplay, use keybinds for
- * user 1 rather than user 2. */
-#define DEFAULT_NETPLAY_CLIENT_SWAP_INPUT true
-
 #define DEFAULT_NETPLAY_NAT_TRAVERSAL false
 
 #define DEFAULT_NETPLAY_CHECK_FRAMES 600
@@ -1435,6 +1516,16 @@
  * startup if savestate_auto_load is set. */
 #define DEFAULT_SAVESTATE_AUTO_SAVE false
 #define DEFAULT_SAVESTATE_AUTO_LOAD false
+
+/* Automatically saves a savestate at a regular interval.
+ * It is measured in seconds. A value of 0 disables automatic savestate saving. */
+#if defined(__i386__) || defined(__i486__) || defined(__i686__) || defined(__x86_64__) || defined(_M_X64) || defined(_WIN32) || defined(OSX) || defined(ANDROID) || defined(IOS) || defined(DINGUX)
+/* Disabled by default but can be enabled by user */
+#define DEFAULT_SAVESTATE_AUTOMATIC_INTERVAL 0
+#else
+/* Default to disabled on I/O-constrained platforms */
+#define DEFAULT_SAVESTATE_AUTOMATIC_INTERVAL 0
+#endif
 
 /* Take screenshots for save states */
 #if defined(__x86_64__) || defined(_M_X64)
@@ -1569,6 +1660,11 @@
 #else
 #define DEFAULT_MENU_SCALE_FACTOR 1.0f
 #endif
+/* Specifies whether menu images (icons, thumbnails,
+ * wallpapers) are uploaded with mip-mapped filtering.
+ * Keeps images smooth when drawn below their native size,
+ * at the cost of slightly higher video memory usage. */
+#define DEFAULT_MENU_TEXTURE_MIPMAPPING true
 /* Specifies whether display widgets should be scaled
  * automatically using the default menu scale factor */
 #define DEFAULT_MENU_WIDGET_SCALE_AUTO true
@@ -1639,6 +1735,12 @@
  * sensor input, if supported */
 #define DEFAULT_INPUT_SENSORS_ENABLE true
 
+/* Use the Android system (IME) keyboard for menu text entry instead of
+ * the built-in on-screen keyboard. Off by default so gamepad-only
+ * and no-touch devices keep the navigable on-screen keyboard at
+ * all times. */
+#define DEFAULT_INPUT_ANDROID_SYSTEM_KEYBOARD false
+
 /* Automatically enable game focus when running or
  * resuming content */
 #define DEFAULT_INPUT_AUTO_GAME_FOCUS AUTO_GAME_FOCUS_OFF
@@ -1686,7 +1788,7 @@
 #else
 #define DEFAULT_MENU_TIMEDATE_ENABLE true
 #endif
-#define DEFAULT_MENU_TIMEDATE_STYLE          MENU_TIMEDATE_STYLE_DDMM_HM
+#define DEFAULT_MENU_TIMEDATE_STYLE          MENU_TIMEDATE_STYLE_YMD_HM
 #define DEFAULT_MENU_TIMEDATE_DATE_SEPARATOR MENU_TIMEDATE_DATE_SEPARATOR_HYPHEN
 #define DEFAULT_MENU_REMEMBER_SELECTION      MENU_REMEMBER_SELECTION_ALWAYS
 #define DEFAULT_MENU_STARTUP_PAGE            MENU_STARTUP_PAGE_MAIN_MENU
@@ -1725,7 +1827,7 @@
 
 #define DEFAULT_UI_MENUBAR_ENABLE true
 
-#if defined(__QNX__) || defined(_XBOX1) || defined(_XBOX360) || (defined(__MACH__) && defined(IOS)) || defined(ANDROID) || defined(WIIU) || defined(HAVE_NEON) || defined(GEKKO) || defined(__ARM_NEON__) || defined(__PS3__)
+#if defined(__QNX__) || defined(_XBOX1) || defined(_XBOX360) || (defined(__MACH__) && defined(IOS)) || defined(ANDROID) || defined(WIIU) || defined(HAVE_NEON) || defined(GEKKO) || defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__PS3__)
 #define DEFAULT_AUDIO_RESAMPLER_QUALITY_LEVEL RESAMPLER_QUALITY_LOWER
 #elif defined(PSP) || defined(_3DS) || defined(VITA) || defined(PS2) || defined(DINGUX)
 #define DEFAULT_AUDIO_RESAMPLER_QUALITY_LEVEL RESAMPLER_QUALITY_LOWEST
@@ -1793,7 +1895,11 @@
 #if defined(HAKCHI)
 #define DEFAULT_BUILDBOT_SERVER_URL "http://hakchicloud.com/Libretro_Cores/"
 #elif defined(WEBOS)
+#if defined(__arm__)
 #define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/webos/armv7a/latest/"
+#else
+#define DEFAULT_BUILDBOT_SERVER_URL "http://retroarch-cores.webosbrew.org/aarch64/"
+#endif
 #elif defined(ANDROID)
 #if defined(ANDROID_ARM_V7)
 #define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/android/latest/armeabi-v7a/"
@@ -1878,6 +1984,8 @@
 #define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/linux/x86_64/latest/"
 #elif defined(__i386__) || defined(__i486__) || defined(__i686__)
 #define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/linux/x86/latest/"
+#elif defined(__aarch64__)
+#define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/linux/aarch64/latest/"
 #elif defined(__arm__) && __ARM_ARCH == 7 && defined(__ARM_PCS_VFP)
 #define DEFAULT_BUILDBOT_SERVER_URL "http://buildbot.libretro.com/nightly/linux/armhf/latest/"
 #else
@@ -1893,7 +2001,7 @@
 #define DEFAULT_BUILDBOT_SERVER_URL ""
 #endif
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 #define DEFAULT_BUILDBOT_ASSETS_SERVER_URL "https://buildbot.libretro.com/assets/"
 #else
 #define DEFAULT_BUILDBOT_ASSETS_SERVER_URL "http://buildbot.libretro.com/assets/"
@@ -1913,7 +2021,7 @@
 
 #define DEFAULT_AI_SERVICE_URL "http://localhost:4404/"
 
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
 #define DEFAULT_BUILTIN_MEDIAPLAYER_ENABLE true
 #else
 #define DEFAULT_BUILTIN_MEDIAPLAYER_ENABLE false

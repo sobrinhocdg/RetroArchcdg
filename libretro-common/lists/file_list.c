@@ -226,6 +226,16 @@ static void file_list_get_label_at_offset(const file_list_t *list, size_t idx,
       *label = list->list[idx].label;
 }
 
+void file_list_set_label_at_offset(file_list_t *list, size_t idx,
+      const char *label)
+{
+   if (!list || !label)
+      return;
+   if (list->list[idx].label)
+      free(list->list[idx].label);
+   list->list[idx].label = strdup(label);
+}
+
 void file_list_set_alt_at_offset(file_list_t *list, size_t idx,
       const char *alt)
 {
@@ -286,7 +296,12 @@ void file_list_free_actiondata(const file_list_t *list, size_t idx)
    if (!list)
       return;
    if (list->list[idx].actiondata)
-       free(list->list[idx].actiondata);
+   {
+      if (list->actiondata_free)
+         list->actiondata_free(list->list[idx].actiondata);
+      else
+         free(list->list[idx].actiondata);
+   }
    list->list[idx].actiondata = NULL;
 }
 
@@ -321,7 +336,7 @@ bool file_list_search(const file_list_t *list, const char *needle, size_t *idx)
             continue;
       }
 
-      if ((str = (const char *)strcasestr(alt, needle)) == alt)
+      if ((str = (const char *)compat_strcasestr(alt, needle)) == alt)
       {
          /* Found match with first chars, best possible match. */
          *idx = i;

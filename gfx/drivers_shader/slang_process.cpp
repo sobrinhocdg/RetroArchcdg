@@ -174,7 +174,7 @@ static bool slang_process_reflection(
    std::unordered_map<std::string, slang_texture_semantic_map> texture_semantic_map;
    std::unordered_map<std::string, slang_texture_semantic_map> texture_semantic_uniform_map;
 
-   for (i = 0; i <= pass_number; i++)
+   for (i = 0; i < shader_info->passes; i++)
    {
       if (!*shader_info->pass[i].alias)
          continue;
@@ -347,37 +347,62 @@ static bool slang_process_reflection(
             static const char* names[] = {
                "Original", "Source", "OriginalHistory", "PassOutput", "PassFeedback",
             };
-            int size;
             texture_sem_t texture;
             slang_texture_semantic
                _semantic              = (slang_texture_semantic)semantic;
             texture.id[0]             = '\0';
-            if (_semantic < (int)SLANG_TEXTURE_SEMANTIC_ORIGINAL_HISTORY)
-               strlcpy(texture.id, names[semantic], sizeof(texture.id));
-            else
-            {
-               size = sizeof(names) / sizeof(*names);
-               if (semantic < size)
-               {
-                  size_t _len = strlcpy(texture.id, names[_semantic], sizeof(texture.id));
-                  snprintf(texture.id + _len, sizeof(texture.id) - _len, "%d", index);
-               }
-               else
-                  strlcpy(texture.id, get_semantic_name(sl_reflection.texture_semantic_map, _semantic, index), sizeof(texture.id));
-            }
+			
+			if (semantic == (int)SLANG_TEXTURE_SEMANTIC_ORIGINAL)
+			{
+				strlcpy(texture.id, names[semantic], sizeof(texture.id));
+				texture.wrap    = shader_info->pass[0].wrap;
+				texture.filter  = shader_info->pass[0].filter;
+			}
+			else if (semantic == (int)SLANG_TEXTURE_SEMANTIC_SOURCE)
+			{
+				strlcpy(texture.id, names[semantic], sizeof(texture.id));
+				texture.wrap    = shader_info->pass[pass_number].wrap;
+				texture.filter  = shader_info->pass[pass_number].filter;
+			}
+			else if (semantic == (int)SLANG_TEXTURE_SEMANTIC_ORIGINAL_HISTORY)
+			{
+				size_t _len = strlcpy(texture.id, names[semantic], sizeof(texture.id));
+				snprintf(texture.id + _len, sizeof(texture.id) - _len, "%d", index);
+				texture.wrap    = shader_info->pass[0].wrap;
+				texture.filter  = shader_info->pass[0].filter;
+			}
+			else if (semantic == (int)SLANG_TEXTURE_SEMANTIC_PASS_OUTPUT)
+			{
+				size_t _len = strlcpy(texture.id, names[semantic], sizeof(texture.id));
+				snprintf(texture.id + _len, sizeof(texture.id) - _len, "%d", index);
+				if ((index + 1) < shader_info->passes)
+				{
+					texture.wrap    = shader_info->pass[index + 1].wrap;
+					texture.filter  = shader_info->pass[index + 1].filter;
+				}
+				else // should not happen and already be checked
+				{
+					texture.wrap    = shader_info->pass[index].wrap;
+					texture.filter  = shader_info->pass[index].filter;
+				}
+			}
+			else if (semantic == (int)SLANG_TEXTURE_SEMANTIC_PASS_FEEDBACK)
+			{
+				size_t _len = strlcpy(texture.id, names[semantic], sizeof(texture.id));
+				snprintf(texture.id + _len, sizeof(texture.id) - _len, "%d", index);
+				texture.wrap    = shader_info->pass[index].wrap;
+				texture.filter  = shader_info->pass[index].filter;
+			}
+			else // SLANG_TEXTURE_SEMANTIC_USER
+			{
+				strlcpy(texture.id, get_semantic_name(sl_reflection.texture_semantic_map, _semantic, index), sizeof(texture.id));
+				texture.wrap    = shader_info->lut[index].wrap;
+				texture.filter  = shader_info->lut[index].filter;
+			}
+			
             texture.texture_data =
                (void*)((uintptr_t)map->textures[semantic].image + index * map->textures[semantic].image_stride);
 
-            if (semantic == SLANG_TEXTURE_SEMANTIC_USER)
-            {
-               texture.wrap    = shader_info->lut[index].wrap;
-               texture.filter  = shader_info->lut[index].filter;
-            }
-            else
-            {
-               texture.wrap    = shader_info->pass[pass_number].wrap;
-               texture.filter  = shader_info->pass[pass_number].filter;
-            }
             texture.stage_mask = src.stage_mask;
             texture.binding    = src.binding;
 
@@ -732,6 +757,12 @@ static bool glslang_parse_meta(const struct shader_line_buf *lines,
  * ----------------------------------------------------------------------- */
 bool glslang_compile_shader(const char *shader_path, glslang_output *output)
 {
+   return glslang_compile_shader_cached(shader_path, output, NULL);
+}
+
+bool glslang_compile_shader_cached(const char *shader_path,
+      glslang_output *output, void *include_cache)
+{
 #if defined(HAVE_GLSLANG)
    struct shader_line_buf lines;
    char cache_filename[PATH_MAX_LENGTH];
@@ -741,7 +772,8 @@ bool glslang_compile_shader(const char *shader_path, glslang_output *output)
 
    RARCH_LOG("[Slang] Compiling shader: \"%s\".\n", shader_path);
 
-   if (!glslang_read_shader_file(shader_path, &lines, true, false))
+   if (!glslang_read_shader_file_cached(shader_path, &lines, true, false,
+            include_cache))
       goto error;
 
    /* Compute cache key from preprocessed source (vertex + fragment stages) */
@@ -872,13 +904,21 @@ bool slang_preprocess_parse_parameters(glslang_meta& meta,
 bool slang_preprocess_parse_parameters(const char *shader_path,
       struct video_shader *shader)
 {
+   return slang_preprocess_parse_parameters_cached(shader_path, shader,
+         NULL);
+}
+
+bool slang_preprocess_parse_parameters_cached(const char *shader_path,
+      struct video_shader *shader, void *include_cache)
+{
    struct shader_line_buf lines;
 
    memset(&lines, 0, sizeof(lines));
 
    if (shader_line_buf_init(&lines))
    {
-      if (glslang_read_shader_file(shader_path, &lines, true, false))
+      if (glslang_read_shader_file_cached(shader_path, &lines, true, false,
+               include_cache))
       {
          glslang_meta meta = glslang_meta{};
          if (glslang_parse_meta(&lines, &meta))
@@ -915,7 +955,8 @@ bool slang_process(
    if (!*pass.alias && !output.meta.name.empty())
       strlcpy(pass.alias, output.meta.name.c_str(), sizeof(pass.alias) - 1);
 
-   out->format = output.meta.rt_format;
+   out->format          = output.meta.rt_format;
+   out->explicit_format = (output.meta.rt_format != SLANG_FORMAT_UNKNOWN);
 
    if (out->format == SLANG_FORMAT_UNKNOWN)
    {
@@ -923,6 +964,8 @@ bool slang_process(
          out->format = SLANG_FORMAT_R8G8B8A8_SRGB;
       else if (pass.fbo.flags & FBO_SCALE_FLAG_FP_FBO)
          out->format = SLANG_FORMAT_R16G16B16A16_SFLOAT;
+      else if (pass.fbo.flags & FBO_SCALE_FLAG_RGB10_FBO)
+         out->format = SLANG_FORMAT_A2B10G10R10_UNORM_PACK32;
       else
          out->format = SLANG_FORMAT_R8G8B8A8_UNORM;
    }
@@ -1469,8 +1512,7 @@ static bool add_active_buffer_ranges(
       }
       else
       {
-         /* TODO - Try to print name */
-         RARCH_ERR("[Slang] Unknown semantic found.\n");
+         RARCH_ERR("[Slang] Unknown semantic found: \"%s\".\n", name.c_str());
          return false;
       }
    }
@@ -1742,7 +1784,7 @@ bool slang_reflect(
 
       if (index == SLANG_INVALID_TEXTURE_SEMANTIC)
       {
-         RARCH_ERR("[Slang] Texture name '%s' not found in semantic map, "
+         RARCH_ERR("[Slang] Texture name \"%s\" not found in semantic map, "
                    "Probably the texture name or pass alias is not defined "
                    "in the preset (Non-semantic textures not supported yet)\n",
                    fragment.sampled_images[i].name.c_str());

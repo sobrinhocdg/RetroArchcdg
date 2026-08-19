@@ -126,18 +126,26 @@ static void runtime_log_read_file(runtime_log_t *runtime_log)
    unsigned state_slot         = 0;
 
    RtlJSONContext context      = {0};
-   /* Attempt to open log file */
-   RFILE *file                 = filestream_open(runtime_log->path,
-         RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   uint8_t *file_buf           = NULL;
+   int64_t file_len            = 0;
 
-   if (!file)
+   /* Read the whole log in one operation: these files are a few
+    * hundred bytes and always parsed in full, so a single
+    * open/size/read/close beats a pre-open stat plus the chunked
+    * callback path (which itself sizes the stream with an extra
+    * fstat).  A missing log - the first-run case - is silent, as
+    * it always was; the stat runs only when there is a failure to
+    * classify. */
+   if (!filestream_read_file(runtime_log->path,
+         (void**)&file_buf, &file_len))
    {
-      RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
+      if (path_is_valid(runtime_log->path))
+         RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
       return;
    }
 
    /* Initialise JSON parser */
-   if (!(parser = rjson_open_rfile(file)))
+   if (!(parser = rjson_open_buffer(file_buf, (size_t)file_len)))
    {
       RARCH_ERR("[Runtime] Failed to create JSON parser.\n");
       goto end;
@@ -286,13 +294,6 @@ parsed:
       state_slot = (unsigned)val;
    }
 
-   if (     state_slot > 0
-         && state_slot < 1000)
-   {
-      runloop_state_t *runloop_st  = runloop_state_get_ptr();
-      runloop_st->entry_state_slot = state_slot;
-   }
-
    /* If we reach this point then all is well
     * > Assign values to runtime_log object */
    runtime_log->runtime.hours      = runtime_hours;
@@ -321,8 +322,8 @@ end:
    if (context.state_slot)
       free(context.state_slot);
 
-   /* Close log file */
-   filestream_close(file);
+   /* Release file contents */
+   free(file_buf);
 }
 
 /* Initialise runtime log, loading current parameters
@@ -407,16 +408,13 @@ runtime_log_t *runtime_log_init(
    if (!*log_file_dir)
       return NULL;
 
-   /* Create directory, if required */
-   if (!path_is_directory(log_file_dir))
-   {
-      if (!path_mkdir(log_file_dir))
-      {
-         RARCH_ERR("[Runtime] Failed to create directory for"
-               " runtime log: \"%s\".\n", log_file_dir);
-         return NULL;
-      }
-   }
+   /* Note: the log directory is not created here - reading an
+    * existing log does not need it to exist, and this function
+    * runs on read-only paths that never write one (playlist
+    * sublabels init a log per entry).  runtime_log_save()
+    * creates it when a log is actually written, so the read
+    * paths no longer pay a stat (plus a possible mkdir) per
+    * call. */
 
    /* Get content name */
    if (!content_path || !*content_path)
@@ -491,9 +489,9 @@ runtime_log_t *runtime_log_init(
 
    strlcpy(runtime_log->path, log_file_path, sizeof(runtime_log->path));
 
-   /* Load existing log file, if it exists */
-   if (path_is_valid(runtime_log->path))
-      runtime_log_read_file(runtime_log);
+   /* Load existing log file, if it exists (a missing file is
+    * handled - silently - inside) */
+   runtime_log_read_file(runtime_log);
 
    return runtime_log;
 }
@@ -1183,7 +1181,9 @@ void runtime_log_save(runtime_log_t *runtime_log)
 {
    char value_string[64]; /* 64 characters should be
                              enough for a very long runtime... :) */
-   RFILE *file            = NULL;
+   char dir[DIR_MAX_LENGTH];
+   int _len;
+   const char *buf;
    rjsonwriter_t* writer;
 
    if (!runtime_log)
@@ -1191,19 +1191,30 @@ void runtime_log_save(runtime_log_t *runtime_log)
 
    RARCH_LOG("[Runtime] Saving runtime log file: \"%s\".\n", runtime_log->path);
 
-   /* Attempt to open log file */
-   if (!(file = filestream_open(runtime_log->path,
-         RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+   /* Create the log directory, if required (deferred from
+    * runtime_log_init(), which also runs on read-only paths
+    * that never write a log) */
+   fill_pathname_basedir(dir, runtime_log->path, sizeof(dir));
+
+   if (     !path_is_directory(dir)
+         && !path_mkdir(dir))
    {
-      RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
+      RARCH_ERR("[Runtime] Failed to create directory for"
+            " runtime log: \"%s\".\n", dir);
       return;
    }
 
-   /* Initialise JSON writer */
-   if (!(writer = rjsonwriter_open_rfile(file)))
+   /* Serialise the whole log in memory and write it with a
+    * single filestream_write_file() call.  Opening the output
+    * before the JSON exists truncates the previous log, and any
+    * failure past that point - writer allocation, a write error,
+    * a crash mid-save - left a zero-length file behind in place
+    * of the log it destroyed.  The log is a few hundred bytes;
+    * nothing here needs to stream. */
+   if (!(writer = rjsonwriter_open_memory()))
    {
       RARCH_ERR("[Runtime] Failed to create JSON writer.\n");
-      goto end;
+      return;
    }
 
    /* Write output file */
@@ -1282,15 +1293,13 @@ void runtime_log_save(runtime_log_t *runtime_log)
    rjsonwriter_raw(writer, "}", 1);
    rjsonwriter_raw(writer, "\n", 1);
 
-   /* Free JSON writer */
-   if (!rjsonwriter_free(writer))
-   {
-      RARCH_ERR("[Runtime] Error writing runtime log file: \"%s\".\n", runtime_log->path);
-   }
+   /* NULL means the writer hit an error while serialising */
+   buf = rjsonwriter_get_memory_buffer(writer, &_len);
 
-end:
-   /* Close log file */
-   filestream_close(file);
+   if (!buf || !filestream_write_file(runtime_log->path, buf, _len))
+      RARCH_ERR("[Runtime] Error writing runtime log file: \"%s\".\n", runtime_log->path);
+
+   rjsonwriter_free(writer);
 }
 
 /* Utility functions */
@@ -1312,18 +1321,22 @@ void runtime_log_convert_usec2hms(retro_time_t usec,
 /* Updates specified playlist entry runtime values with
  * contents of associated log file */
 void runtime_update_playlist(
-      playlist_t *playlist, size_t idx,
-      const char *dir_runtime_log,
-      const char *dir_playlist,
-      bool log_per_core,
-      enum playlist_sublabel_last_played_style_type timedate_style,
-      enum playlist_sublabel_last_played_date_separator_type date_separator)
+      playlist_t *playlist, size_t idx)
 {
    char runtime_str[64];
    char last_played_str[64];
    runtime_log_t *runtime_log             = NULL;
    const struct playlist_entry *entry     = NULL;
    struct playlist_entry update_entry     = {0};
+   settings_t *settings                   = config_get_ptr();
+   const char *dir_runtime_log            = settings->paths.directory_runtime_log;
+   const char *dir_playlist               = settings->paths.directory_playlist;
+   unsigned runtime_type                  = settings->uints.playlist_sublabel_runtime_type;
+   bool log_per_core                      = (runtime_type == PLAYLIST_RUNTIME_PER_CORE);
+   enum playlist_sublabel_last_played_style_type
+         timedate_style                   = (enum playlist_sublabel_last_played_style_type)settings->uints.playlist_sublabel_last_played_style;
+   enum playlist_sublabel_last_played_date_separator_type
+         date_separator                   = (enum playlist_sublabel_last_played_date_separator_type)settings->uints.menu_timedate_date_separator;
 
    /* Sanity check */
    if (!playlist)

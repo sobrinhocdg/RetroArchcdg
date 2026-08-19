@@ -342,16 +342,18 @@ static bool gl_cg_set_coords(void *shader_data,
       return true;
    }
 
-   if (cg->prg[cg->active_idx].vertex)
+   /* A NULL stream means the caller has nothing for that attribute;
+    * leave it unbound rather than walk a NULL pointer. */
+   if (cg->prg[cg->active_idx].vertex && coords->vertex)
       gl_cg_set_coord_array(cg->prg[cg->active_idx].vertex, cg, coords->vertex, 2);
 
-   if (cg->prg[cg->active_idx].tex)
+   if (cg->prg[cg->active_idx].tex && coords->tex_coord)
       gl_cg_set_coord_array(cg->prg[cg->active_idx].tex, cg, coords->tex_coord, 2);
 
-   if (cg->prg[cg->active_idx].lut_tex)
+   if (cg->prg[cg->active_idx].lut_tex && coords->lut_tex_coord)
       gl_cg_set_coord_array(cg->prg[cg->active_idx].lut_tex, cg, coords->lut_tex_coord, 2);
 
-   if (cg->prg[cg->active_idx].color)
+   if (cg->prg[cg->active_idx].color && coords->color)
       gl_cg_set_coord_array(cg->prg[cg->active_idx].color, cg, coords->color, 4);
 
    return true;
@@ -455,6 +457,13 @@ static void gl_cg_set_params(void *dat, void *shader_data)
       unsigned modulo = cg->shader->pass[cg->active_idx - 1].frame_count_mod;
       if (modulo)
          frame_count %= modulo;
+      else
+         /* fp32 mantissa is 23 bits; integers above 2^24 cannot be
+          * represented exactly. Mask to 24 bits when the shader pass
+          * has not declared its own modulo, so (float)frame_count stays
+          * bit-exact and time-based Cg shaders keep animating beyond
+          * ~77 h of continuous play. */
+         frame_count &= 0xFFFFFFu;
 
       cg_gl_set_param_1f(cg->prg[cg->active_idx].frame_cnt_f, (float)frame_count);
       cg_gl_set_param_1f(cg->prg[cg->active_idx].frame_cnt_v, (float)frame_count);

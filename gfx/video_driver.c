@@ -14,13 +14,16 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <memory/mem_stats.h>
 #include <stdlib.h>
 #include <math.h>
 
+#include <retro_atomic.h>
 #include <retro_inline.h>
 #include <string/stdstring.h>
 #include <retro_math.h>
 #include <retro_timers.h>
+#include <time/rtime.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../config.h"
@@ -41,6 +44,7 @@
 
 #ifdef HAVE_THREADS
 #include "video_thread_wrapper.h"
+#include "font_driver.h"
 #endif
 
 #ifdef HAVE_MENU
@@ -73,9 +77,30 @@
 
 #define FRAME_DELAY_AUTO_DEBUG 0
 
+/* Force a helper out of line even though it has a single call site.
+ * Follows the RXML_NOINLINE precedent in
+ * libretro-common/formats/xml/rxml.c.
+ *
+ * video_driver_frame() is the hottest function outside the cores
+ * themselves -- once per emulated frame, forever -- and the helpers it
+ * calls exactly once get inlined straight back into it, so work that
+ * is conditional on a pixel format, a scanline racing mode or a
+ * per-frame toggle still occupies its fall-through path.  Under -Os
+ * the compiler already optimises for size and the outlining only adds
+ * call overhead, so it is disabled there. */
+#if defined(__OPTIMIZE_SIZE__)
+#define VIDEO_NOINLINE
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
+#define VIDEO_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define VIDEO_NOINLINE __declspec(noinline)
+#else
+#define VIDEO_NOINLINE
+#endif
+
 /* Forward declarations */
-static INLINE void video_driver_scanline_before_frame(video_driver_state_t *video_st, float refresh_rate, uint16_t frame_time_target, uint16_t core_run_time);
-static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video_st, float refresh_rate, uint16_t frame_time_target, uint16_t core_run_time);
+VIDEO_NOINLINE static void video_driver_scanline_before_frame(video_driver_state_t *video_st, float refresh_rate, uint16_t frame_time_target, uint16_t core_run_time);
+VIDEO_NOINLINE static void video_driver_scanline_after_frame(video_driver_state_t *video_st, float refresh_rate, uint16_t frame_time_target, uint16_t core_run_time);
 
 typedef struct
 {
@@ -138,6 +163,12 @@ static const gfx_ctx_driver_t *gfx_ctx_gl_drivers[] = {
 #if defined(HAVE_OPENDINGUX_FBDEV)
    &gfx_ctx_opendingux_fbdev,
 #endif
+/* SDL3 video driver is higher on the list so that when an OpenGL context
+ * is desired while using SDL3, it's used. The sdl3_ctx_enabled() function
+ * ensures it's only selected when SDL3 is actively in use. */
+#if defined(HAVE_SDL3) && (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE) || defined(HAVE_OPENGLES))
+   &gfx_ctx_sdl3_gl,
+#endif
 #if defined(_WIN32) && (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_ANGLE)
    &gfx_ctx_wgl,
 #endif
@@ -178,10 +209,10 @@ static const gfx_ctx_driver_t *gfx_ctx_gl_drivers[] = {
 #ifdef HAVE_OSMESA
    &gfx_ctx_osmesa,
 #endif
-#if (defined(EMSCRIPTEN) && defined(HAVE_EGL))
+#if (defined(__EMSCRIPTEN__) && defined(HAVE_EGL))
    &gfx_ctx_emscripten,
 #endif
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
    &gfx_ctx_emscripten_webgl,
 #endif
    &gfx_ctx_null,
@@ -229,22 +260,49 @@ static INLINE bool realloc_checked(void **ptr, size_t len)
    return *ptr == nptr;
 }
 
-static bool video_coord_array_resize(video_coord_array_t *ca,
-   unsigned cap)
+/* Grow one stream, or bring it into existence if this is the first
+ * append that carries it.  A stream nobody has ever appended stays
+ * NULL and costs nothing; consumers already treat a NULL stream as
+ * "not present" -- every shader backend binds a stream only when its
+ * attribute location is >= 0, and the display drivers substitute a
+ * default for one they need and did not get. */
+static bool video_coord_array_grow(float **dst, const float *src,
+      unsigned comps, unsigned cap, unsigned have)
 {
-   size_t base_size    = sizeof(float) * cap;
+   size_t stride = comps * sizeof(float);
 
-   if (!realloc_checked((void**)&ca->coords.vertex,
-            2 * base_size))
+   if (!src && !*dst)
+      return true;
+
+   if (!*dst && have)
+   {
+      /* First appearance of this stream part-way through the array.
+       * The vertices already appended have no data for it, so zero
+       * them rather than hand the consumer whatever realloc found. */
+      if (!(*dst = (float*)calloc(cap, stride)))
+         return false;
+      return true;
+   }
+
+   return realloc_checked((void**)dst, cap * stride);
+}
+
+static bool video_coord_array_resize(video_coord_array_t *ca,
+   const video_coords_t *coords, unsigned cap)
+{
+   unsigned have = (unsigned)ca->coords.vertices;
+
+   if (!video_coord_array_grow(&ca->coords.vertex,
+            coords->vertex, 2, cap, have))
       return false;
-   if (!realloc_checked((void**)&ca->coords.color,
-            4 * base_size))
+   if (!video_coord_array_grow(&ca->coords.color,
+            coords->color, 4, cap, have))
       return false;
-   if (!realloc_checked((void**)&ca->coords.tex_coord,
-            2 * base_size))
+   if (!video_coord_array_grow(&ca->coords.tex_coord,
+            coords->tex_coord, 2, cap, have))
       return false;
-   if (!realloc_checked((void**)&ca->coords.lut_tex_coord,
-            2 * base_size))
+   if (!video_coord_array_grow(&ca->coords.lut_tex_coord,
+            coords->lut_tex_coord, 2, cap, have))
       return false;
 
    ca->allocated = cap;
@@ -258,29 +316,43 @@ bool video_coord_array_append(video_coord_array_t *ca,
    size_t base_size, offset;
    count          = MIN(count, coords->vertices);
 
-   if (ca->coords.vertices + count >= ca->allocated)
+   if (     (ca->coords.vertices + count >= ca->allocated)
+         || (coords->vertex        && !ca->coords.vertex)
+         || (coords->color         && !ca->coords.color)
+         || (coords->tex_coord     && !ca->coords.tex_coord)
+         || (coords->lut_tex_coord && !ca->coords.lut_tex_coord))
    {
       unsigned cap = next_pow2(ca->coords.vertices + count);
-      if (!video_coord_array_resize(ca, cap))
+      if (cap < ca->allocated)
+         cap       = ca->allocated;
+      if (!video_coord_array_resize(ca, coords, cap))
          return false;
    }
 
    base_size = count * sizeof(float);
    offset    = ca->coords.vertices;
 
-   /* XXX: I wish we used interlaced arrays so
-    * we could call memcpy only once. */
-   memcpy(ca->coords.vertex        + offset * 2,
-         coords->vertex, base_size * 2);
+   /* A NULL stream means the caller has nothing to say about that
+    * attribute, which is not the same as having zeroes to say about
+    * it: the XMB ribbon, the only producer of the shared display
+    * array, passes one buffer of zeros as three of the four streams
+    * purely to satisfy this function, and its shaders declare a
+    * single attribute.  Skip what was not given rather than copy it. */
+   if (coords->vertex)
+      memcpy(ca->coords.vertex        + offset * 2,
+            coords->vertex, base_size * 2);
 
-   memcpy(ca->coords.color         + offset * 4,
-         coords->color, base_size * 4);
+   if (coords->color)
+      memcpy(ca->coords.color         + offset * 4,
+            coords->color, base_size * 4);
 
-   memcpy(ca->coords.tex_coord     + offset * 2,
-         coords->tex_coord, base_size * 2);
+   if (coords->tex_coord)
+      memcpy(ca->coords.tex_coord     + offset * 2,
+            coords->tex_coord, base_size * 2);
 
-   memcpy(ca->coords.lut_tex_coord + offset * 2,
-         coords->lut_tex_coord, base_size * 2);
+   if (coords->lut_tex_coord)
+      memcpy(ca->coords.lut_tex_coord + offset * 2,
+            coords->lut_tex_coord, base_size * 2);
 
    ca->coords.vertices += count;
 
@@ -364,8 +436,8 @@ const video_driver_t *video_drivers[] = {
 #ifdef HAVE_GCM
    &video_gcm,
 #endif
-#ifdef HAVE_VITA2D
-   &video_vita2d,
+#ifdef HAVE_GXM
+   &video_gxm,
 #endif
 #ifdef HAVE_VULKAN
    &video_vulkan,
@@ -426,6 +498,9 @@ const video_driver_t *video_drivers[] = {
 #if defined(HAVE_SDL2) && !(defined(HAVE_COCOA) || defined(HAVE_COCOA_METAL))
    &video_sdl2,
 #endif
+#if defined(HAVE_SDL3) && !(defined(HAVE_COCOA) || defined(HAVE_COCOA_METAL))
+   &video_sdl3,
+#endif
 #ifdef HAVE_SDL_DINGUX
 #if defined(RS90) || defined(MIYOO)
    &video_sdl_rs90,
@@ -483,6 +558,9 @@ const video_driver_t *video_drivers[] = {
 #ifdef HAVE_NETWORK_VIDEO
    &video_network,
 #endif
+#ifdef HAVE_HUB75
+   &video_hub75,
+#endif
    &video_null,
    NULL,
 };
@@ -490,6 +568,18 @@ const video_driver_t *video_drivers[] = {
 static video_driver_state_t video_driver_st = { 0 };
 static const video_display_server_t *current_display_server =
 &dispserv_null;
+
+/* Cached-frame state.  Private to this TU; all access goes through
+ * video_driver_cached_frame_{info,read,is_hw_render,publish,
+ * invalidate} (any-thread, locked) or the same-thread
+ * video_driver_cached_frame() replay path.  Extracted from
+ * video_driver_state_t after the API migration landed so the
+ * privacy is structural (file-scope static) rather than
+ * convention (struct field accessed only through helpers). */
+static const void *frame_cache_data    = NULL;
+static unsigned    frame_cache_width   = 0;
+static unsigned    frame_cache_height  = 0;
+static size_t      frame_cache_pitch   = 0;
 
 struct retro_hw_render_callback *video_driver_get_hw_context(void)
 {
@@ -627,6 +717,25 @@ static void *video_thread_get_ptr(video_driver_state_t *video_st)
       return thr->driver_data;
    return NULL;
 }
+
+/* Content scale is computed by the viewport maths, which runs on the
+ * video thread when threading is active. Read the copy the worker
+ * publishes under its lock instead of racing video_driver_st. */
+static void video_thread_get_scale(video_driver_state_t *video_st,
+      unsigned *width, unsigned *height)
+{
+   thread_video_t *thr = (thread_video_t*)video_st->data;
+   if (!thr)
+   {
+      *width  = video_st->scale_width;
+      *height = video_st->scale_height;
+      return;
+   }
+   slock_lock(thr->lock);
+   *width  = thr->scale_width;
+   *height = thr->scale_height;
+   slock_unlock(thr->lock);
+}
 #endif
 
 /**
@@ -751,34 +860,33 @@ const char *hw_render_context_name(
 
 static enum retro_hw_context_type hw_render_context_type(const char *s)
 {
-   size_t len = strlen(s) + 1;
-
+   size_t _len = strlen(s) + 1;
 #ifdef HAVE_OPENGL_CORE
-   if (len >= 7 && memcmp(s, "glcore", 7) == 0)
+   if (_len >= 7 && memcmp(s, "glcore", 7) == 0)
       return RETRO_HW_CONTEXT_OPENGL_CORE;
 #endif
 #ifdef HAVE_OPENGL
-   if (len >= 3 && memcmp(s, "gl", 3) == 0)
+   if (_len >= 3 && memcmp(s, "gl", 3) == 0)
       return RETRO_HW_CONTEXT_OPENGL;
 #endif
 #ifdef HAVE_VULKAN
-   if (len >= 7 && memcmp(s, "vulkan", 7) == 0)
+   if (_len >= 7 && memcmp(s, "vulkan", 7) == 0)
       return RETRO_HW_CONTEXT_VULKAN;
 #endif
 #if defined(HAVE_D3D9) && defined(HAVE_HLSL)
-   if (len >= 10 && memcmp(s, "d3d9_hlsl", 10) == 0)
+   if (_len >= 10 && memcmp(s, "d3d9_hlsl", 10) == 0)
       return RETRO_HW_CONTEXT_D3D9;
 #endif
 #ifdef HAVE_D3D10
-   if (len >= 6 && memcmp(s, "d3d10", 6) == 0)
+   if (_len >= 6 && memcmp(s, "d3d10", 6) == 0)
       return RETRO_HW_CONTEXT_D3D10;
 #endif
 #ifdef HAVE_D3D11
-   if (len >= 6 && memcmp(s, "d3d11", 6) == 0)
+   if (_len >= 6 && memcmp(s, "d3d11", 6) == 0)
       return RETRO_HW_CONTEXT_D3D11;
 #endif
 #ifdef HAVE_D3D12
-   if (len >= 6 && memcmp(s, "d3d12", 6) == 0)
+   if (_len >= 6 && memcmp(s, "d3d12", 6) == 0)
       return RETRO_HW_CONTEXT_D3D12;
 #endif
    return RETRO_HW_CONTEXT_NONE;
@@ -812,6 +920,26 @@ struct string_list* video_driver_get_gpu_api_devices(enum gfx_ctx_api api)
    }
 
    return NULL;
+}
+
+const char *pixel_format_name(enum retro_pixel_format pix_fmt)
+{
+   switch (pix_fmt)
+   {
+      case RETRO_PIXEL_FORMAT_0RGB1555:
+         return "0RGB1555";
+      case RETRO_PIXEL_FORMAT_XRGB8888:
+         return "XRGB8888";
+      case RETRO_PIXEL_FORMAT_RGB565:
+         return "RGB565";
+      case RETRO_PIXEL_FORMAT_XRGB2101010:
+         return "XRGB2101010";
+      case RETRO_PIXEL_FORMAT_HDR10_2101010:
+         return "HDR10_2101010";
+      case RETRO_PIXEL_FORMAT_UNKNOWN:
+      default:
+         return "UNKNOWN";
+   }
 }
 
 
@@ -1253,10 +1381,9 @@ const char *video_display_server_get_ident(void)
 void* video_display_server_init(enum rarch_display_type type)
 {
    video_driver_state_t *video_st = &video_driver_st;
-   runloop_state_t *runloop_st    = runloop_state_get_ptr();
 
    /* Reuse when already and still running */
-   if (current_display_server && runloop_st->flags & RUNLOOP_FLAG_IS_INITED)
+   if (current_display_server && runloop_is_inited())
       return video_st->current_display_server_data;
    else
       video_display_server_destroy();
@@ -1636,24 +1763,13 @@ bool video_driver_is_threaded(void)
 bool *video_driver_get_threaded(void)
 {
    video_driver_state_t *video_st                 = &video_driver_st;
-#if defined(__MACH__) && defined(__APPLE__)
-   /* TODO/FIXME - force threaded video to disabled on Apple for now
-    * until NSWindow/UIWindow concurrency issues are taken care of */
-   video_st->threaded = false;
-#endif
    return &video_st->threaded;
 }
 
 void video_driver_set_threaded(bool val)
 {
    video_driver_state_t *video_st                 = &video_driver_st;
-#if defined(__MACH__) && defined(__APPLE__)
-   /* TODO/FIXME - force threaded video to disabled on Apple for now
-    * until NSWindow/UIWindow concurrency issues are taken care of */
-   video_st->threaded = false;
-#else
    video_st->threaded = val;
-#endif
 }
 
 const char *video_driver_get_ident(void)
@@ -1731,7 +1847,7 @@ void video_driver_filter_free(void)
 
    video_st->state_scale     = 0;
    video_st->state_out_bpp   = 0;
-   video_st->flags          &= ~(VIDEO_FLAG_STATE_OUT_RGB32);
+   video_driver_modify_disp_flags(0, VIDEO_FLAG_STATE_OUT_RGB32);
 }
 
 void video_driver_init_filter(enum retro_pixel_format colfmt_int,
@@ -1787,9 +1903,9 @@ void video_driver_init_filter(enum retro_pixel_format colfmt_int,
    video_st->state_scale     = maxsize / RARCH_SCALE_BASE;
    if (rarch_softfilter_get_output_format(
          video_st->state_filter) == RETRO_PIXEL_FORMAT_XRGB8888)
-      video_st->flags       |=  VIDEO_FLAG_STATE_OUT_RGB32;
+      video_driver_modify_disp_flags(VIDEO_FLAG_STATE_OUT_RGB32, 0);
    else
-      video_st->flags       &= ~VIDEO_FLAG_STATE_OUT_RGB32;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_STATE_OUT_RGB32);
 
    video_st->state_out_bpp   = (video_st->flags & VIDEO_FLAG_STATE_OUT_RGB32)
       ? sizeof(uint32_t) : sizeof(uint16_t);
@@ -1886,12 +2002,43 @@ void video_driver_free_internal(void)
       }
    }
 
+   /* Drop the OSD font before the driver that owns its GPU objects
+    * goes away. Only for drivers that have handed the lifecycle up;
+    * the rest still free it inside their own free(). Keyed on
+    * ownership so that a teardown arriving after the next driver is
+    * already up cannot take the live font with it. Under threaded
+    * video the wrapper does this from CMD_FREE, so we don't need to
+    * check HAVE_THREADS here. */
+   /* Anything still waiting out its frames has to go now: the context
+    * that owns its atlas is about to, and there will be no further
+    * frame to age it against. */
+   font_driver_free_pending(true);
+
+   if (vid && vid->font_backend)
+      font_driver_free_osd_for(video_st->data);
+
    if (video_st->data && vid && vid->free)
       vid->free(video_st->data);
+
+   /* The poke interface is a pointer into the driver's static vtable, so
+    * unlike video_st->data it survives free "working" - and
+    * video_context_driver_get_flags() consults poke->get_flags, so a
+    * stale poke lets a torn-down instance keep answering capability
+    * queries during an in-process core switch. That was harmless while
+    * every get_flags ignored its data argument; gl3's scRGB-gated
+    * 10-bit-source flag is instance state, and answering from a freed
+    * instance reported the capability absent, which is how HDR10
+    * negotiation broke on core switch. Dead instances answer nothing. */
+   video_st->poke = NULL;
 
    if (video_st->scaler_ptr)
       video_driver_pixel_converter_free(video_st->scaler_ptr);
    video_st->scaler_ptr = NULL;
+
+   if (video_st->pix10_convert_buf)
+      free(video_st->pix10_convert_buf);
+   video_st->pix10_convert_buf = NULL;
+   video_st->pix10_convert_cap = 0;
 #ifdef HAVE_VIDEO_FILTER
    video_driver_filter_free();
 #endif
@@ -2222,6 +2369,44 @@ void video_driver_set_viewport_core(void)
       aspectratio_lut[ASPECT_RATIO_CORE].value = core_aspect;
 }
 
+/* Atomically set and/or clear bits of video_driver_st.flags under
+ * display_lock, the same lock video_driver_get_disp_flags() takes.
+ * Callers must not hold display_lock already; this is a leaf helper.
+ * A set/get pair around a |= would not do: the read-modify-write would
+ * straddle two separate critical sections. */
+void video_driver_modify_disp_flags(uint32_t set_bits, uint32_t clear_bits)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+#ifdef HAVE_THREADS
+   if (video_st->display_lock)
+   {
+      slock_lock(video_st->display_lock);
+      video_st->flags = (video_st->flags & ~clear_bits) | set_bits;
+      slock_unlock(video_st->display_lock);
+      return;
+   }
+#endif
+   video_st->flags = (video_st->flags & ~clear_bits) | set_bits;
+}
+
+static retro_atomic_int_t video_cache_context_ack
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
+
+void video_driver_cache_context_ack_set(void)
+{
+   retro_atomic_fetch_or_int(&video_cache_context_ack, 1);
+}
+
+bool video_driver_cache_context_ack_test(void)
+{
+   return retro_atomic_load_acquire_int(&video_cache_context_ack) != 0;
+}
+
+void video_driver_cache_context_ack_clear(void)
+{
+   retro_atomic_fetch_and_int(&video_cache_context_ack, 0);
+}
+
 uint32_t video_driver_get_disp_flags(void)
 {
    video_driver_state_t *video_st = &video_driver_st;
@@ -2461,8 +2646,8 @@ static void video_viewport_get_scaled_integer(
    int padding_y                   = 0;
    float vp_bias_x                 = settings->floats.video_vp_bias_x;
    float vp_bias_y                 = settings->floats.video_vp_bias_y;
-   unsigned content_width          = video_st->frame_cache_width;
-   unsigned content_height         = video_st->frame_cache_height;
+   unsigned content_width          = frame_cache_width;
+   unsigned content_height         = frame_cache_height;
 #if defined(RARCH_MOBILE)
    if (width < height)
    {
@@ -2610,8 +2795,8 @@ static void video_viewport_get_scaled_integer(
 
             /* Reset width to exact width */
             content_width = (rotation % 2)
-                  ? ((video_st->frame_cache_height <= 4) ? video_st->av_info.geometry.base_height : video_st->frame_cache_height)
-                  : ((video_st->frame_cache_width  <= 4) ? video_st->av_info.geometry.base_width  : video_st->frame_cache_width);
+                  ? ((frame_cache_height <= 4) ? video_st->av_info.geometry.base_height : frame_cache_height)
+                  : ((frame_cache_width  <= 4) ? video_st->av_info.geometry.base_width  : frame_cache_width);
 
             overscale_w   = (width / content_width) + !!(width % content_width);
 
@@ -2826,7 +3011,11 @@ void video_driver_update_viewport(
             int ol_y      = (int)(ol->viewport.y * vp->full_height);
             unsigned ol_w = (unsigned)(ol->viewport.w * vp->full_width);
             unsigned ol_h = (unsigned)(ol->viewport.h * vp->full_height);
-            RARCH_LOG("[Overlay] Applying viewport override!\n");
+            if (!ol->viewport_override_logged)
+            {
+               RARCH_LOG("[Overlay] Applying viewport override!\n");
+               ((struct overlay *)ol)->viewport_override_logged = true;
+            }
 
             if (ol->flags & OVERLAY_VIEWPORT_FILL)
             {
@@ -3059,6 +3248,61 @@ bool video_driver_is_hw_context(void)
    return video_st->hw_render.context_type != RETRO_HW_CONTEXT_NONE;
 }
 
+bool video_driver_render_context_is_main_thread_only(void)
+{
+#ifdef IOS
+   /* The iOS Cocoa GL/GLES backends ("gl", "glcore") render through a
+    * GLKView, whose drawable and backing CAEAGLLayer may only be touched
+    * on the main thread.  With threaded video, swap_buffers and the
+    * per-frame bindDrawable run on the video worker thread, which trips
+    * UIKit's "modifying properties of a view's layer off the main thread"
+    * assertion (the GLKView drawable is realized/resized from the layer
+    * lazily on whichever thread first binds it).  Veto threaded video for
+    * these drivers so all GL and UIKit work stays on the main thread, the
+    * way GLKit is designed to be driven.  Metal and Vulkan (CAMetalLayer
+    * via MoltenVK) do not use GLKView and are unaffected. */
+   video_driver_state_t *video_st = &video_driver_st;
+   const video_driver_t *vid      = video_st->current_video;
+   const char           *ident    = NULL;
+   if (!vid)
+      return false;
+   /* Read the underlying driver ident directly.  Mirror
+    * video_driver_get_ident() but key off VIDEO_FLAG_THREAD_WRAPPER_ACTIVE
+    * rather than VIDEO_DRIVER_IS_THREADED_INTERNAL, since that macro calls
+    * back into this predicate and would recurse. */
+#ifdef HAVE_THREADS
+   if (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE)
+   {
+      const thread_video_t *thr = (const thread_video_t*)video_st->data;
+      ident = (thr && thr->driver) ? thr->driver->ident : NULL;
+   }
+   else
+#endif
+      ident = vid->ident;
+   if (ident && (string_is_equal(ident, "gl")
+              || string_is_equal(ident, "glcore")))
+      return true;
+#endif /* IOS */
+   return false;
+}
+
+/* Drops cached, core-owned GPU resource references from the active
+ * video driver. Safe to call unconditionally; cheap when no HW context
+ * is active or when the driver does not implement the hook. */
+void video_driver_invalidate_hw_render_cache(void)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (!video_st->current_video || !video_st->data)
+      return;
+   if (video_st->hw_render.context_type == RETRO_HW_CONTEXT_NONE)
+      return;
+   if (!video_st->current_video->invalidate_hw_render_cache)
+      return;
+
+   video_st->current_video->invalidate_hw_render_cache(video_st->data);
+}
+
 bool video_driver_get_viewport_info(struct video_viewport *viewport)
 {
    video_driver_state_t *video_st  = &video_driver_st;
@@ -3143,16 +3387,50 @@ bool video_driver_texture_load(void *data,
 {
    video_driver_state_t *video_st     = &video_driver_st;
    const video_poke_interface_t *poke = video_st->poke;
+   struct texture_image *ti           = (struct texture_image*)data;
+   bool threaded;
    if (!id || !poke || !poke->load_texture)
       return false;
    /* Only use the threaded path when the thread wrapper is
     * fully active. During reinit, video_st->threaded may
     * already reflect the new setting while video_st->data
     * still points to the real driver, not thread_video_t. */
-   *id = poke->load_texture(video_st->data, data,
-         VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
-         && (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE),
-         filter_type);
+   threaded = VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
+         && (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE);
+
+   /* GPU-native fast path: upload BCn blocks directly when the driver can
+    * sample the format. This works under threading too -- the threaded flag
+    * is forwarded, and each driver's load_texture_compressed either marshals
+    * the upload onto the video thread or declines (returning 0), in which
+    * case the CPU decode fallback below takes over. */
+   if (     ti
+         && ti->compressed
+         && poke->supports_texture_format
+         && poke->load_texture_compressed
+         && poke->supports_texture_format(video_st->data,
+               ti->compressed->format))
+   {
+      *id = poke->load_texture_compressed(video_st->data,
+            ti->compressed, threaded, filter_type);
+      if (*id)
+         return true;
+      /* upload failed or declined: fall through to CPU decode */
+   }
+
+   /* Fallback: realize RGBA8 for drivers that can't sample the format
+    * (or that declined the threaded upload), then take the normal upload. */
+   if (ti && ti->compressed && !ti->pixels)
+      image_texture_realize_rgba(ti);
+
+   /* A 10-bit (XRGB2101010) texture is only kept for drivers that advertise
+    * native 10-bit source support; otherwise narrow to 8-bit ARGB8888 before
+    * upload so the driver's ordinary 8-bit path stays correct. */
+   if (     ti
+         && ti->pix10
+         && !video_driver_test_all_flags(GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE))
+      image_texture_narrow_10bit(ti);
+
+   *id = poke->load_texture(video_st->data, data, threaded, filter_type);
    return true;
 }
 
@@ -3179,7 +3457,6 @@ void video_driver_cached_frame(void)
 {
    runloop_state_t *runloop_st    = runloop_state_get_ptr();
    recording_state_t *recording_st= recording_state_get_ptr();
-   video_driver_state_t *video_st = &video_driver_st;
    void             *recording    = recording_st->data;
    struct retro_callbacks *cbs    = &runloop_st->retro_ctx;
 
@@ -3188,14 +3465,197 @@ void video_driver_cached_frame(void)
 
    if (runloop_st->current_core.flags & RETRO_CORE_FLAG_INITED)
       cbs->frame_cb(
-            (video_st->frame_cache_data != RETRO_HW_FRAME_BUFFER_VALID)
-            ? video_st->frame_cache_data
+            (frame_cache_data != RETRO_HW_FRAME_BUFFER_VALID)
+            ? frame_cache_data
             : NULL,
-            video_st->frame_cache_width,
-            video_st->frame_cache_height,
-            video_st->frame_cache_pitch);
+            frame_cache_width,
+            frame_cache_height,
+            frame_cache_pitch);
 
    recording_st->data             = recording;
+}
+
+/* Commit 1 of the frame-cache redesign: new API surface implemented
+ * as thin wrappers over the existing video_driver_state_t fields.
+ * No behavioural change vs accessing frame_cache_data directly.
+ * Lifetime / thread-safety guarantees described in the headers are
+ * NOT yet enforced -- they become real in the later commit that
+ * makes the storage private and adds the lifetime lock.  Until
+ * then these wrappers are equivalent to direct field reads and
+ * exist so consumers can be migrated one at a time without
+ * waiting on the structural work.
+ */
+/* Lifetime lock for the frame_cache_* fields.  Reads
+ * (cached_frame_info / cached_frame_read / cached_frame_is_hw_render)
+ * take it shared with writes (publish / invalidate).  The
+ * cached_frame_read callback runs inside the lock so that any
+ * buffer the cached pointer references is guaranteed to remain
+ * mapped / allocated for the duration of the callback -- the
+ * write side (in particular the driver-resource teardown paths
+ * that previously had to use cooperative defensive NULL-outs)
+ * blocks here until the callback returns.
+ *
+ * HAVE_THREADS-gated: builds without threading support degenerate
+ * to no-op locking, same as the rest of video_driver.c.
+ */
+#ifdef HAVE_THREADS
+static slock_t *cached_frame_lock = NULL;
+
+static INLINE void cached_frame_lock_acquire(void)
+{
+   if (cached_frame_lock)
+      slock_lock(cached_frame_lock);
+}
+static INLINE void cached_frame_lock_release(void)
+{
+   if (cached_frame_lock)
+      slock_unlock(cached_frame_lock);
+}
+#else
+#define cached_frame_lock_acquire() ((void)0)
+#define cached_frame_lock_release() ((void)0)
+#endif
+
+bool video_driver_cached_frame_info(
+      unsigned *width, unsigned *height, size_t *pitch,
+      bool *has_cpu_pixels)
+{
+   const void           *data;
+   bool                  has_frame;
+
+   cached_frame_lock_acquire();
+   data      = frame_cache_data;
+   has_frame = (data != NULL);
+
+   if (has_frame)
+   {
+      if (width)          *width          = frame_cache_width;
+      if (height)         *height         = frame_cache_height;
+      if (pitch)          *pitch          = frame_cache_pitch;
+      if (has_cpu_pixels) *has_cpu_pixels =
+         (data != RETRO_HW_FRAME_BUFFER_VALID);
+   }
+   cached_frame_lock_release();
+
+   if (!has_frame)
+   {
+      /* No cached frame yet, or it was invalidated.  Zero outputs
+       * and report not-available so the caller can branch. */
+      if (width)          *width          = 0;
+      if (height)         *height         = 0;
+      if (pitch)          *pitch          = 0;
+      if (has_cpu_pixels) *has_cpu_pixels = false;
+      return false;
+   }
+   return true;
+}
+
+void video_driver_cached_frame_read(
+      void *userdata,
+      void (*cb)(void *userdata,
+                 const void *data,
+                 unsigned width, unsigned height, size_t pitch))
+{
+   const void           *data;
+   unsigned              width    = 0;
+   unsigned              height   = 0;
+   size_t                pitch    = 0;
+   bool                  hw_or_empty;
+
+   if (!cb)
+      return;
+
+   /* Hold the lock for the duration of the callback so that any
+    * concurrent driver-resource teardown (vulkan_deinit_textures,
+    * d3d12_sw_fb_ensure / _gfx_free, runloop lifecycle resets)
+    * blocks until the callback returns.  This is the core safety
+    * guarantee the redesign introduces: the pointer handed to the
+    * callback cannot be freed out from under it. */
+   cached_frame_lock_acquire();
+   data        = frame_cache_data;
+   hw_or_empty = (!data || data == RETRO_HW_FRAME_BUFFER_VALID);
+   if (!hw_or_empty)
+   {
+      width  = frame_cache_width;
+      height = frame_cache_height;
+      pitch  = frame_cache_pitch;
+   }
+
+   /* Hand the callback NULL when no CPU pixels are available, so
+    * the consumer doesn't have to special-case the HW-render
+    * sentinel or a yet-uninitialised cache.  Same convention as
+    * cached_frame_info()'s has_cpu_pixels=false. */
+   cb(userdata, hw_or_empty ? NULL : data, width, height, pitch);
+   cached_frame_lock_release();
+}
+
+bool video_driver_cached_frame_is_hw_render(void)
+{
+   bool                  is_hw;
+   cached_frame_lock_acquire();
+   is_hw =    frame_cache_data
+           && frame_cache_data == RETRO_HW_FRAME_BUFFER_VALID;
+   cached_frame_lock_release();
+   return is_hw;
+}
+
+/* Producer-side publish: install a new cached frame metadata
+ * tuple.  Called from video_driver_frame, from the
+ * command_event_reinit replay path, and from the
+ * task_screenshot.c::supports_read_frame_raw block.  Takes the
+ * lock; any in-flight cached_frame_read callback completes before
+ * the publish becomes visible. */
+void video_driver_cached_frame_publish(
+      const void *data, unsigned width, unsigned height, size_t pitch)
+{
+   cached_frame_lock_acquire();
+   if (data)
+      frame_cache_data = data;
+   frame_cache_width   = width;
+   frame_cache_height  = height;
+   frame_cache_pitch   = pitch;
+   cached_frame_lock_release();
+}
+
+/* Producer-side invalidate: clear the cached frame.  Drivers call
+ * this before releasing any buffer they suspect the cached frame
+ * might point into; runloop calls it at content / core / driver
+ * lifecycle transitions.  Takes the lock; any in-flight
+ * cached_frame_read callback completes before the invalidation
+ * becomes visible, so the buffer is safe to free immediately
+ * after this returns. */
+void video_driver_cached_frame_invalidate(void)
+{
+   cached_frame_lock_acquire();
+   frame_cache_data   = NULL;
+   frame_cache_width  = 0;
+   frame_cache_height = 0;
+   frame_cache_pitch  = 0;
+   cached_frame_lock_release();
+}
+
+bool video_driver_cached_frame_invalidate_if(
+      void *userdata,
+      bool (*predicate)(void *userdata, const void *data))
+{
+   bool invalidated = false;
+
+   if (!predicate)
+      return false;
+
+   cached_frame_lock_acquire();
+   if (     frame_cache_data
+         && predicate(userdata, frame_cache_data))
+   {
+      frame_cache_data   = NULL;
+      frame_cache_width  = 0;
+      frame_cache_height = 0;
+      frame_cache_pitch  = 0;
+      invalidated        = true;
+   }
+   cached_frame_lock_release();
+
+   return invalidated;
 }
 
 bool video_driver_has_focus(void)
@@ -3210,7 +3670,7 @@ size_t video_driver_get_window_title(char *s, size_t len)
    if (s && (video_st->flags & VIDEO_FLAG_WINDOW_TITLE_UPDATE))
    {
       size_t n = strlcpy(s, video_st->window_title, len);
-      video_st->flags &= ~VIDEO_FLAG_WINDOW_TITLE_UPDATE;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_WINDOW_TITLE_UPDATE);
       if (n >= len)
          return len ? len - 1 : 0;
       return n;
@@ -3232,7 +3692,7 @@ void video_driver_update_title(void *data)
          window->set_title((void*)video_st->display_userdata, video_st->window_title);
          strlcpy(video_st->window_title_prev, video_st->window_title, sizeof(video_st->window_title_prev));
       }
-      video_st->flags &= ~VIDEO_FLAG_WINDOW_TITLE_UPDATE;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_WINDOW_TITLE_UPDATE);
    }
 #endif
 }
@@ -3296,9 +3756,11 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->preemptive_frames           = settings->bools.preemptive_frames_enable;
    video_info->runahead_frames             = settings->uints.run_ahead_frames;
    video_info->fps_show                    = settings->bools.video_fps_show;
+   video_info->filter_enable               = settings->bools.video_filter_enable;
    video_info->memory_show                 = settings->bools.video_memory_show;
    video_info->statistics_show             = settings->bools.video_statistics_show;
    video_info->framecount_show             = settings->bools.video_framecount_show;
+   video_info->time_show                   = settings->uints.video_time_show;
    video_info->core_status_msg_show        = runloop_st->core_status_msg.set;
    video_info->aspect_ratio_idx            = settings->uints.video_aspect_ratio_idx;
    video_info->post_filter_record          = settings->bools.video_post_filter_record;
@@ -3334,8 +3796,17 @@ void video_driver_build_info(video_frame_info_t *video_info)
 
    video_info->width                       = video_st->width;
    video_info->height                      = video_st->height;
-   video_info->scale_width                 = video_st->scale_width;
-   video_info->scale_height                = video_st->scale_height;
+#ifdef HAVE_THREADS
+   if (  VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
+       && (video_st->flags & VIDEO_FLAG_THREAD_WRAPPER_ACTIVE))
+      video_thread_get_scale(video_st,
+            &video_info->scale_width, &video_info->scale_height);
+   else
+#endif
+   {
+      video_info->scale_width              = video_st->scale_width;
+      video_info->scale_height             = video_st->scale_height;
+   }
 
    video_info->shader_active               = !(menu_shdr_flags & SHDR_FLAG_DISABLED) ? true : false;
    video_info->hdr_mode                    = settings->uints.video_hdr_mode;
@@ -3348,35 +3819,41 @@ void video_driver_build_info(video_frame_info_t *video_info)
 
 #ifdef HAVE_MENU
    video_info->menu_st_flags               = menu_st->flags;
-   video_info->menu_footer_opacity         = settings->floats.menu_footer_opacity;
-   video_info->menu_header_opacity         = settings->floats.menu_header_opacity;
-   video_info->materialui_color_theme      = settings->uints.menu_materialui_color_theme;
-   video_info->ozone_color_theme           = settings->uints.menu_ozone_color_theme;
-   video_info->menu_shader_pipeline        = settings->uints.menu_xmb_shader_pipeline;
-   video_info->xmb_theme                   = settings->uints.menu_xmb_theme;
-   video_info->xmb_color_theme             = settings->uints.menu_xmb_color_theme;
-   video_info->timedate_enable             = settings->bools.menu_timedate_enable;
-   video_info->battery_level_enable        = settings->bools.menu_battery_level_enable;
-   video_info->xmb_shadows_enable          = settings->bools.menu_xmb_shadows_enable;
-   video_info->xmb_alpha_factor            = settings->uints.menu_xmb_alpha_factor;
-   video_info->menu_wallpaper_opacity      = settings->floats.menu_wallpaper_opacity;
-   video_info->menu_framebuffer_opacity    = settings->floats.menu_framebuffer_opacity;
    video_info->overlay_behind_menu         = settings->bools.input_overlay_behind_menu;
    video_info->libretro_running            = (runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED) ? true : false;
-#else
+   if (menu_st->flags & MENU_ST_FLAG_ALIVE)
+   {
+      /* Menu theming: the only readers are the menu drivers' frame()
+       * callbacks, which menu_driver_frame() invokes solely under this
+       * same flag -- so with the menu closed these copies were seven
+       * scattered settings cachelines loaded per frame for values
+       * nothing would look at.  Zeroed below when the menu is closed
+       * so the struct stays deterministic. */
+      video_info->materialui_color_theme   = settings->uints.menu_materialui_color_theme;
+      video_info->menu_shader_pipeline     = settings->uints.menu_xmb_shader_pipeline;
+      video_info->xmb_color_theme          = settings->uints.menu_xmb_color_theme;
+      video_info->timedate_enable          = settings->bools.menu_timedate_enable;
+      video_info->battery_level_enable     = settings->bools.menu_battery_level_enable;
+      video_info->xmb_shadows_enable       = settings->bools.menu_xmb_shadows_enable;
+      video_info->xmb_alpha_factor         = settings->uints.menu_xmb_alpha_factor;
+      video_info->menu_wallpaper_opacity   = settings->floats.menu_wallpaper_opacity;
+      video_info->menu_framebuffer_opacity = settings->floats.menu_framebuffer_opacity;
+   }
+   else
+#endif
+   {
+      video_info->materialui_color_theme   = 0;
+      video_info->menu_shader_pipeline     = 0;
+      video_info->xmb_color_theme          = 0;
+      video_info->timedate_enable          = false;
+      video_info->battery_level_enable     = false;
+      video_info->xmb_shadows_enable       = false;
+      video_info->xmb_alpha_factor         = 0.0f;
+      video_info->menu_framebuffer_opacity = 0.0f;
+      video_info->menu_wallpaper_opacity   = 0.0f;
+   }
+#ifndef HAVE_MENU
    video_info->menu_st_flags               = 0;
-   video_info->menu_footer_opacity         = 0.0f;
-   video_info->menu_header_opacity         = 0.0f;
-   video_info->materialui_color_theme      = 0;
-   video_info->menu_shader_pipeline        = 0;
-   video_info->xmb_color_theme             = 0;
-   video_info->xmb_theme                   = 0;
-   video_info->timedate_enable             = false;
-   video_info->battery_level_enable        = false;
-   video_info->xmb_shadows_enable          = false;
-   video_info->xmb_alpha_factor            = 0.0f;
-   video_info->menu_framebuffer_opacity    = 0.0f;
-   video_info->menu_wallpaper_opacity      = 0.0f;
    video_info->overlay_behind_menu         = false;
 #endif
 
@@ -3558,7 +4035,7 @@ bool video_context_driver_get_flags(gfx_ctx_flags_t *flags)
          if (video_st->flags & VIDEO_FLAG_DEFERRED_VIDEO_CTX_DRIVER_SET_FLAGS)
          {
             flags->flags     = video_st->deferred_flag_data.flags;
-            video_st->flags &= ~VIDEO_FLAG_DEFERRED_VIDEO_CTX_DRIVER_SET_FLAGS;
+            video_driver_modify_disp_flags(0, VIDEO_FLAG_DEFERRED_VIDEO_CTX_DRIVER_SET_FLAGS);
          }
          else
             flags->flags     = ctx->get_flags(ctx_data);
@@ -3590,6 +4067,71 @@ bool video_context_driver_get_flags(gfx_ctx_flags_t *flags)
  * Poll both the video and context driver's flags and test
  * whether @testflag is set or not.
  **/
+/* Can the named video driver present a 10-bit source surface?
+ *
+ * This exists because the flag-based test cannot answer the question
+ * before drivers_init(): SET_PIXEL_FORMAT is issued from retro_load_game,
+ * i.e. during CMD_EVENT_CORE_INIT, which on a cold start (RetroArch
+ * launched straight into content) runs *before* any video driver or
+ * context driver exists. video_context_driver_get_flags() then reports
+ * nothing at all and every 10-bit request is refused, on all drivers,
+ * purely because of when the core happens to ask. Loading the same
+ * content from a running menu works, which made this look driver- or
+ * core-specific when it is neither.
+ *
+ * The list mirrors the drivers that set GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE
+ * from a live instance; it is only consulted when no instance exists. */
+static bool video_driver_ident_supports_10bit_source(const char *ident)
+{
+   if (string_is_empty(ident))
+      return false;
+   if (     string_is_equal(ident, "vulkan")
+         || string_is_equal(ident, "d3d11")
+         || string_is_equal(ident, "d3d12")
+         || string_is_equal(ident, "glcore"))
+      return true;
+#if !defined(HAVE_OPENGLES) && !defined(HAVE_PSGL)
+   /* gl2's 10-bit path is desktop-only (RGB10_A2 + packed 2-10-10-10
+    * upload are not in GLES2), so the ident only counts in builds
+    * where that path exists. */
+   if (string_is_equal(ident, "gl"))
+      return true;
+#endif
+   /* gl1 is unconditional: its PQ handling degrades through a pure-CPU
+    * tonemap that has no GL requirements at all, so acceptance is safe
+    * even on the GL 1.1 software rasterizers that driver exists for. */
+   if (string_is_equal(ident, "gl1"))
+      return true;
+   return false;
+}
+
+/* Whether a 10-bit source surface can be presented, judged by the
+ * *configured* driver alone - live instance state is deliberately never
+ * consulted.
+ *
+ * SET_PIXEL_FORMAT always precedes the (re)creation of the video driver
+ * for the session being started: on a cold start no instance exists,
+ * and on an in-process core switch the instance that exists belongs to
+ * the outgoing session and is mid-teardown - its flags describe the
+ * wrong session at best and a freed instance at worst (the reported
+ * failure: a stale poke->get_flags answering after video_driver_free).
+ * The question being asked is about the *next* session, and the only
+ * stable answer to that is the configured driver ident.
+ *
+ * This is deliberately optimistic where the capability is conditional:
+ * glcore can only present 10-bit on a context with an scRGB backbuffer,
+ * unknowable until that context exists. The two errors are not
+ * symmetric - accepting and discovering otherwise is recoverable (the
+ * driver tonemaps PQ for its actual output), refusing is final because
+ * the core has committed to an SDR format before anything better is
+ * known. */
+bool video_driver_supports_10bit_source(void)
+{
+   settings_t *settings = config_get_ptr();
+   return settings && video_driver_ident_supports_10bit_source(
+         settings->arrays.video_driver);
+}
+
 bool video_driver_test_all_flags(enum display_flags testflag)
 {
    gfx_ctx_flags_t flags;
@@ -3613,7 +4155,7 @@ bool video_context_driver_set_flags(gfx_ctx_flags_t *flags)
    if (!ctx->set_flags)
    {
       video_st->deferred_flag_data.flags  = flags->flags;
-      video_st->flags |= VIDEO_FLAG_DEFERRED_VIDEO_CTX_DRIVER_SET_FLAGS;
+      video_driver_modify_disp_flags(VIDEO_FLAG_DEFERRED_VIDEO_CTX_DRIVER_SET_FLAGS, 0);
       return false;
    }
 
@@ -3739,6 +4281,14 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
       video_driver_init_filter(video_driver_pix_fmt, settings);
 #endif
 
+#ifdef HAVE_THREADS
+   /* Lazily allocate the cached-frame lifetime lock on first video
+    * driver init.  Kept across video driver reinits (HDR toggle,
+    * fullscreen change) -- only freed at deinit_drivers / shutdown. */
+   if (!cached_frame_lock)
+      cached_frame_lock = slock_new();
+#endif
+
    max_dim   = MAX(geom->max_width, geom->max_height);
    scale     = next_pow2(max_dim) / RARCH_SCALE_BASE;
    scale     = MAX(scale, 1);
@@ -3805,7 +4355,8 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
 #endif
       {
 #if (defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) ||  \
-    (defined(HAVE_COCOA_METAL) && !defined(HAVE_COCOATOUCH))
+    (defined(HAVE_COCOA_METAL) && !defined(HAVE_COCOATOUCH)) ||     \
+    defined(HAVE_SDL3)
          bool window_custom_size_enable = settings->bools.video_window_save_positions;
 #else
          bool window_custom_size_enable = settings->bools.video_window_custom_size_enable;
@@ -3959,20 +4510,41 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
    video.font_enable                 = settings->bools.video_font_enable;
    video.font_size                   = settings->floats.video_font_size;
    video.path_font                   = settings->paths.path_font;
+   /* Both XRGB8888 and XRGB2101010 sources are 32-bit; the latter is
+    * down-converted to XRGB8888 before the driver sees it (until a driver
+    * gains native 10-bit support), so from the driver's perspective it is a
+    * 32-bit frame either way. */
 #ifdef HAVE_VIDEO_FILTER
    video.rgb32                       = video_st->state_filter
          ? (video_st->flags & VIDEO_FLAG_STATE_OUT_RGB32)
-         : (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888);
+         : (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB2101010
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_HDR10_2101010);
 #else
    video.rgb32                       =
-         (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888);
+         (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB2101010
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_HDR10_2101010);
 #endif
+   /* A native 10-bit source is only presented to drivers that advertise
+    * support; otherwise it has already been down-converted to XRGB8888 in
+    * video_driver_frame and must not be flagged as 10-bit here. */
+   /* Both 10-bit formats share the packed 2-10-10-10 upload; they differ
+    * only in how the samples are interpreted downstream.  HDR10 is refused
+    * outright unless the driver can present it (see SET_PIXEL_FORMAT), so it
+    * needs no capability test here. */
+   video.source_10bit                =
+         (   (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB2101010)
+          && video_driver_test_all_flags(GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE))
+         || (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_HDR10_2101010);
+   video.source_hdr10                =
+         (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_HDR10_2101010);
    video.parent                      = 0;
 
    if (video.fullscreen)
-      video_st->flags |=  VIDEO_FLAG_STARTED_FULLSCREEN;
+      video_driver_modify_disp_flags(VIDEO_FLAG_STARTED_FULLSCREEN, 0);
    else
-      video_st->flags &= ~VIDEO_FLAG_STARTED_FULLSCREEN;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_STARTED_FULLSCREEN);
 
    /* Reset video frame count */
    video_st->frame_count             = 0;
@@ -4017,6 +4589,21 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
       RARCH_ERR("[Video] Cannot open video driver. Exiting...\n");
       return false;
    }
+
+   /* Create the OSD font for drivers that have handed the lifecycle
+    * up. Threaded video is excluded: the wrapper creates it from
+    * CMD_INIT on the video thread, where the graphics context lives.
+    *
+    * Pairing creation and destruction here rather than inside each
+    * driver is what makes the font's lifetime match the driver
+    * instance. When a driver owns it, a teardown path that does not
+    * reach the driver's free() leaves the font alive across the
+    * reinit, holding GPU handles from a device that is gone -
+    * font_driver_init_osd() then no-ops because the pointer is still
+    * set, and the stale object keeps drawing. */
+   if (video_st->current_video->font_backend)
+      font_driver_init_osd(video_st->data, &video,
+            video.is_threaded, video_st->current_video->font_backend);
 
    video_st->poke = NULL;
    if (video_st->current_video->poke_interface)
@@ -4078,12 +4665,7 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
 #endif
 
    if (!(runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED))
-   {
-      video_st->frame_cache_data    = &dummy_pixels;
-      video_st->frame_cache_width   = 4;
-      video_st->frame_cache_height  = 4;
-      video_st->frame_cache_pitch   = 8;
-   }
+      video_driver_cached_frame_publish(&dummy_pixels, 4, 4, 8);
 
 #if defined(PSP)
    if (     video_st->poke
@@ -4127,10 +4709,62 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
    return true;
 }
 
+/* Down-convert an XRGB2101010 source frame to XRGB8888 in place of a scratch
+ * buffer, used when the active video driver cannot present a native 10-bit
+ * source surface. Each channel is narrowed 10 -> 8 bits by taking the high 8
+ * bits (>> 2), which matches the truncation a core would otherwise apply
+ * itself. Returns the scratch buffer and its tight stride, or NULL on
+ * allocation failure (in which case the caller leaves the frame untouched).
+ * The packed layout is bits [29:20]=R, [19:10]=G, [9:0]=B, 2 ignored high
+ * bits; output is 0xFFRRGGBB (XRGB8888, native endian). */
+VIDEO_NOINLINE static const void *video_driver_convert_xrgb2101010(
+      video_driver_state_t *video_st,
+      const void *data, unsigned width, unsigned height,
+      size_t in_pitch, size_t *out_pitch)
+{
+   unsigned x, y;
+   const uint8_t *src_row = (const uint8_t*)data;
+   uint32_t      *dst;
+   size_t         needed  = (size_t)width * height;
+
+   if (video_st->pix10_convert_cap < needed)
+   {
+      uint32_t *buf = (uint32_t*)realloc(video_st->pix10_convert_buf,
+            needed * sizeof(uint32_t));
+      if (!buf)
+         return NULL;
+      video_st->pix10_convert_buf = buf;
+      video_st->pix10_convert_cap = needed;
+   }
+
+   dst = video_st->pix10_convert_buf;
+   for (y = 0; y < height; y++)
+   {
+      const uint32_t *src = (const uint32_t*)src_row;
+      for (x = 0; x < width; x++)
+      {
+         uint32_t p = src[x];
+         uint32_t r = (p >> 20) & 0x3ff;
+         uint32_t g = (p >> 10) & 0x3ff;
+         uint32_t b =  p        & 0x3ff;
+         dst[x]     = 0xff000000u
+                    | ((r >> 2) << 16)
+                    | ((g >> 2) <<  8)
+                    |  (b >> 2);
+      }
+      dst     += width;
+      src_row += in_pitch;
+   }
+
+   *out_pitch = (size_t)width * sizeof(uint32_t);
+   return video_st->pix10_convert_buf;
+}
+
 void video_driver_frame(const void *data, unsigned width,
       unsigned height, size_t pitch)
 {
-   char status_text[128];
+   char status_text[256];
+   settings_t *settings = config_get_ptr();
    static char video_driver_msg[256];
    static retro_time_t last_time;
    static retro_time_t curr_time;
@@ -4175,11 +4809,14 @@ void video_driver_frame(const void *data, unsigned width,
          || runloop_st->core_run_time > runloop_st->core_runtime_last)
       runloop_st->core_run_time     = 0;
 
-   if (data)
-      video_st->frame_cache_data = data;
-   video_st->frame_cache_width   = width;
-   video_st->frame_cache_height  = height;
-   video_st->frame_cache_pitch   = pitch;
+   /* Publish the new cached frame metadata atomically under the
+    * lifetime lock so concurrent off-thread readers (task workers
+    * for screenshots / translation) see a consistent (data,
+    * dims) tuple.  Same-thread cached_frame_replay callers
+    * (drivers' read_viewport setup, paused render) read without
+    * the lock -- they're on the runloop thread same as the
+    * producer here, so there's no race for them to lose. */
+   video_driver_cached_frame_publish(data, width, height, pitch);
 
    if (
             video_st->scaler_ptr
@@ -4194,6 +4831,27 @@ void video_driver_frame(const void *data, unsigned width,
             data, width, height, pitch);
       data                = video_st->scaler_ptr->scaler_out;
       pitch               = video_st->scaler_ptr->scaler->out_stride;
+   }
+
+   /* XRGB2101010 fallback: if the active video driver cannot present a native
+    * 10-bit source surface, transparently narrow to XRGB8888 before the driver
+    * sees the frame. A driver that advertises GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE
+    * takes the packed 10-bit frame directly and this branch is skipped. */
+   if (
+            (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB2101010)
+         && data
+         && (data != RETRO_HW_FRAME_BUFFER_VALID)
+         && !video_driver_test_all_flags(GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE)
+      )
+   {
+      size_t      conv_pitch = pitch;
+      const void *converted  = video_driver_convert_xrgb2101010(
+            video_st, data, width, height, pitch, &conv_pitch);
+      if (converted)
+      {
+         data  = converted;
+         pitch = conv_pitch;
+      }
    }
 
    video_driver_build_info(&video_info);
@@ -4283,15 +4941,89 @@ void video_driver_frame(const void *data, unsigned width,
    {
       unsigned fps_update_interval              = video_info.fps_update_interval;
       unsigned memory_update_interval           = video_info.memory_update_interval;
-      /* Set this to 1 to avoid an offset issue */
-      unsigned write_index                      = video_st->frame_time_count++
-                                               & (MEASURE_FRAME_TIME_SAMPLES_COUNT - 1);
       frame_time                                = new_time - fps_time;
-      /* Don't let fast-forward frame times and startup hiccups to skew the stats */
-      video_st->frame_time_samples[write_index] = (  video_info.input_driver_nonblock_state
-                                                  || video_st->frame_count < 8)
-                                                   ? video_info.frame_time_target : frame_time;
       fps_time                                  = new_time;
+
+      /* Frame-time sampling.  Two modes:
+       *
+       *   1. Legacy (default; video_frame_time_sample_gated == false):
+       *      sample every frame, substituting frame_time_target for
+       *      fast-forward and startup frames.  This is the historical
+       *      behaviour the reset toggles (Reset After Save State / Load
+       *      State / Fast-Forward) were designed around -- the buffer
+       *      accumulates contamination from menu sleep, blocking I/O,
+       *      pause transitions, etc., and the toggles offer one-shot
+       *      drains for known contaminators.
+       *
+       *   2. Gated (opt-in; video_frame_time_sample_gated == true):
+       *      skip the write entirely when we're not in a steady-state
+       *      that the buffer is supposed to be measuring.  The ring
+       *      retains its last N clean samples; samples taken during
+       *      menu, pause, fast-forward, or with frame_time outside a
+       *      sanity envelope are not written and frame_time_count is
+       *      not advanced.  The reset toggles become redundant under
+       *      this mode since contamination never enters the buffer.
+       *
+       * Both modes still record the dropped-frame counter below
+       * (separate from the rate-estimation buffer).
+       */
+      if (settings->bools.video_frame_time_sample_gated)
+      {
+         /* The clean-sample predicate.  Inline rather than factored
+          * out so all conditions are visible in one place. */
+         bool sample_clean    = true;
+         retro_time_t expected_us = (retro_time_t)video_info.frame_time_target;
+
+         /* Startup warmup (same threshold the legacy path uses for
+          * its substitution; here we just skip instead of substituting). */
+         if (video_st->frame_count < 8)
+            sample_clean      = false;
+         /* Fast-forward / rewind: deltas are tiny and meaningless
+          * for refresh estimation. */
+         else if (video_info.input_driver_nonblock_state)
+            sample_clean      = false;
+         /* Paused: no new core advancement, only menu/cached_frame
+          * replays. */
+         else if (runloop_st->flags & RUNLOOP_FLAG_PAUSED)
+            sample_clean      = false;
+         /* Menu with libretro paused: only menu replays are firing,
+          * pace reflects menu throttle (sleep / vsync), not core.
+          * Menu with content actively running behind it (overlay-
+          * menu, menu_pause_libretro == false) is still a valid
+          * sample of core cadence and is allowed through. */
+         else if (    menu_is_alive
+                  &&  settings->bools.menu_pause_libretro)
+            sample_clean      = false;
+         /* Sanity envelope on the delta itself: reject anything
+          * obviously outside steady-state.  Catches blocking I/O
+          * gaps (save/load state, content boot, shader compile)
+          * that don't have a per-frame flag we can check. */
+         else if (expected_us > 0
+                  && (   frame_time > expected_us * 2
+                      || frame_time < expected_us / 2))
+            sample_clean      = false;
+
+         if (sample_clean)
+         {
+            unsigned write_index                      = video_st->frame_time_count++
+                                                     & (MEASURE_FRAME_TIME_SAMPLES_COUNT - 1);
+            video_st->frame_time_samples[write_index] = frame_time;
+         }
+         /* else: skip the write, don't advance count.  Ring keeps
+          * its last N clean samples; statistics computed over them
+          * remain meaningful even though the loop has been doing
+          * other things since. */
+      }
+      else
+      {
+         /* Legacy path -- unchanged from pre-gating behaviour. */
+         unsigned write_index                      = video_st->frame_time_count++
+                                                  & (MEASURE_FRAME_TIME_SAMPLES_COUNT - 1);
+         /* Don't let fast-forward frame times and startup hiccups to skew the stats */
+         video_st->frame_time_samples[write_index] = (  video_info.input_driver_nonblock_state
+                                                     || video_st->frame_count < 8)
+                                                      ? video_info.frame_time_target : frame_time;
+      }
 
       /* Try to count dropped frames */
       if (     video_st->frame_count > 8
@@ -4346,8 +5078,8 @@ void video_driver_frame(const void *data, unsigned width,
 
          if ((video_st->frame_count % memory_update_interval) == 0)
          {
-            last_total_memory = frontend_driver_get_total_memory();
-            last_used_memory  = last_total_memory - frontend_driver_get_free_memory();
+            last_total_memory = mem_stats_total();
+            last_used_memory  = last_total_memory - mem_stats_free();
          }
 
          if (_len > 0)
@@ -4399,7 +5131,7 @@ void video_driver_frame(const void *data, unsigned width,
 
          curr_time                  = new_time;
          video_st->window_title_len = __len;
-         video_st->flags           |= VIDEO_FLAG_WINDOW_TITLE_UPDATE;
+         video_driver_modify_disp_flags(VIDEO_FLAG_WINDOW_TITLE_UPDATE, 0);
       }
    }
    else
@@ -4411,12 +5143,9 @@ void video_driver_frame(const void *data, unsigned width,
             video_st->title_buf,
             sizeof(video_st->window_title));
 
-      if (video_info.fps_show)
-         _len = strlcpy(status_text,
-               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE),
-               sizeof(status_text));
+      status_text[0] = '\0';
 
-      video_st->flags |= VIDEO_FLAG_WINDOW_TITLE_UPDATE;
+      video_driver_modify_disp_flags(VIDEO_FLAG_WINDOW_TITLE_UPDATE, 0);
    }
 
    /* Add core status message to status text */
@@ -4454,18 +5183,72 @@ void video_driver_frame(const void *data, unsigned width,
             status_text[++_len] = '|';
             status_text[++_len] = ' ';
             status_text[++_len] = '\0';
-            strlcpy(
+            _len               += strlcpy(
                   status_text         + _len,
                   runloop_st->core_status_msg.str,
                   sizeof(status_text) - _len);
          }
          else
-            strlcpy(status_text,
+            _len = strlcpy(status_text,
                   runloop_st->core_status_msg.str,
                   sizeof(status_text));
       }
 
       RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st);
+   }
+
+   if (video_info.time_show)
+   {
+      static char time_text[64];
+      static retro_time_t next_time_update;
+      static unsigned time_show_last_format;
+      time_t time_;
+
+      if (_len > 0)
+      {
+         status_text[  _len] = ' ';
+         status_text[++_len] = '|';
+         status_text[++_len] = '|';
+         status_text[++_len] = ' ';
+         status_text[++_len] = '\0';
+      }
+
+      if (   !next_time_update
+          || (new_time >= next_time_update)
+          || video_info.time_show != time_show_last_format)
+      {
+         struct tm tm_;
+         retro_time_t time_update_interval = 0;
+
+         time(&time_);
+
+         time_show_last_format = video_info.time_show;
+         rtime_localtime(&time_, &tm_);
+
+         switch (video_info.time_show)
+         {
+            case TIME_SHOW_HM:
+               strftime(time_text, sizeof(time_text), "%H:%M", &tm_);
+               time_update_interval = (60 - tm_.tm_sec) * 1000000;
+               break;
+            case TIME_SHOW_HMS:
+               strftime(time_text, sizeof(time_text), "%H:%M:%S", &tm_);
+               time_update_interval = 500000;
+               break;
+            case TIME_SHOW_HM_AMPM:
+               strftime_am_pm(time_text, sizeof(time_text), "%I:%M %p", &tm_);
+               time_update_interval = (60 - tm_.tm_sec) * 1000000;
+               break;
+            case TIME_SHOW_HMS_AMPM:
+               strftime_am_pm(time_text, sizeof(time_text), "%I:%M:%S %p", &tm_);
+               time_update_interval = 500000;
+               break;
+         }
+
+         next_time_update = new_time + time_update_interval;
+      }
+
+      _len += strlcpy(status_text + _len, time_text, sizeof(status_text) - _len);
    }
 
    /* Slightly messy code,
@@ -4489,7 +5272,7 @@ void video_driver_frame(const void *data, unsigned width,
             pitch, runloop_idle);
 
 #ifdef HAVE_VIDEO_FILTER
-   if (render_frame && data && video_st->state_filter)
+   if (settings->bools.video_filter_enable && render_frame && data && video_st->state_filter)
    {
       unsigned output_width                             = 0;
       unsigned output_height                            = 0;
@@ -4577,28 +5360,21 @@ void video_driver_frame(const void *data, unsigned width,
 
    if (render_frame && video_info.statistics_show)
    {
+      struct retro_system_av_info *av_info   = &video_st->av_info;
+      audio_driver_state_t *audio_st         = audio_state_get_ptr();
       audio_statistics_t audio_stats;
       double stddev                          = 0.0;
-      float font_size_scale                  = (float)video_info.font_size / 100;
-      float scale                            = ((float)video_info.height / 480)
-            * 0.50f * (DEFAULT_FONT_SIZE / video_info.font_size);
-      struct retro_system_av_info *av_info   = &video_st->av_info;
-      unsigned red                           = 235;
-      unsigned green                         = 235;
-      unsigned blue                          = 235;
-      unsigned alpha                         = 255;
-      /* Clamp scale */
-      if (scale < font_size_scale)
-         scale                               = font_size_scale;
-      if (scale > 1.00f)
-         scale                               =  1.00f;
+      float font_size_ratio                  = (float)(DEFAULT_FONT_SIZE / video_info.font_size);
+      float scale                            = (float)video_info.height / (video_info.font_size * 30)
+            * 0.50f * font_size_ratio;
 
-      if (scale > font_size_scale)
-      {
-         scale *= 100;
-         scale  = ceil(scale);
-         scale /= 100;
-      }
+      /* Divide scale evenly to maintain size and readability in small screens */
+      if (font_size_ratio && scale < 0.20f)
+         scale                               = 0.25f;
+      else if (scale < 0.55f)
+         scale                               = 0.50f;
+      else
+         scale                               = 1.00f;
 
       audio_stats.samples                    = 0;
       audio_stats.average_buffer_saturation  = 0.0f;
@@ -4606,52 +5382,47 @@ void video_driver_frame(const void *data, unsigned width,
       audio_stats.close_to_underrun          = 0.0f;
       audio_stats.close_to_blocking          = 0.0f;
 
+      audio_compute_buffer_statistics(&audio_stats);
       video_monitor_fps_statistics(NULL, &stddev, NULL);
 
-      video_info.osd_stat_params.x           = 0.008f;
-      video_info.osd_stat_params.y           = 0.960f;
+      video_info.osd_stat_params.x           = 0.001f;
+      video_info.osd_stat_params.y           = 0.970f;
       video_info.osd_stat_params.text_align  = TEXT_ALIGN_LEFT;
       video_info.osd_stat_params.scale       = scale;
       video_info.osd_stat_params.full_screen = true;
-      video_info.osd_stat_params.drop_x      = (video_info.font_size / DEFAULT_FONT_SIZE) * 3;
-      video_info.osd_stat_params.drop_y      = (video_info.font_size / DEFAULT_FONT_SIZE) * -3;
-      video_info.osd_stat_params.drop_mod    = 0.1f;
-      video_info.osd_stat_params.drop_alpha  = 0.9f;
-      video_info.osd_stat_params.color       = COLOR_ABGR(
-            alpha, blue, green, red);
-
-      audio_compute_buffer_statistics(&audio_stats);
+      video_info.osd_stat_params.drop_x      = 2;
+      video_info.osd_stat_params.drop_y      = -2;
+      video_info.osd_stat_params.drop_mod    = 0.0f;
+      video_info.osd_stat_params.drop_alpha  = 1.0f;
+      video_info.osd_stat_params.color       = COLOR_ABGR(255,
+            (int)(settings->floats.video_msg_color_b * 255.0f),
+            (int)(settings->floats.video_msg_color_g * 255.0f),
+            (int)(settings->floats.video_msg_color_r * 255.0f));
+      video_info.osd_stat_params.color_hp    = NULL;
 
       {
-         /* TODO/FIXME - localize */
-         size_t __len = snprintf(video_info.stat_text,
-                        sizeof(video_info.stat_text),
+         size_t __len = snprintf(video_info.stat_text, sizeof(video_info.stat_text),
                "CORE AV_INFO\n"
-               " Size:        %u x %u\n"
-               " - Base:      %u x %u\n"
-               " - Max:       %u x %u\n"
-               " Aspect:      %3.3f\n"
-               " FPS:         %3.2f\n"
-               " Sample Rate: %6.2f\n"
-               "VIDEO: %s\n"
-               " Viewport:    %u x %u\n"
-               " - Scale:     %u x %u\n"
-               " - Scale X/Y: %2.2f / %2.2f\n"
-               " Refresh:    %6.2f hz\n"
-               " Frame Rate:%7.2f fps\n"
-               " Frame Time: %6.2f ms\n"
-               " - Deviation:%6.2f %%\n"
-               " Frames:   %8" PRIu64"\n"
-               " - Dropped:   %5u\n"
-               "AUDIO: %s\n"
-               " Saturation: %6.2f %%\n"
-               " Deviation:  %6.2f %%\n"
-               " Underrun:   %6.2f %%\n"
-               " Blocking:   %6.2f %%\n"
-               " Samples:  %8d\n"
+               " Size:       %ux%u\n"
+               " -Base:      %ux%u\n"
+               " -Max:       %ux%u\n"
+               " Aspect:     %3.5f\n"
+               " FPS:        %3.4f\n"
+               " SampleRate: %.0f\n"
+               " -Format:    %s\n"
+               "VIDEO: %s %s\n"
+               " Viewport:   %ux%u\n"
+               " Scale:      %ux%u\n"
+               " Scale X/Y:  %2.2f/%2.2f\n"
+               " Refresh:  %7.2f hz\n"
+               " FrameRate:%7.2f fps\n"
+               " FrameTime:%7.2f ms\n"
+               " -Deviation:%6.2f %%\n"
+               " Frames:  %8" PRIu64"\n"
+               " -Dropped:  %6u\n"
                ,
-               video_st->frame_cache_width,
-               video_st->frame_cache_height,
+               frame_cache_width,
+               frame_cache_height,
                av_info->geometry.base_width,
                av_info->geometry.base_height,
                av_info->geometry.max_width,
@@ -4659,47 +5430,68 @@ void video_driver_frame(const void *data, unsigned width,
                av_info->geometry.aspect_ratio,
                av_info->timing.fps,
                av_info->timing.sample_rate,
+               (audio_st->stat_core_is_float) ? "FLOAT" : "INT16",
                vid->ident,
+               pixel_format_name(video_st->pix_fmt),
                video_info.width,
                video_info.height,
                video_info.scale_width,
                video_info.scale_height,
                (float)video_info.scale_width  / ((rotation % 2)
-                     ? (float)video_st->frame_cache_height : (float)video_st->frame_cache_width),
+                     ? (float)frame_cache_height : (float)frame_cache_width),
                (float)video_info.scale_height / ((rotation % 2)
-                     ? (float)video_st->frame_cache_width : (float)video_st->frame_cache_height),
+                     ? (float)frame_cache_width : (float)frame_cache_height),
                video_info.refresh_rate,
                last_fps,
                frame_time / 1000.0f,
                100.0f * stddev,
                video_st->frame_count,
-               video_st->frame_drop_count,
-               audio_state_get_ptr()->current_audio->ident,
-               audio_stats.average_buffer_saturation,
-               audio_stats.std_deviation_percentage,
-               audio_stats.close_to_underrun,
-               audio_stats.close_to_blocking,
-               audio_stats.samples);
+               video_st->frame_drop_count);
 
-         /* TODO/FIXME - localize */
+         /* Split from the block above: a single concatenated format
+          * literal exceeded the 509-byte minimum ISO C90 guarantees
+          * (-Werror=overlength-strings in the C89 lane). */
+         __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
+               "AUDIO: %s %s\n"
+               " SampleRate: %u %s\n"
+               ,
+               audio_st->current_audio->ident,
+               (audio_st->stat_frontend_is_float) ? "FLOAT" : "INT16",
+               settings->uints.audio_output_sample_rate,
+               (audio_st->src_ratio_orig == 1.0) ? "" : "R");
+
+         if (audio_st->rate_control_delta)
+            __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
+                  " Saturation:%6.2f %%\n"
+                  " Deviation: %6.2f %%\n"
+                  " Underrun:  %6.2f %%\n"
+                  " Blocking:  %6.2f %%\n"
+                  " Samples: %8d\n"
+                  ,
+                  audio_stats.average_buffer_saturation,
+                  audio_stats.std_deviation_percentage,
+                  audio_stats.close_to_underrun,
+                  audio_stats.close_to_blocking,
+                  audio_stats.samples);
+
          __len += strlcpy(video_info.stat_text + __len, "LATENCY\n",
                sizeof(video_info.stat_text) - __len);
 
          __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-               " Core:        %5.2f ms\n",
+               " Core:       %5.2f ms\n",
                runloop_st->core_run_time / 1000.0f);
 
          if (video_info.scanline_sync)
             __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-                  " Scanline:    %5d\n",
+                  " Scanline:   %5d\n",
                   video_st->scanline[SCANLINE_NEXT]);
 
          if (video_st->frame_delay_target > 0)
             __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-                  " Frame Delay: %2u.00 ms\n"
-                  " - Target:    %2u.00 ms\n"
-                  " - Idle:      %5.2f ms\n"
-                  " - Reserve:   %5.2f ms\n",
+                  " Frame Delay:%2u.00 ms\n"
+                  " -Target:    %2u.00 ms\n"
+                  " -Idle:      %5.2f ms\n"
+                  " -Reserve:   %5.2f ms\n",
                   video_st->frame_delay_effective,
                   video_st->frame_delay_target,
                   (1000.0f / video_info.refresh_rate) - video_st->frame_delay_effective - (runloop_st->core_run_time / 1000.0f),
@@ -4707,19 +5499,20 @@ void video_driver_frame(const void *data, unsigned width,
 
          if (video_info.runahead && !video_info.runahead_second_instance)
             __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-                  " Run-Ahead:   %2u frames\n"
-                  " - Single Instance\n",
+                  " Run-Ahead: %u SinInst\n",
                   video_info.runahead_frames);
          else if (video_info.runahead && video_info.runahead_second_instance)
             __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-                  " Run-Ahead:   %2u frames\n"
-                  " - Second Instance\n",
+                  " Run-Ahead: %u SecInst\n",
                   video_info.runahead_frames);
          else if (video_info.preemptive_frames)
             __len += snprintf(video_info.stat_text + __len, sizeof(video_info.stat_text) - __len,
-                  " Run-Ahead:   %2u frames\n"
-                  " - Preemptive Frames\n",
+                  " Run-Ahead: %u Preempt\n",
                   video_info.runahead_frames);
+
+         /* Tracked length of stat_text; consumed by driver frame()
+          * callbacks instead of strlen on every frame. */
+         video_info.stat_text_len = __len;
       }
    }
 
@@ -4742,9 +5535,17 @@ void video_driver_frame(const void *data, unsigned width,
                ? ""
                : video_driver_msg,
                &video_info))
-         video_st->flags |=  VIDEO_FLAG_ACTIVE;
+         video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
       else
-         video_st->flags &= ~VIDEO_FLAG_ACTIVE;
+         video_driver_modify_disp_flags(0, VIDEO_FLAG_ACTIVE);
+
+      /* A frame has gone out, so fonts retired while it was being
+       * built are one frame closer to being safe to release. Inside
+       * this block rather than after it: render_frame is false when
+       * the frame limiter skips, and a counter aged by a frame that
+       * was never handed to the driver would release an atlas the
+       * GPU could still be reading. */
+      font_driver_free_pending(false);
    }
 
    video_st->frame_count++;
@@ -4754,25 +5555,45 @@ void video_driver_frame(const void *data, unsigned width,
           || video_info.framecount_show
           || video_info.memory_show
           || video_info.core_status_msg_show
+          || video_info.time_show
          )
 #if HAVE_MENU
        && !((video_info.menu_st_flags & MENU_ST_FLAG_SCREENSAVER_ACTIVE))
 #endif
        && !video_info.notifications_hidden
+       && *status_text
       )
    {
 #if defined(HAVE_GFX_WIDGETS)
       if (widgets_active)
-         strlcpy(
-               p_dispwidget->gfx_widgets_status_text,
-               status_text,
-               sizeof(p_dispwidget->gfx_widgets_status_text)
-               );
+      {
+         /* Cap to widget buffer.  _len is the source length; if it
+          * would overflow, fall back to a clamping strlcpy and use
+          * its return as the new length. */
+         if (_len < sizeof(p_dispwidget->gfx_widgets_status_text))
+         {
+            memcpy(p_dispwidget->gfx_widgets_status_text,
+                  status_text, _len + 1);
+            p_dispwidget->gfx_widgets_status_text_len = _len;
+         }
+         else
+         {
+            p_dispwidget->gfx_widgets_status_text_len = strlcpy(
+                  p_dispwidget->gfx_widgets_status_text,
+                  status_text,
+                  sizeof(p_dispwidget->gfx_widgets_status_text));
+            if (p_dispwidget->gfx_widgets_status_text_len
+                  >= sizeof(p_dispwidget->gfx_widgets_status_text))
+               p_dispwidget->gfx_widgets_status_text_len =
+                  sizeof(p_dispwidget->gfx_widgets_status_text) - 1;
+         }
+      }
       else
 #endif
       {
-         /* TODO/FIXME - get rid of strlen here */
-         runloop_msg_queue_push(status_text, strlen(status_text), 2, 1, true, NULL,
+         /* _len was tracked accurately through the status_text
+          * build above — no strlen needed. */
+         runloop_msg_queue_push(status_text, _len, 2, 1, true, NULL,
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
       }
    }
@@ -4784,7 +5605,7 @@ void video_driver_frame(const void *data, unsigned width,
       unsigned native_width     = width;
       bool dynamic_super_width  = false;
 
-      video_st->flags          |= VIDEO_FLAG_CRT_SWITCHING_ACTIVE;
+      video_driver_modify_disp_flags(VIDEO_FLAG_CRT_SWITCHING_ACTIVE, 0);
 
       switch (video_info.crt_switch_resolution_super)
       {
@@ -4818,7 +5639,7 @@ void video_driver_frame(const void *data, unsigned width,
    }
    else if (!video_info.crt_switch_resolution)
 #endif
-      video_st->flags          &= ~VIDEO_FLAG_CRT_SWITCHING_ACTIVE;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_CRT_SWITCHING_ACTIVE);
 
    if (video_info.scanline_sync && !video_info.input_driver_nonblock_state)
       video_driver_scanline_after_frame(video_st,
@@ -4853,12 +5674,12 @@ void video_driver_reinit(int flags)
          VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
 
    if (hwr->cache_context != false)
-      video_st->flags                     |=  VIDEO_FLAG_CACHE_CONTEXT;
+      video_driver_modify_disp_flags(VIDEO_FLAG_CACHE_CONTEXT, 0);
    else
-      video_st->flags                     &= ~VIDEO_FLAG_CACHE_CONTEXT;
-   video_st->flags                        &= ~VIDEO_FLAG_CACHE_CONTEXT_ACK;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_CACHE_CONTEXT);
+   video_driver_cache_context_ack_clear();
    video_driver_reinit_context(settings, flags);
-   video_st->flags                        &= ~VIDEO_FLAG_CACHE_CONTEXT;
+   video_driver_modify_disp_flags(0, VIDEO_FLAG_CACHE_CONTEXT);
 
    video_st->window_title_prev[0]          = '\0';
 }
@@ -5214,6 +6035,8 @@ void video_frame_delay(video_driver_state_t *video_st,
    float refresh_rate                  = settings->floats.video_refresh_rate;
    uint8_t video_frame_delay           = settings->uints.video_frame_delay;
    uint8_t video_frame_delay_effective = video_st->frame_delay_effective;
+   float video_frame_delay_ms          = 0.0f;
+   uint16_t video_frame_delay_remainder= 0;
    uint8_t video_swap_interval         = runloop_get_video_swap_interval(settings->uints.video_swap_interval);
    uint8_t video_bfi                   = settings->uints.video_black_frame_insertion;
    uint8_t shader_subframes            = settings->uints.video_shader_subframes;
@@ -5222,12 +6045,29 @@ void video_frame_delay(video_driver_state_t *video_st,
          || (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION)
          || state_manager_frame_is_reversed();
 
+   /* The delay target is derived from the frame time and is therefore
+    * rarely a whole number of milliseconds - 3/4 of a 60 Hz frame is
+    * 12.5 ms. The auto tuner below works in whole millisecond steps, so
+    * the target is still carried as milliseconds, but the sub-millisecond
+    * remainder is kept here and added back when actually sleeping instead
+    * of being truncated away. At 60 Hz that recovers up to 6% of a frame. */
+
    /* Treat values 20+ as frame time percentage */
    if (video_frame_delay >= 20)
-      video_frame_delay = 1 / refresh_rate * 1000 * (video_frame_delay / 100.0f);
+      video_frame_delay_ms = 1 / refresh_rate * 1000 * (video_frame_delay / 100.0f);
    /* Set 0 (Auto) delay target as 3/4 frame time */
    else if (video_frame_delay == 0 && settings->bools.video_frame_delay_auto)
-      video_frame_delay = 1 / refresh_rate * 1000 * 0.75f;
+      video_frame_delay_ms = 1 / refresh_rate * 1000 * 0.75f;
+
+   if (video_frame_delay_ms > 0.0f)
+   {
+      video_frame_delay           = (uint8_t)video_frame_delay_ms;
+      /* Keep the truncated fraction so it can be added back when
+       * sleeping. Derived from the same value that produced the integer
+       * target above, so the target itself is bit for bit unchanged. */
+      video_frame_delay_remainder = (uint16_t)
+            ((video_frame_delay_ms - (float)video_frame_delay) * 1000.0f);
+   }
 
    /* Black frame insertion + swap interval multiplier */
    refresh_rate = (refresh_rate / (video_bfi + 1.0f) / video_swap_interval / shader_subframes);
@@ -5322,12 +6162,22 @@ void video_frame_delay(video_driver_state_t *video_st,
 
    /* Never apply frame delay when slow/fastmotion is active */
    if (video_frame_delay_effective > 0 && !skip_delay)
-      retro_sleep(video_frame_delay_effective);
+   {
+      unsigned delay_us = (unsigned)video_frame_delay_effective * 1000;
+
+      /* Only add the sub-millisecond remainder while the delay is still
+       * at the target. If the auto tuner has reduced it, frames were
+       * being missed, and time must not be handed back. */
+      if (video_frame_delay_effective == video_st->frame_delay_target)
+         delay_us += video_frame_delay_remainder;
+
+      retro_sleep_us(delay_us);
+   }
 }
 
 void video_driver_scanline_init(void)
 {
-   video_driver_state_t *video_st = video_state_get_ptr();
+   video_driver_state_t *video_st     = video_state_get_ptr();
    video_st->scanline[SCANLINE_NEXT]  = 1;
    video_st->scanline[SCANLINE_HOLD]  = 1;
    video_st->scanline[SCANLINE_TOTAL] = 0;
@@ -5341,7 +6191,7 @@ static INLINE int16_t video_driver_scanline_get(void)
    return -1;
 }
 
-static INLINE void video_driver_scanline_before_frame(video_driver_state_t *video_st,
+VIDEO_NOINLINE static void video_driver_scanline_before_frame(video_driver_state_t *video_st,
       float refresh_rate,
       uint16_t frame_time_target,
       uint16_t core_run_time)
@@ -5364,41 +6214,49 @@ static INLINE void video_driver_scanline_before_frame(video_driver_state_t *vide
    }
    else if (video_st->frame_count > refresh_rate)
    {
-      /* Disable if the core frame takes too long or has too much deviation */
-      double stddev = 0.0;
-      video_monitor_fps_statistics(NULL, &stddev, NULL);
+      /* Disable if the core and/or frame takes too long */
+      uint16_t frame_time_index = video_st->frame_time_count & (MEASURE_FRAME_TIME_SAMPLES_COUNT - 1);
+      uint16_t sample_index     = (uint16_t)((frame_time_index - 1) & (MEASURE_FRAME_TIME_SAMPLES_COUNT - 1));
+      retro_time_t frame_time   = video_st->frame_time_samples[sample_index];
+      bool frame_time_deviation = frame_time >= frame_time_target * 1.66f || frame_time <= frame_time_target * 0.33f;
 
-      if (stddev > 0.75f || core_run_time > frame_time_target)
+      if (scanline_hold && (frame_time_deviation || core_run_time >= frame_time_target - 3000))
       {
          scanline_next = 0;
          scanline_hold = refresh_rate / 2;
       }
+      else if (!scanline_hold && frame_time_deviation)
+         scanline_hold += 3;
    }
 
    /* Shift overflow */
-   if (scanline >= (int)video_height + scanline_next)
+   if (scanline > (int)video_height - (scanline_blank * 4))
       scanline -= video_height;
 
    /* Allow change */
    if (!scanline_hold)
    {
-      int16_t corelines = video_height * ((double)core_run_time / (double)frame_time_target);
+      int16_t corelines = (video_height + scanline_blank) * ((double)core_run_time / (double)frame_time_target);
 
       /* Fine-tuning */
       if (     scanline > -scanline_blank
-            && scanline < corelines)
+            && scanline < corelines + scanline_blank)
          scanline_next -= 2;
-      else if (scanline_next < scanline + corelines)
+      else if (scanline_next <= scanline + corelines + scanline_blank)
          scanline_next += 4;
 
-      /* Core time based minimum nudge */
-      while (  corelines > 0
-            && scanline_next >= -corelines
-            && core_run_time < frame_time_target / 4)
-      {
+      if (     scanline > 0
+            && scanline < video_height - scanline_blank
+            && scanline_next >= -(scanline + corelines + scanline_blank))
          scanline_next--;
-         corelines--;
-      }
+      else if (scanline > (video_height - scanline_blank) / 2
+            || scanline < -scanline_blank)
+         scanline_next++;
+
+      /* Cap to avoid visible tear in bottom */
+      if (     scanline_next > corelines
+            && scanline_next < video_height - corelines - scanline_blank)
+         scanline_next = video_height - corelines - scanline_blank;
 
       /* Skip unsynced */
       if (!scanline_next)
@@ -5407,16 +6265,16 @@ static INLINE void video_driver_scanline_before_frame(video_driver_state_t *vide
    else if (scanline_hold)
       scanline_hold--;
 
-   /* Resync on overflow */
+   /* Wrap overflow */
    if (     scanline_next >= (int)video_height
          || scanline_next <= (int)-video_height)
-      scanline_next = 1;
+      scanline_next = -1;
 
    video_st->scanline[SCANLINE_NEXT] = scanline_next;
    video_st->scanline[SCANLINE_HOLD] = scanline_hold;
 }
 
-static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video_st,
+VIDEO_NOINLINE static void video_driver_scanline_after_frame(video_driver_state_t *video_st,
       float refresh_rate,
       uint16_t frame_time_target,
       uint16_t core_run_time)
@@ -5426,6 +6284,7 @@ static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video
    int16_t scanline_total  = video_st->scanline[SCANLINE_TOTAL];
    int16_t scanline_blank  = video_st->scanline[SCANLINE_TOTAL] - video_height;
    int16_t scanline_target = (scanline_next < 0) ? video_height + scanline_next : scanline_next;
+   int16_t scanline        = scanline_next;
    uint16_t min_run_time   = (scanline_blank > 0) ? (double)scanline_blank / (double)video_height * (double)frame_time_target : 1000;
    bool init               = (!scanline_total) ? true : false;
    bool wait               = true;
@@ -5436,7 +6295,7 @@ static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video
 
    /* Reset */
    if (scanline_next == 1)
-      scanline_target = video_height - 1;
+      scanline_target = video_height;
 
    /* Minimum usage is vblank */
    core_run_time = (core_run_time < min_run_time) ? min_run_time : core_run_time;
@@ -5445,7 +6304,7 @@ static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video
    if (wait && frame_time_target > core_run_time)
    {
       int8_t sleep = (frame_time_target - core_run_time) / 1000;
-      if (sleep > 0)
+      if (sleep > 1)
       {
          /* Sleeping too much causes problems */
          sleep -= 4;
@@ -5457,22 +6316,26 @@ static INLINE void video_driver_scanline_after_frame(video_driver_state_t *video
 
    while (wait)
    {
-      int16_t scanline = video_driver_scanline_get();
+      scanline = video_driver_scanline_get();
 
       if (scanline >= scanline_target)
          wait = false;
 
       if (init)
       {
+         if (!scanline_total)
+            scanline_total = video_height;
+
          if (scanline)
             wait = true;
          else if (scanline_total > video_height)
             init = false;
-
-         if (scanline_total < scanline)
-            scanline_total = scanline + 1;
       }
+
+      if (scanline >= scanline_total)
+         scanline_total = scanline + 1;
    }
 
+   video_st->scanline[SCANLINE_NEXT]  = scanline;
    video_st->scanline[SCANLINE_TOTAL] = scanline_total;
 }

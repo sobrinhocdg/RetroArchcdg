@@ -713,6 +713,13 @@ static void gfx_display_d3d9_cg_draw(gfx_display_ctx_draw_t *draw,
                static float t = 0.0f;
                CGparameter param;
                t += 0.01f;
+               /* Wrap at 65536 to keep fp32 increments precise. 0.01 stays
+                * exactly representable up to t ~ 167772 (where 0.5*ulp first
+                * exceeds 0.01), so 65536 has wide margin and wraps roughly
+                * every 30 h of cumulative menu time, making the discontinuity
+                * effectively unobservable. */
+               if (t > 65536.0f)
+                  t -= 65536.0f;
 
                param = cgGetNamedParameter(
                      (CGprogram)_chain->pipeline_vprg[idx], "time");
@@ -1240,22 +1247,6 @@ static void gfx_display_d3d9_cg_scissor_end(void *data,
    IDirect3DDevice9_SetScissorRect(d3d9->dev, &rect);
 }
 
-gfx_display_ctx_driver_t gfx_display_ctx_d3d9_cg = {
-   gfx_display_d3d9_cg_draw,
-   gfx_display_d3d9_cg_draw_pipeline,
-   gfx_display_d3d9_cg_blend_begin,
-   gfx_display_d3d9_cg_blend_end,
-   NULL,                                     /* get_default_mvp        */
-   NULL,                                     /* get_default_vertices   */
-   NULL,                                     /* get_default_tex_coords */
-   FONT_DRIVER_RENDER_D3D9_CG_API,
-   GFX_VIDEO_DRIVER_DIRECT3D9_CG,
-   "d3d9_cg",
-   true,
-   gfx_display_d3d9_cg_scissor_begin,
-   gfx_display_d3d9_cg_scissor_end
-};
-
 /*
  * FONT DRIVER
  */
@@ -1286,7 +1277,7 @@ static void *d3d9_cg_font_init(void *data,
 
    if (!font_renderer_create_default(
             &font->font_driver, &font->font_data,
-            font_path, font_size))
+            font_path, font_size, FONT_ATLAS_FORMAT_A8))
    {
       free(font);
       return NULL;
@@ -1459,7 +1450,7 @@ static INLINE Vertex *d3d9_cg_font_get_scratch(
 
 static void d3d9_cg_font_render_msg(
       void *userdata, void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *params)
 {
    float x, y, scale, drop_mod, drop_alpha;
@@ -1556,9 +1547,12 @@ static void d3d9_cg_font_render_msg(
    /* Update atlas texture if dirty */
    if (font->atlas->dirty)
    {
+      bool respecified = false;
+
       if (   font->atlas->width  != font->tex_width
           || font->atlas->height != font->tex_height)
       {
+         respecified      = true;
          if (font->texture)
             IDirect3DTexture9_Release(font->texture);
 
@@ -1579,15 +1573,41 @@ static void d3d9_cg_font_render_msg(
       {
          unsigned i, j;
          D3DLOCKED_RECT lr;
+         RECT rect;
+         unsigned x0 = font->atlas->dirty_x0;
+         unsigned y0 = font->atlas->dirty_y0;
+         unsigned x1 = font->atlas->dirty_x1;
+         unsigned y1 = font->atlas->dirty_y1;
+
+         /* A recreated texture has no previous contents, so the whole
+          * atlas must be converted; otherwise only the dirty
+          * rectangle tracked by the font renderers needs it. Managed
+          * pool textures track locked sub-rects natively. */
+         if (     respecified
+               || x1 <= x0 || y1 <= y0
+               || x1 > (unsigned)font->atlas->width
+               || y1 > (unsigned)font->atlas->height)
+         {
+            x0 = 0;
+            y0 = 0;
+            x1 = font->atlas->width;
+            y1 = font->atlas->height;
+         }
+         rect.left   = (LONG)x0;
+         rect.top    = (LONG)y0;
+         rect.right  = (LONG)x1;
+         rect.bottom = (LONG)y1;
 
          if (SUCCEEDED(IDirect3DTexture9_LockRect(
-                     font->texture, 0, &lr, NULL, 0)))
+                     font->texture, 0, &lr, &rect, 0)))
          {
-            for (j = 0; j < font->atlas->height; j++)
+            /* lr.pBits addresses the top-left of the locked rect */
+            for (j = 0; j < y1 - y0; j++)
             {
                uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits + j * lr.Pitch);
-               const uint8_t  *src = font->atlas->buffer + j * font->atlas->width;
-               for (i = 0; i < font->atlas->width; i++)
+               const uint8_t  *src = font->atlas->buffer
+                     + (size_t)(y0 + j) * font->atlas->width + x0;
+               for (i = 0; i < x1 - x0; i++)
                   dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
             }
             IDirect3DTexture9_UnlockRect(font->texture, 0);
@@ -1897,18 +1917,6 @@ static bool d3d9_cg_font_get_line_metrics(
    return false;
 }
 
-font_renderer_t d3d9_cg_font = {
-   d3d9_cg_font_init,
-   d3d9_cg_font_free,
-   d3d9_cg_font_render_msg,
-   "d3d9_cg",
-   d3d9_cg_font_get_glyph,
-   NULL, /* bind_block */
-   NULL, /* flush */
-   d3d9_cg_font_get_message_width,
-   d3d9_cg_font_get_line_metrics
-};
-
 /*
  * VIDEO DRIVER
  */
@@ -2167,7 +2175,6 @@ static bool d3d9_cg_renderchain_init_shader_fvf(
    static const D3DVERTEXELEMENT9 decl_end     = D3DDECL_END();
    D3DVERTEXELEMENT9 decl[MAXD3DDECLLENGTH]    = {{0}};
    bool *indices                               = NULL;
-   CGprogram fprg                              = (CGprogram)pass->fprg;
    CGprogram vprg                              = (CGprogram)pass->vprg;
 
    if (cgD3D9GetVertexDeclaration(vprg, decl) == CG_FALSE)
@@ -2981,11 +2988,17 @@ static void d3d9_cg_renderchain_render_pass(
       output_size[0]       = vp_width;
       output_size[1]       = vp_height;
 
-      frame_cnt            = chain->frame_count;
-
       if (pass->info.pass->frame_count_mod)
          frame_cnt         = chain->frame_count
             % pass->info.pass->frame_count_mod;
+      else
+         /* SM2/SM3 has no uint registers, so frame_count is bound
+          * via a float uniform here. fp32 mantissa is 23 bits, so
+          * integers above 2^24 cannot be represented exactly. Mask
+          * to 24 bits when the shader pass has not declared its own
+          * modulo, to keep the implicit cast bit-exact in long
+          * sessions. */
+         frame_cnt         = chain->frame_count & 0xFFFFFFu;
 
       if (vp_video_size)
          cgD3D9SetUniform(vp_video_size, &video_size);
@@ -3315,7 +3328,6 @@ static void d3d9_cg_deinitialize(d3d9_video_t *d3d)
    if (!d3d)
       return;
 
-   font_driver_free_osd();
 
    d3d9_cg_deinit_chain(d3d);
    d3d9_vertex_buffer_free(d3d->menu_display.buffer,
@@ -3627,7 +3639,7 @@ static void d3d9_set_font_rect(
 }
 
 static void d3d9_cg_set_osd_msg(void *data,
-      const char *msg,
+      const char *msg, size_t msg_len,
       const struct font_params *params, void *font)
 {
    d3d9_video_t          *d3d = (d3d9_video_t*)data;
@@ -3635,7 +3647,7 @@ static void d3d9_cg_set_osd_msg(void *data,
 
    d3d9_set_font_rect(d3d, params);
    IDirect3DDevice9_BeginScene(dev);
-   font_driver_render_msg(d3d, msg, params, font);
+   font_driver_render_msg(d3d, msg, msg_len, params, font);
    IDirect3DDevice9_EndScene(dev);
 }
 
@@ -3703,7 +3715,6 @@ static void d3d9_cg_set_viewport(void *data,
 static bool d3d9_cg_initialize(d3d9_video_t *d3d, const video_info_t *info)
 {
    bool ret             = true;
-   settings_t *settings = config_get_ptr();
 
    if (!d3d->d3d9)
       ret = d3d9_cg_init_base(d3d, info);
@@ -3741,10 +3752,6 @@ static bool d3d9_cg_initialize(d3d9_video_t *d3d, const video_info_t *info)
    d3d9_cg_set_viewport(d3d,
       d3d->vp.full_width, d3d->vp.full_height, false, true);
 
-   font_driver_init_osd(d3d, info,
-         false,
-         info->is_threaded,
-         FONT_DRIVER_RENDER_D3D9_CG_API);
 
    {
       static const D3DVERTEXELEMENT9 VertexElements[4] = {
@@ -4544,7 +4551,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
       {
          IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
          IDirect3DDevice9_BeginScene(d3d->dev);
-         font_driver_render_msg(d3d, stat_text,
+         font_driver_render_msg(d3d, stat_text, video_info->stat_text_len,
                (const struct font_params*)osd_params, NULL);
          IDirect3DDevice9_EndScene(d3d->dev);
       }
@@ -4606,7 +4613,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    {
       IDirect3DDevice9_SetViewport(d3d->dev, (D3DVIEWPORT9*)&screen_vp);
       IDirect3DDevice9_BeginScene(d3d->dev);
-      font_driver_render_msg(d3d, msg, NULL, NULL);
+      font_driver_render_msg(d3d, msg, strlen(msg), NULL, NULL);
       IDirect3DDevice9_EndScene(d3d->dev);
    }
 
@@ -4797,7 +4804,9 @@ static const video_poke_interface_t d3d9_cg_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   d3d9_supports_texture_format,
+   d3d9_load_texture_compressed
 };
 
 static void d3d9_cg_get_poke_interface(void *data,
@@ -4980,6 +4989,18 @@ static bool d3d9_cg_has_windowed(void *data)
    return true;
 }
 
+static font_renderer_t d3d9_cg_font = {
+   d3d9_cg_font_init,
+   d3d9_cg_font_free,
+   d3d9_cg_font_render_msg,
+   "d3d9_cg",
+   d3d9_cg_font_get_glyph,
+   NULL, /* bind_block */
+   NULL, /* flush */
+   d3d9_cg_font_get_message_width,
+   d3d9_cg_font_get_line_metrics
+};
+
 video_driver_t video_d3d9_cg = {
    d3d9_cg_init,
    d3d9_cg_frame,
@@ -5004,6 +5025,25 @@ video_driver_t video_d3d9_cg = {
    NULL, /* shader_load_begin */
    NULL, /* shader_load_step */
 #ifdef HAVE_GFX_WIDGETS
-   d3d9_cg_gfx_widgets_enabled
+   d3d9_cg_gfx_widgets_enabled,
 #endif
+   NULL, /* invalidate_hw_render_cache */
+   NULL, /* read_viewport_hdr */
+   &d3d9_cg_font
+};
+
+gfx_display_ctx_driver_t gfx_display_ctx_d3d9_cg = {
+   gfx_display_d3d9_cg_draw,
+   gfx_display_d3d9_cg_draw_pipeline,
+   gfx_display_d3d9_cg_blend_begin,
+   gfx_display_d3d9_cg_blend_end,
+   NULL,                                     /* get_default_mvp        */
+   NULL,                                     /* get_default_vertices   */
+   NULL,                                     /* get_default_tex_coords */
+   &d3d9_cg_font,
+   GFX_VIDEO_DRIVER_DIRECT3D9_CG,
+   "d3d9_cg",
+   true,
+   gfx_display_d3d9_cg_scissor_begin,
+   gfx_display_d3d9_cg_scissor_end
 };

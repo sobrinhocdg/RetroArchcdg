@@ -148,13 +148,25 @@ bool getMountInfo(char *path, char *mountPoint, char *partition, char *newCWD)
       return false;
    }
 
-   sprintf(partition, "%s:%s",
-            str_list->elems[0].data, str_list->elems[1].data);
-   sprintf(mountPoint, "%s:",
-            str_list->elems[2].data);
-   sprintf(newCWD, "%s%s",
-            mountPoint,
-            str_list->size >= 4 ? str_list->elems[3].data : "");
+   /* Build partition string: "device:path" using strlcpy offsets */
+   size_t len = strlcpy(partition, str_list->elems[0].data, 50);
+   if (len < 50) {
+      len += strlcpy(partition + len, ":", 50 - len);
+      if (len < 50)
+         strlcpy(partition + len, str_list->elems[1].data, 50 - len);
+   }
+
+   /* Build mountPoint string: "mount:" using strlcpy offset */
+   len = strlcpy(mountPoint, str_list->elems[2].data, 10);
+   if (len < 10)
+      strlcpy(mountPoint + len, ":", 10 - len);
+
+   /* Build newCWD string using strlcpy offset */
+   len = strlcpy(newCWD, mountPoint, FILENAME_MAX);
+   if (len < FILENAME_MAX)
+      strlcpy(newCWD + len,
+            str_list->size >= 4 ? str_list->elems[3].data : "",
+            FILENAME_MAX - len);
 
    string_list_free(str_list);
    return true;
@@ -439,45 +451,6 @@ enum frontend_architecture frontend_ps2_get_arch(void)
    return FRONTEND_ARCH_MIPS;
 }
 
-static uint64_t frontend_ps2_get_total_mem(void) { return 32*1024*1024; }
-
-/* Crude try-and-fail approach, in lack of a better solution. */
-static uint64_t frontend_ps2_get_free_mem(void)
-{
-  uint64_t free_mem;
-  size_t s0 = 32*1024*1024;
-  void* p1;
-  void* p2;
-  void* p3;
-
-  while (s0 && (p1 = malloc(s0)) == NULL)
-    s0 >>= 1;
-
-  free_mem = s0;
-
-  s0 = 32*1024*1024;
-
-  while (s0 && (p2 = malloc(s0)) == NULL)
-    s0 >>= 1;
-
-  free_mem += s0;
-
-  s0 = 32*1024*1024;
-
-  while (s0 && (p3 = malloc(s0)) == NULL)
-    s0 >>= 1;
-
-  free_mem += s0;
-
-  if (p1)
-    free(p1);
-  if (p2)
-    free(p2);
-  if (p3)
-    free(p3);
-
-  return free_mem;
-}
 
 static int frontend_ps2_parse_drive_list(void *data, bool load_content)
 {
@@ -567,8 +540,6 @@ frontend_ctx_driver_t frontend_ctx_ps2 = {
    frontend_ps2_get_arch,        /* get_architecture */
    NULL,                         /* get_powerstate */
    frontend_ps2_parse_drive_list,/* parse_drive_list */
-   frontend_ps2_get_total_mem,   /* get_total_mem */
-   frontend_ps2_get_free_mem,    /* get_free_mem */
    NULL,                         /* install_signal_handler */
    NULL,                         /* get_sighandler_state */
    NULL,                         /* set_sighandler_state */

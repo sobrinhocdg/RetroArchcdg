@@ -59,15 +59,6 @@
 #endif
 #endif
 
-/* Assume W-functions do not work below Win2K and Xbox platforms */
-#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0500 || defined(_XBOX)
-
-#ifndef LEGACY_WIN32
-#define LEGACY_WIN32
-#endif
-
-#endif
-
 /* Time format strings with AM-PM designation require special
  * handling due to platform dependence */
 size_t strftime_am_pm(char *s, size_t len, const char* format,
@@ -380,7 +371,7 @@ char *find_last_slash(const char *str)
       return s1;
    return (s2 > s1) ? s2 : s1;
 #else
-   return strrchr(str, '/');
+   return (char*)strrchr(str, '/');
 #endif
 }
 
@@ -730,6 +721,12 @@ bool path_is_absolute(const char *path)
    {
       if (path[0] == '/')
          return true;
+      /* VFS URL schemes (smb://, cdrom://, saf://, ...) are absolute. */
+      {
+         const char *scheme = strstr(path, "://");
+         if (scheme && scheme > path)
+            return true;
+      }
 #if defined(_WIN32)
       if (path[0] == '\\' && path[1] == '\\')
          return true;
@@ -793,12 +790,16 @@ char *path_resolve_realpath(char *s, size_t len, bool resolve_symlinks)
    const char *buf_end;
    if (resolve_symlinks)
    {
+      char *real_path;
       strlcpy(tmp, s, sizeof(tmp));
-      if (!realpath(tmp, s))
+      real_path = realpath(tmp, NULL);
+      if (!real_path)
       {
          strlcpy(s, tmp, len);
          return NULL;
       }
+      strlcpy(s, real_path, len);
+      free(real_path);
       return s;
    }
    t       = 0;
@@ -988,34 +989,16 @@ size_t fill_pathname_join(char *s, const char *dir,
    return _len;
 }
 
-/**
- * fill_pathname_join_special:
- * @s                  : output path
- * @dir                : directory. Cannot be identical to @s
- * @path               : path
- * @len                : size of @s
- *
- * Specialized version of fill_pathname_join.
- * Unlike fill_pathname_join(),
- * @dir and @s CANNOT be identical.
- *
- * Joins a directory (@dir) and path (@path) together.
- * Makes sure not to get  two consecutive slashes
- * between directory and path.
- *
- * @return Length of the string copied into @s
- **/
-size_t fill_pathname_join_special(char *s,
-      const char *dir, const char *path, size_t len)
-{
-   size_t _len = strlcpy(s, dir, len);
-
-   if (*s)
-      _len = fill_pathname_slash(s, len);
-
-   _len += strlcpy(s + _len, path, len - _len);
-   return _len;
-}
+/* fill_pathname_join_special() is a macro alias of
+ * fill_pathname_join() - see file_path.h. Historically it was a
+ * separate function that skipped the @s != @dir alias guard (one
+ * pointer compare ahead of two strlcpy calls - never a measurable
+ * saving), which made any aliased call undefined: strlcpy aborts
+ * via __chk_fail_overlap under fortified libc on macOS while the
+ * portable fallback hides the defect on other platforms.
+ * libretro-common is vendored into cores that never see RetroArch's
+ * overlap_copy_check CI gate, so the safe semantics have to live in
+ * the header rather than in a caller-side contract. */
 
 size_t fill_pathname_join_special_ext(char *s,
       const char *dir,  const char *path,
@@ -1342,7 +1325,26 @@ size_t fill_pathname_application_path(char *s, size_t len)
    if (len)
    {
 #if defined(_WIN32)
-#ifdef LEGACY_WIN32
+#if defined(LEGACY_WIN32_RUNTIME)
+      DWORD ret;
+
+      if (win32_needs_local_encoding())
+         ret = GetModuleFileNameA(NULL, s, len);
+      else
+      {
+         wchar_t wstr[PATH_MAX_LENGTH] = {0};
+         ret = GetModuleFileNameW(NULL, wstr, ARRAY_SIZE(wstr));
+         if (*wstr)
+         {
+            char *str = utf16_to_utf8_string_alloc(wstr);
+            if (str)
+            {
+               strlcpy(s, str, len);
+               free(str);
+            }
+         }
+      }
+#elif defined(LEGACY_WIN32)
       DWORD ret = GetModuleFileNameA(NULL, s, len);
 #else
       wchar_t wstr[PATH_MAX_LENGTH] = {0};
